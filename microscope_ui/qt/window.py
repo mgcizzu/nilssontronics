@@ -43,6 +43,7 @@ from qtpy.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QToolButton,
@@ -87,6 +88,7 @@ LAUNCH_ERRORS = (ControllerError, HardwareError, OSError, ValueError)
 MOSAIC_UNDERLAY_PX = 1024
 PREVIEW_TILE_PX = 256
 DEFAULT_PANEL_SIZES = (380, 720, 280)
+DEFAULT_WINDOW_SIZE = (1400, 860)
 OVERVIEW_MODES = (
     ("navigate", "Navigate", "Drag to pan, wheel to zoom, double-click to move the stage"),
     ("rectangle", "Rectangle", "Drag to draw a rectangular scan region"),
@@ -123,7 +125,7 @@ class ScanWindow(QMainWindow):
         self._loading = False
 
         self.setWindowTitle(f"Microscope Scan Console — {self.backend.name}")
-        self.resize(1400, 860)
+        self.fit_window_to_screen()
         self._build_ui(use_ndv)
         microscope_menu = self.menuBar().addMenu("Microscope")
         microscope_menu.addAction("Configuration…", self.show_configuration)
@@ -178,7 +180,27 @@ class ScanWindow(QMainWindow):
         self.setCentralWidget(central)
 
         view_menu = self.menuBar().addMenu("View")
+        self.view_menu = view_menu
         view_menu.addAction("Reset panel sizes", self.reset_panel_sizes)
+        view_menu.addAction("Fit window to screen", self.fit_window_to_screen)
+
+    def fit_window_to_screen(self) -> None:
+        """Fit the window inside the current screen's usable desktop area."""
+
+        app = QApplication.instance()
+        screen = self.screen() or (app.primaryScreen() if app is not None else None)
+        if screen is None:
+            self.resize(*DEFAULT_WINDOW_SIZE)
+            return
+        available = screen.availableGeometry()
+        width = min(DEFAULT_WINDOW_SIZE[0], max(640, int(available.width() * 0.94)))
+        height = min(DEFAULT_WINDOW_SIZE[1], max(560, int(available.height() * 0.90)))
+        width = min(width, available.width())
+        height = min(height, available.height())
+        self.resize(width, height)
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
 
     def reset_panel_sizes(self) -> None:
         """Restore a balanced three-panel layout after manual resizing."""
@@ -207,8 +229,12 @@ class ScanWindow(QMainWindow):
         return header
 
     def _build_setup_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
+        project_page = QWidget()
+        project_layout = QVBoxLayout(project_page)
+        regions_page = QWidget()
+        regions_page_layout = QVBoxLayout(regions_page)
+        acquisition_page = QWidget()
+        acquisition_layout = QVBoxLayout(acquisition_page)
 
         # Experiment
         experiment = QGroupBox("Experiment")
@@ -221,7 +247,7 @@ class ScanWindow(QMainWindow):
         self.resume_button.clicked.connect(lambda: self._resume_cycle())
         for button in (self.new_button, self.open_button, self.resume_button):
             exp_layout.addWidget(button)
-        layout.addWidget(experiment)
+        project_layout.addWidget(experiment)
 
         # Sample
         sample = QGroupBox("Sample")
@@ -238,7 +264,7 @@ class ScanWindow(QMainWindow):
         form.addRow("Project", self.project_edit)
         form.addRow("Sample", self.sample_edit)
         form.addRow("Output", out_row)
-        layout.addWidget(sample)
+        project_layout.addWidget(sample)
 
         # Optics
         optics = QGroupBox("Objective && channels")
@@ -262,7 +288,7 @@ class ScanWindow(QMainWindow):
         self.channel_table.changed.connect(self._recipe_to_custom)
         optics_layout.addWidget(self.objective_box)
         optics_layout.addWidget(self.channel_table)
-        layout.addWidget(optics)
+        project_layout.addWidget(optics)
 
         # Regions & focus
         regions = QGroupBox("Scan regions (stage µm)")
@@ -284,7 +310,7 @@ class ScanWindow(QMainWindow):
         set_row.addWidget(self.shift_button)
         regions_layout.addWidget(self.region_list)
         regions_layout.addLayout(set_row)
-        layout.addWidget(regions)
+        regions_page_layout.addWidget(regions)
 
         focus = QGroupBox("Focus points")
         focus_layout = QVBoxLayout(focus)
@@ -314,7 +340,7 @@ class ScanWindow(QMainWindow):
         focus_layout.addWidget(self.focus_list)
         focus_layout.addLayout(cycle_row)
         focus_layout.addWidget(self.refocus_label)
-        layout.addWidget(focus)
+        regions_page_layout.addWidget(focus)
         self.refocus_index: int | None = None
         self._accept_pending = False
 
@@ -344,7 +370,7 @@ class ScanWindow(QMainWindow):
         z_form.addRow("End", self.z_top)
         z_form.addRow("Step", self.z_step)
         self.z_stack_widgets = (self.z_begin_button, self.z_end_button, self.z_bottom, self.z_top, self.z_step)
-        layout.addWidget(z_group)
+        acquisition_layout.addWidget(z_group)
 
         # Tiling & options
         tiling = QGroupBox("Tiling && options")
@@ -363,8 +389,10 @@ class ScanWindow(QMainWindow):
         t_form.addRow(self.consistent_approach)
         t_form.addRow(self.shutter_per_frame)
         t_form.addRow(self.flat_field)
-        layout.addWidget(tiling)
-        layout.addStretch(1)
+        acquisition_layout.addWidget(tiling)
+        project_layout.addStretch(1)
+        regions_page_layout.addStretch(1)
+        acquisition_layout.addStretch(1)
 
         for signal in (
             self.channel_table.changed,
@@ -386,13 +414,26 @@ class ScanWindow(QMainWindow):
         ):
             signal.connect(self._refresh)
 
-        scroll = QScrollArea()
-        scroll.setWidget(panel)
-        scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(300)
-        scroll.setToolTip("This panel scrolls; drag its right divider to resize it")
-        self.setup_scroll = scroll
-        return scroll
+        self.setup_tabs = QTabWidget()
+        self.setup_tabs.setMinimumWidth(360)
+        self.setup_tabs.setUsesScrollButtons(False)
+        self.setup_tabs.tabBar().setExpanding(True)
+        self.setup_pages: list[QScrollArea] = []
+        for label, page in (
+            ("Project", project_page),
+            ("Regions", regions_page),
+            ("Acquisition", acquisition_page),
+        ):
+            page.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            scroll = QScrollArea()
+            scroll.setWidget(page)
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setToolTip("This page scrolls when its controls do not fit")
+            self.setup_tabs.addTab(scroll, label)
+            self.setup_pages.append(scroll)
+        self.setup_tabs.setToolTip("Choose a workflow section; drag the right divider to resize")
+        return self.setup_tabs
 
     def _build_viewer(self, use_ndv: bool) -> QWidget:
         wrapper = QWidget()
@@ -467,8 +508,6 @@ class ScanWindow(QMainWindow):
         self.live_channel_box = QComboBox()
         for channel in self.config_data.channels:
             self.live_channel_box.addItem(channel.name, channel.id)
-        self.jog = StageJog()
-        self.jog.move_requested.connect(self._jog)
         self.preview_button = QPushButton("Spiral preview")
         self.preview_button.setCheckable(True)
         self.preview_button.setToolTip(
@@ -485,10 +524,6 @@ class ScanWindow(QMainWindow):
         capture_controls.addWidget(self.preview_button)
         capture_controls.addWidget(self.clear_preview_button)
         layout.addLayout(capture_controls)
-        jog_controls = QHBoxLayout()
-        jog_controls.addStretch(1)
-        jog_controls.addWidget(self.jog)
-        layout.addLayout(jog_controls)
         wrapper.setMinimumWidth(360)
         return wrapper
 
@@ -524,6 +559,13 @@ class ScanWindow(QMainWindow):
         layout.addLayout(run_row)
         layout.addWidget(self.progress)
         layout.addWidget(self.progress_label)
+
+        stage = QGroupBox("Stage controls")
+        stage_layout = QVBoxLayout(stage)
+        self.jog = StageJog()
+        self.jog.move_requested.connect(self._jog)
+        stage_layout.addWidget(self.jog)
+        layout.addWidget(stage)
         layout.addStretch(1)
         scroll = QScrollArea()
         scroll.setWidget(panel)

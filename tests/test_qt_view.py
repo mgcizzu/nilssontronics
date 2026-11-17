@@ -12,8 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("qtpy")
 pytest.importorskip("pytestqt")
 
-from qtpy.QtCore import QTimer  # noqa: E402
-from qtpy.QtWidgets import QScrollArea  # noqa: E402
+from qtpy.QtCore import Qt, QTimer  # noqa: E402
+from qtpy.QtWidgets import QScrollArea, QTabWidget  # noqa: E402
 
 from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
@@ -64,7 +64,8 @@ def test_main_panels_are_resizable_scrollable_and_resettable(qtbot, window):
     assert splitter.count() == 3
     assert splitter.handleWidth() >= 8
     assert all(not splitter.isCollapsible(index) for index in range(3))
-    assert isinstance(window.setup_scroll, QScrollArea)
+    assert isinstance(window.setup_tabs, QTabWidget)
+    assert all(isinstance(page, QScrollArea) for page in window.setup_pages)
     assert isinstance(window.review_scroll, QScrollArea)
 
     splitter.setSizes([520, 400, 230])
@@ -77,6 +78,32 @@ def test_main_panels_are_resizable_scrollable_and_resettable(qtbot, window):
     reset_actions = [action for action in window.menuBar().actions() if action.text() == "View"]
     assert reset_actions
     assert any(action.text() == "Reset panel sizes" for action in reset_actions[0].menu().actions())
+
+
+def test_window_fits_screen(window):
+    available = window.screen().availableGeometry()
+    assert window.width() <= available.width()
+    assert window.height() <= available.height()
+
+
+def test_setup_workflow_is_split_into_named_tabs_and_stage_is_on_right(qtbot, window):
+    window.show()
+    qtbot.waitExposed(window)
+    assert [window.setup_tabs.tabText(index) for index in range(3)] == [
+        "Project",
+        "Regions",
+        "Acquisition",
+    ]
+    assert not window.setup_tabs.usesScrollButtons()
+    assert all(
+        page.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        for page in window.setup_pages
+    )
+    for index, control in enumerate((window.project_edit, window.region_list, window.z_mode_box)):
+        window.setup_tabs.setCurrentIndex(index)
+        assert control.isVisibleTo(window)
+    assert window.review_scroll.widget().isAncestorOf(window.jog)
+    assert window.jog.isVisibleTo(window)
 
 
 def test_two_cycles_with_xy_shift(qtbot, window):
