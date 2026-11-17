@@ -14,7 +14,7 @@ Python 3.11+ with Tk and NumPy.
 pip install -e .                 # simulator only
 pip install -e ".[hardware]"     # + pymmcore-plus for a real microscope
 pip install -e ".[flatfield]"    # + BaSiC (basicpy) for flat-field estimation
-pip install -e ".[qt]"           # + Qt view (PyQt6, ndv, pymmcore-widgets)
+pip install -e ".[qt]"           # + Qt view (PySide6, ndv, pymmcore-widgets)
 
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # Micro-Manager (see below)
@@ -280,5 +280,5 @@ Micro-Manager demo tests are skipped there.
 
 MIT — see [LICENSE](LICENSE). The Qt view's Windows 11 / Fluent styling is
 implemented in `microscope_ui/qt/theme.py` without third-party theme packages,
-while preserving the tabbed/resizable workflow,
-so the project has no copyleft dependencies.
+while preserving the tabbed/resizable workflow. Qt is provided by PySide6
+(LGPLv3), so the project has no GPL/AGPL runtime dependencies.

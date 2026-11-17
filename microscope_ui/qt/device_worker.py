@@ -17,7 +17,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from qtpy.QtCore import QObject, Signal
+from qtpy.QtCore import QObject, Qt, Signal
 
 from ..backend import HardwareError, StagePosition
 from ..models import Channel
@@ -51,7 +51,11 @@ class DeviceWorker(QObject):
         self._illumination_ready = False
         self._stopped = False
         self.last_position: StagePosition = backend.position
-        self._deliver.connect(lambda callback, value: callback(value))
+        # Bound to this QObject (not a lambda): queued results are delivered on the GUI
+        # thread and are dropped together with the worker when its window is deleted.
+        # A free-function connection outlives the window under PySide6 and would run
+        # callbacks into already-deleted widgets.
+        self._deliver.connect(self._run_callback, Qt.ConnectionType.QueuedConnection)
         self._thread = threading.Thread(target=self._run, name="device-worker", daemon=True)
         self._thread.start()
 
@@ -79,6 +83,12 @@ class DeviceWorker(QObject):
             self._live = on
         if on:
             self._put(_Job(None))
+
+    def _run_callback(self, callback, value) -> None:
+        with self._lock:
+            stopped = self._stopped
+        if not stopped:  # the window is shutting down: nobody to report to
+            callback(value)
 
     @property
     def live(self) -> bool:

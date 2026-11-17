@@ -27,6 +27,9 @@ See README.md for the architecture, data layout and configuration.
   Leica's LAS X does it on the fly). When on, corrected planes go to `cycle_NN/` (what
   ISS_preprocessing reads), optionally with `uncorrected/` copies. Calibrated with a grid
   slide per objective; the experiment keeps its own copy, fixed by cycle 1.
+- **Licence: MIT.** No GPL/AGPL dependencies without Marco's OK. The Qt binding is
+  PySide6 (LGPLv3); code imports Qt through `qtpy`. Fluent light/dark styling is
+  local to `qt/theme.py` and keeps the tabbed/resizable workflow.
 
 ## Architecture rules
 - `app.py` (Tk view) talks only to `ScanController` (`controller.py`); it never

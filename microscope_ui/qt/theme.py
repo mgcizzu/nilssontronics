@@ -14,7 +14,7 @@ import sys
 import tempfile
 
 from qtpy.QtCore import QByteArray, QEasingCurve, QPointF, QRectF, QSize, Qt, QVariantAnimation
-from qtpy.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+from qtpy.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPalette, QPixmap
 from qtpy.QtWidgets import QApplication, QCheckBox, QWidget
 
 THEME_MODES = ("system", "light", "dark")
@@ -119,7 +119,10 @@ def apply_theme(app: QApplication, mode: str = "system") -> Palette:
         raise ValueError(f"Unknown theme mode: {mode}")
     p = palette_for(mode, app)
     font = QFont()
-    font.setFamilies(FONT_FAMILIES)
+    installed = set(QFontDatabase.families())
+    families = [family for family in FONT_FAMILIES if family in installed]
+    if families:  # only installed ones: avoids Qt's slow missing-font alias search
+        font.setFamilies(families)
     font.setPointSizeF(10.0 if sys.platform == "win32" else 13.0)
     app.setFont(font)
     qpal = app.palette()
@@ -202,6 +205,9 @@ QToolTip {{ background: {p.card}; color: {p.text}; border: 1px solid {p.control_
 #rail QToolButton:hover {{ background: {p.subtle_hover}; }}
 #rail QToolButton:checked {{ background: {p.subtle_hover}; border-left: 3px solid {p.accent};
                             padding-left: 7px; font-weight: 600; }}
+
+QToolBar {{ background: transparent; border: none; spacing: 4px; padding: 0; }}
+QToolBar QToolButton#qt_toolbar_ext_button {{ background: transparent; border: none; }}
 
 /* page header */
 #pageTitle {{ font-size: 20pt; font-weight: 600; }}
