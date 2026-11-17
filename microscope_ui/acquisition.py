@@ -31,7 +31,7 @@ class PlaneSink(Protocol):
         z_index: int,
         frame: np.ndarray,
         z_um: float | None = None,
-    ) -> None: ...
+    ) -> None: ...  # a distortion-correcting sink may add ``uncorrected=``
 
     def finish_tile(self): ...
 
@@ -195,6 +195,16 @@ class BoundedAsyncWriter:
                     return False
                 self._state_changed.wait(remaining)
             return self._failure is None
+
+    @property
+    def stopped(self) -> bool:
+        """True once the writer thread has exited (no further access to the sink)."""
+
+        return not self._thread.is_alive()
+
+    def wait_stopped(self, timeout: float | None = None) -> bool:
+        self._thread.join(timeout)
+        return self.stopped
 
     def shutdown(self, *, drain: bool, timeout: float = 5.0) -> bool:
         """Stop the worker after draining, or discard frames that have not begun."""

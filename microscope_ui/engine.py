@@ -79,6 +79,7 @@ class AcquisitionEngine:
         on_tile_written: Callable[[int], None] | None = None,
         post_process: Callable[[Callable[[], bool]], str | None] | None = None,
         on_finished: Callable[[EngineStatus], None] | None = None,
+        writer_stop_timeout_s: float = 5.0,
     ) -> None:
         missing = [tile.index for tile in run.tiles if tile.index not in run.z_positions]
         if missing:
@@ -89,6 +90,7 @@ class AcquisitionEngine:
         self._run = run
         self._post_process = post_process
         self._on_finished = on_finished
+        self._writer_stop_timeout_s = writer_stop_timeout_s
         self._lock = Lock()
         self._resume_signal = Condition(self._lock)
         self._abort = Event()
@@ -171,10 +173,13 @@ class AcquisitionEngine:
             self._set(state="draining", message="Camera complete — draining SSD buffer")
             if not self._writer.wait_until_idle():
                 state, error = "failed", f"SSD writer: {self._writer.snapshot().failure}"
-            if not self._writer.shutdown(drain=True):
-                state, error = "failed", error or "The SSD writer did not stop"
+            stopped = self._writer.shutdown(drain=True, timeout=self._writer_stop_timeout_s)
         else:
-            self._writer.shutdown(drain=False)
+            stopped = self._writer.shutdown(drain=False, timeout=self._writer_stop_timeout_s)
+        if not stopped:
+            # Never report a final state while the writer can still touch the cycle's
+            # storage: resume/close would close it underneath an in-flight write.
+            self._wait_for_writer()
 
         snapshot = self._writer.snapshot()
         if snapshot.failure and state != "failed":
@@ -189,16 +194,44 @@ class AcquisitionEngine:
             except Exception as exc:
                 message = f"Flat-field estimation failed: {exc}"
 
-        self._set(
-            state=state,
-            error=error,
-            tiles_done=min(done, self._status.tiles_total),
-            current_tile=None,
-            message=message or {"complete": "Cycle complete", "aborted": "Stopped by operator"}.get(state, error or ""),
-            finished_monotonic=time.monotonic(),
-        )
+        with self._lock:
+            final = replace(
+                self._status,
+                state=state,
+                error=error,
+                tiles_done=min(done, self._status.tiles_total),
+                current_tile=None,
+                backpressure=False,
+                message=message
+                or {"complete": "Cycle complete", "aborted": "Stopped by operator"}.get(state, error or ""),
+                finished_monotonic=time.monotonic(),
+            )
+        # Persist first, publish second: until the final state is visible the
+        # controller stays busy, so nobody can switch experiments before this
+        # cycle's record is saved.
         if self._on_finished is not None:
-            self._on_finished(self.status())
+            self._set(message="Saving the cycle record")
+            try:
+                self._on_finished(final)
+            except Exception as exc:
+                # The images are on disk but experiment.json still says "running":
+                # never show "complete". The cycle stays resumable; resume skips the
+                # saved tiles and records it again.
+                reason = f"The cycle record could not be saved: {exc}"
+                final = replace(
+                    final,
+                    state="failed",
+                    error=(final.error + "; " if final.error else "") + reason,
+                    message=f"{reason}. Saved tiles are kept — fix the problem, then resume.",
+                )
+        with self._lock:
+            self._status = final
+
+    def _wait_for_writer(self) -> None:
+        started = time.monotonic()
+        while not self._writer.wait_stopped(timeout=1.0):
+            waited = int(time.monotonic() - started)
+            self._set(message=f"Waiting for the SSD writer to finish its current frame ({waited} s)")
 
     def _wait_if_paused(self) -> bool:
         """Return False if aborted while paused."""

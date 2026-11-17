@@ -21,10 +21,15 @@ from dataclasses import dataclass
 import math
 from typing import Iterable
 
-from .geometry import points_are_non_collinear
 from .models import FocusMethod, FocusPoint
 
 Point = tuple[float, float]
+
+# Focus points must spread across, not only along, a line: the across-line spread
+# (standard deviation) must reach this fraction of the along-line spread and at
+# least MIN_ACROSS_SPREAD_UM. Thinner layouts cannot define a tilt across the line.
+MIN_SPREAD_RATIO = 0.01
+MIN_ACROSS_SPREAD_UM = 5.0
 
 
 @dataclass(frozen=True)
@@ -39,8 +44,7 @@ class FocusSurface:
         unique = _merge_duplicates(tuple(points))
         if len(unique) < 3:
             raise ValueError("A focus surface needs at least three focus points")
-        if not points_are_non_collinear(tuple((p.x_um, p.y_um) for p in unique)):
-            raise ValueError("Focus points must not all lie on one line")
+        _check_spread(tuple((p.x_um, p.y_um) for p in unique))
         if method not in ("linear", "plane"):
             raise ValueError(f"Unknown focus surface method: {method}")
         self.method = method
@@ -53,6 +57,8 @@ class FocusSurface:
         if method == "linear":
             self._triangles = _delaunay(self._xy)
             self._hull_edges = _boundary_edges(self._triangles)
+            if not self._triangles:  # cannot happen after _check_spread; never crash anyway
+                self.method = "plane"
 
     @property
     def triangles(self) -> tuple[tuple[int, int, int], ...]:
@@ -85,6 +91,9 @@ class FocusSurface:
         return (min(values), max(values))
 
     def _z_on_hull(self, point: Point) -> float:
+        if not self._hull_edges:
+            a, b, c = self._plane
+            return a * point[0] + b * point[1] + c
         best: tuple[float, float] | None = None
         for start, end in self._hull_edges:
             (x1, y1), (x2, y2) = self._xy[start], self._xy[end]
@@ -97,8 +106,30 @@ class FocusSurface:
             z = self._z[start] + t * (self._z[end] - self._z[start])
             if best is None or distance < best[0]:
                 best = (distance, z)
-        assert best is not None
         return best[1]
+
+
+def _check_spread(xy: tuple[Point, ...]) -> None:
+    """Reject layouts that are (almost) on one line, with an actionable message."""
+
+    n = len(xy)
+    mx = sum(x for x, _ in xy) / n
+    my = sum(y for _, y in xy) / n
+    sxx = sum((x - mx) ** 2 for x, _ in xy) / n
+    syy = sum((y - my) ** 2 for _, y in xy) / n
+    sxy = sum((x - mx) * (y - my) for x, y in xy) / n
+    half_trace = (sxx + syy) / 2
+    root = math.sqrt(max(0.0, half_trace**2 - (sxx * syy - sxy * sxy)))
+    along = math.sqrt(max(0.0, half_trace + root))
+    across = math.sqrt(max(0.0, half_trace - root))
+    needed = max(MIN_ACROSS_SPREAD_UM, MIN_SPREAD_RATIO * along)
+    if across < needed:
+        raise ValueError(
+            "Focus points lie (almost) on one line: they spread "
+            f"{along:.0f} µm along it but only {across:.1f} µm across, so the tilt across "
+            f"that line is unknown. Add a focus point at least {2 * needed:.0f} µm away from "
+            "the line (or use a single Z / Z-stack instead of a focus map)."
+        )
 
 
 def _merge_duplicates(points: tuple[FocusPoint, ...], tolerance: float = 1e-6) -> tuple[FocusPoint, ...]:
@@ -170,11 +201,15 @@ def _delaunay(xy: tuple[Point, ...]) -> tuple[_Triangle, ...]:
     xs = [p[0] for p in xy]
     ys = [p[1] for p in xy]
     cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
-    span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0) * 1000
-    points: list[Point] = list(xy) + [
-        (cx - 2 * span, cy - span),
-        (cx + 2 * span, cy - span),
-        (cx, cy + 2 * span),
+    scale = max(max(xs) - min(xs), max(ys) - min(ys)) or 1.0
+    # Triangulate in centred, unit-scaled coordinates: a huge super-triangle in raw
+    # µm loses so much precision that thin triangles vanish from the result.
+    unit = [((x - cx) / scale, (y - cy) / scale) for x, y in xy]
+    span = 20.0
+    points: list[Point] = unit + [
+        (-2 * span, -span),
+        (2 * span, -span),
+        (0.0, 2 * span),
     ]
     n = len(xy)
     triangles = [_Triangle(n, n + 1, n + 2)]
@@ -193,7 +228,7 @@ def _delaunay(xy: tuple[Point, ...]) -> tuple[_Triangle, ...]:
     return tuple(
         t
         for t in triangles
-        if t.a < n and t.b < n and t.c < n and _area2(xy, t) > 1e-9
+        if t.a < n and t.b < n and t.c < n and _area2(tuple(unit), t) > 1e-12
     )
 
 

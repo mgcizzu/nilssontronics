@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,12 +7,15 @@ name = "microscope-scan-console"
 version = "0.1.0"
 description = "A workflow-focused desktop front end for microscope acquisition"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["numpy>=1.24", "tifffile>=2023.7.10"]
 
 [project.optional-dependencies]
 hardware = ["pymmcore-plus>=0.13"]
 flatfield = ["basicpy"]
-qt = ["qtpy", "PyQt6", "ndv[pyqt,vispy]>=0.5", "pymmcore-widgets>=0.12"]
+# PySide6 (LGPLv3, the official Qt binding) keeps the MIT app free of GPL code; not PyQt6.
+qt = ["qtpy", "PySide6>=6.7", "ndv[pyside,vispy]>=0.5", "pymmcore-widgets[pyside6]>=0.12"]
 test = ["pytest", "pytest-qt"]
 
 [project.scripts]

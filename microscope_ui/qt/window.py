@@ -25,13 +25,11 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import QSettings, Qt, QTimer
 from qtpy.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QCheckBox,
     QComboBox,
-    QDockWidget,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -43,8 +41,11 @@ from qtpy.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -68,8 +69,10 @@ from ..planner import spiral_preview_positions
 from ..roi_io import load_roi_set, save_roi_set
 from .device_worker import DeviceWorker
 from .overview import OverviewCanvas, bounded_set_translation
+from .theme import THEME_MODES, ToggleSwitch, apply_theme, icon, set_dark_title_bar
 from .widgets import (
     ChannelTable,
+    FlowLayout,
     FrameView,
     ItemList,
     RectangleDialog,
@@ -80,6 +83,11 @@ from .widgets import (
 )
 
 POSITION_REFRESH_MS = 1000
+CLOSE_TIMEOUT_S = 30.0
+# Layout: fits a 1280 px laptop at 125 % scaling (~1024 logical px).
+RAIL_WIDE, RAIL_COMPACT, RAIL_COMPACT_BELOW = 200, 56, 1360
+SETUP_MIN_WIDTH, REVIEW_MIN_WIDTH = 320, 220
+DEVICE_DRAIN_TIMEOUT_S = 30.0
 POLL_INTERVAL_MS = 150
 MOSAIC_REFRESH_S = 0.3
 Z_MODES = (("Single plane (current Z)", "single"), ("Focus map", "focus_map"), ("Z-stack", "stack"))
@@ -109,8 +117,11 @@ class ScanWindow(QMainWindow):
         backend=None,
         use_ndv: bool = True,
         config_path: Path | str = DEFAULT_CONFIG_PATH,
+        settings: QSettings | None = None,
     ) -> None:
         super().__init__()
+        # Per-user view preferences (theme); tests pass their own file.
+        self.settings = settings if settings is not None else QSettings("nilssontronics", "scan-console")
         self.config_data = config
         self.config_path = Path(config_path)
         self.backend = backend if backend is not None else create_backend(config)
@@ -124,9 +135,12 @@ class ScanWindow(QMainWindow):
         self.setWindowTitle(f"Microscope Scan Console — {self.backend.name}")
         self.resize(1400, 860)
         self._build_ui(use_ndv)
-        microscope_menu = self.menuBar().addMenu("Microscope")
-        microscope_menu.addAction("Configuration…", self.show_configuration)
-        self._build_device_docks()
+        self._build_device_pages()
+        self.apply_theme_mode(self.theme_mode())
+        # Follow Windows/macOS when the user switches dark/light while we run.
+        hints = QApplication.instance().styleHints()
+        if hasattr(hints, "colorSchemeChanged"):  # Qt >= 6.5
+            hints.colorSchemeChanged.connect(self._system_scheme_changed)
 
         self.device.frame_ready.connect(self.frame_view.show_frame)
         self.device.position_changed.connect(self._position_changed)
@@ -151,34 +165,199 @@ class ScanWindow(QMainWindow):
     # ------------------------------------------------------------------ UI --
     def _build_ui(self, use_ndv: bool) -> None:
         central = QWidget()
-        root = QVBoxLayout(central)
-        root.addWidget(self._build_header())
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.pages = QStackedWidget()
+
+        acquire = self._page()
+        layout = acquire.layout()
+        layout.addWidget(self._build_header())
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_setup_panel())
         splitter.addWidget(self._build_viewer(use_ndv))
         splitter.addWidget(self._build_review_panel())
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([460, 720, 320])
-        root.addWidget(splitter, 1)
+        self.splitter = splitter
+        layout.addWidget(splitter, 1)
+
+        self.devices_page = self._page("Devices")
+        self.config_page = self._page("Configuration")
+        self.config_text = QTextBrowser()
+        self.config_text.setOpenExternalLinks(False)
+        self.config_page.layout().addWidget(self.config_text, 1)
+        self.settings_page = self._build_settings_page()
+
+        self.page_names = ("acquire", "devices", "config", "settings")
+        for page in (acquire, self.devices_page, self.config_page, self.settings_page):
+            self.pages.addWidget(page)
+        outer.addWidget(self._build_rail())
+        outer.addWidget(self.pages, 1)
         self.setCentralWidget(central)
+
+    def _page(self, title: str | None = None) -> QWidget:
+        page = QWidget()
+        page.setObjectName("page")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 14, 20, 14)
+        layout.setSpacing(8)
+        if title:
+            heading = QLabel(title)
+            heading.setObjectName("pageTitle")
+            layout.addWidget(heading)
+        return page
+
+    def _build_rail(self) -> QWidget:
+        rail = _Rail()
+        rail.setObjectName("rail")
+        # Minimum is always the compact width, so the rail never stops the window from
+        # shrinking; resizeEvent then switches to icons-only below RAIL_COMPACT_BELOW.
+        rail.setMinimumWidth(RAIL_COMPACT)
+        rail.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.rail = rail
+        rail.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        layout = QVBoxLayout(rail)
+        layout.setContentsMargins(0, 14, 0, 12)
+        layout.setSpacing(2)
+        title = QLabel("Scan Console")
+        title.setObjectName("railTitle")
+        self.rail_title = title
+        layout.addWidget(title)
+        self.nav_group = QButtonGroup(self)
+        self.nav_buttons: dict[str, QToolButton] = {}
+        entries = (
+            ("acquire", "Acquire", "acquire"),
+            ("devices", "Devices", "devices"),
+            ("config", "Configuration", "config"),
+            (None, None, None),
+            ("settings", "Settings", "settings"),
+        )
+        for name, text, icon_name in entries:
+            if name is None:
+                layout.addStretch(1)
+                continue
+            button = QToolButton()
+            button.setText(f"  {text}")
+            button.setToolTip(text)
+            button.setProperty("label", text)
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.setProperty("iconName", icon_name)
+            button.clicked.connect(lambda _=False, n=name: self.show_page(n))
+            self.nav_group.addButton(button)
+            self.nav_buttons[name] = button
+            layout.addWidget(button)
+        self.nav_buttons["acquire"].setChecked(True)
+        return rail
+
+    def set_rail_compact(self, compact: bool) -> None:
+        """Icons only (narrow windows) or icons with labels."""
+
+        if getattr(self, "_rail_compact", None) == compact:
+            return
+        self._rail_compact = compact
+        self.rail.preferred_width = RAIL_COMPACT if compact else RAIL_WIDE
+        self.rail.updateGeometry()
+        # Narrow windows: side panels at their minimum so the viewer keeps a usable width.
+        total = sum(self.splitter.sizes()) or 1
+        if compact:
+            self.splitter.setSizes([SETUP_MIN_WIDTH, max(1, total - SETUP_MIN_WIDTH - REVIEW_MIN_WIDTH), REVIEW_MIN_WIDTH])
+        else:
+            self.splitter.setSizes([round(total * 460 / 1500), round(total * 720 / 1500), round(total * 320 / 1500)])
+        self.rail_title.setVisible(not compact)
+        for button in self.nav_buttons.values():
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonIconOnly if compact
+                else Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+            )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self.set_rail_compact(event.size().width() < RAIL_COMPACT_BELOW)
+
+    def show_page(self, name: str) -> None:
+        if name == "config":
+            self.config_text.setHtml(self.configuration_html())
+        self.nav_buttons[name].setChecked(True)
+        self.pages.setCurrentIndex(self.page_names.index(name))
+
+    def _build_settings_page(self) -> QWidget:
+        page = self._page("Settings")
+        appearance = QGroupBox("Appearance")
+        form = QFormLayout(appearance)
+        self.theme_box = QComboBox()
+        for mode in THEME_MODES:
+            self.theme_box.addItem({"system": "Use system setting", "light": "Light", "dark": "Dark"}[mode], mode)
+        self.theme_box.activated.connect(
+            lambda _i: self.apply_theme_mode(self.theme_box.currentData(), remember=True)
+        )
+        hint = QLabel("Colours follow Windows' dark/light mode and accent colour when set to the system.")
+        hint.setProperty("secondary", True)
+        hint.setWordWrap(True)
+        form.addRow("Theme", self.theme_box)
+        form.addRow(hint)
+        about = QGroupBox("About")
+        about_layout = QVBoxLayout(about)
+        text = QLabel(
+            "Microscope Scan Console — cyclic imaging front end for Micro-Manager.<br>"
+            "MIT licence."
+        )
+        text.setProperty("secondary", True)
+        about_layout.addWidget(text)
+        for card in (appearance, about):
+            card.setMaximumWidth(860)
+        page.layout().addWidget(appearance)
+        page.layout().addWidget(about)
+        page.layout().addStretch(1)
+        return page
+
+    # ---------------------------------------------------------------- theme --
+    def theme_mode(self) -> str:
+        mode = str(self.settings.value("theme", "system"))
+        return mode if mode in THEME_MODES else "system"
+
+    def _system_scheme_changed(self, *_args) -> None:
+        if self.theme_mode() == "system":
+            self.apply_theme_mode("system")
+
+    def apply_theme_mode(self, mode: str, remember: bool = False) -> None:
+        palette = apply_theme(QApplication.instance(), mode)
+        self.palette_tokens = palette
+        if remember:
+            self.settings.setValue("theme", mode)
+            self.settings.sync()
+        self.theme_box.setCurrentIndex(self.theme_box.findData(mode))
+        for button in self.nav_buttons.values():
+            button.setIcon(icon(button.property("iconName"), palette.text))
+        self.channel_table.refresh_swatches()
+        set_dark_title_bar(self, palette.dark)
 
     def _build_header(self) -> QWidget:
         header = QWidget()
         row = QHBoxLayout(header)
-        row.setContentsMargins(4, 0, 4, 0)
-        title = QLabel(f"<b>{self.config_data.microscope_name}</b>")
-        mode = "SIMULATOR CONNECTED" if self.backend.simulated else f"{self.backend.name.upper()} CONNECTED"
+        row.setContentsMargins(0, 0, 0, 4)
+        title = QLabel(self.config_data.microscope_name)
+        title.setObjectName("pageTitle")
+        mode = "Simulator" if self.backend.simulated else f"{self.backend.name} connected"
         self.mode_label = QLabel(mode)
-        self.mode_label.setStyleSheet(
-            "padding: 2px 8px; border-radius: 4px; color: white; background: "
-            + ("#2f6f9f;" if self.backend.simulated else "#b5442c;")
-        )
+        self.mode_label.setObjectName("statusPill")
+        self.mode_label.setProperty("tone", "sim" if self.backend.simulated else "hw")
         self.position_label = QLabel()
+        self.position_label.setProperty("secondary", True)
         self.experiment_label = QLabel()
+        self.experiment_label.setProperty("secondary", True)
+        # The experiment text takes the free header space and may be cut on narrow
+        # windows (full text in its tooltip) instead of widening the window.
+        self.experiment_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.experiment_label.setMinimumWidth(40)
+        self.experiment_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        title.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         row.addWidget(title)
+        row.addSpacing(10)
         row.addWidget(self.mode_label)
-        row.addStretch(1)
-        row.addWidget(self.experiment_label)
+        row.addWidget(self.experiment_label, 1)
         row.addSpacing(16)
         row.addWidget(self.position_label)
         return header
@@ -207,7 +386,9 @@ class ScanWindow(QMainWindow):
         self.sample_edit = QLineEdit("Sample 001")
         self.output_edit = QLineEdit(str(Path.cwd()))
         browse = QPushButton("…")
-        browse.setFixedWidth(30)
+        browse.setFixedWidth(36)
+        browse.setProperty("compact", True)
+        browse.setToolTip("Choose the output folder")
         browse.clicked.connect(self._choose_output)
         out_row = QHBoxLayout()
         out_row.addWidget(self.output_edit)
@@ -286,7 +467,7 @@ class ScanWindow(QMainWindow):
         cycle_row.addWidget(self.align_button)
         self.refocus_label = QLabel()
         self.refocus_label.setWordWrap(True)
-        self.refocus_label.setStyleSheet("color: #b5442c; font-weight: 600;")
+        self.refocus_label.setProperty("tone", "attention")
         self.refocus_label.hide()
         focus_layout.addWidget(self.focus_list)
         focus_layout.addLayout(cycle_row)
@@ -330,16 +511,36 @@ class ScanWindow(QMainWindow):
         self.overlap_y = spin(self.config_data.overlap_y_percent, 0, 50, 0, "%")
         self.tile_order_box = QComboBox()
         self.tile_order_box.addItems(["raster", "serpentine"])
-        self.consistent_approach = QCheckBox("Consistent stage approach")
-        self.shutter_per_frame = QCheckBox("Shutter closed during moves")
+        self.consistent_approach = ToggleSwitch("Consistent stage approach")
+        self.shutter_per_frame = ToggleSwitch("Shutter closed during moves")
         self.shutter_per_frame.setChecked(True)
-        self.flat_field = QCheckBox("Estimate flat-field profiles")
+        self.flat_field = ToggleSwitch("Estimate flat-field profiles")
+        self.distortion = ToggleSwitch("Correct lens distortion")
+        self.distortion.setToolTip(
+            "Resample every plane with the objective's grid-slide calibration before saving, "
+            "so ISS_preprocessing gets geometrically corrected, channel-registered tiles. "
+            "Fixed by cycle 1."
+        )
+        self.keep_uncorrected = ToggleSwitch("Keep uncorrected frames")
+        self.keep_uncorrected.setChecked(True)
+        self.keep_uncorrected.setToolTip("Also save the camera frames in cycle_NN/uncorrected/ (twice the disk space)")
+        self.calibrate_button = QPushButton("Calibrate distortion…")
+        self.calibrate_button.setToolTip("Measure the correction with a grid slide")
+        self.calibrate_button.clicked.connect(self.open_distortion_calibration)
+        self.distortion_label = QLabel()
+        self.distortion_label.setWordWrap(True)
+        self.distortion_label.setProperty("secondary", True)
+        self.calibration_dialog = None
         t_form.addRow("Overlap X", self.overlap_x)
         t_form.addRow("Overlap Y", self.overlap_y)
         t_form.addRow("Tile order", self.tile_order_box)
         t_form.addRow(self.consistent_approach)
         t_form.addRow(self.shutter_per_frame)
         t_form.addRow(self.flat_field)
+        t_form.addRow(self.distortion)
+        t_form.addRow(self.keep_uncorrected)
+        t_form.addRow(self.calibrate_button)
+        t_form.addRow(self.distortion_label)
         layout.addWidget(tiling)
         layout.addStretch(1)
 
@@ -357,16 +558,20 @@ class ScanWindow(QMainWindow):
             self.consistent_approach.toggled,
             self.shutter_per_frame.toggled,
             self.flat_field.toggled,
+            self.distortion.toggled,
+            self.keep_uncorrected.toggled,
             self.project_edit.editingFinished,
             self.sample_edit.editingFinished,
             self.output_edit.editingFinished,
         ):
             signal.connect(self._refresh)
 
+        layout.setContentsMargins(0, 0, 8, 0)
         scroll = QScrollArea()
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(440)
+        scroll.setMinimumWidth(SETUP_MIN_WIDTH)
         return scroll
 
     def _build_viewer(self, use_ndv: bool) -> QWidget:
@@ -379,7 +584,8 @@ class ScanWindow(QMainWindow):
         overview_tab = QWidget()
         overview_layout = QVBoxLayout(overview_tab)
         overview_layout.setContentsMargins(0, 4, 0, 0)
-        toolbar = QHBoxLayout()
+        toolbar_widget = QWidget()
+        toolbar = FlowLayout(toolbar_widget)
         self.mode_group = QButtonGroup(self)
         self.mode_buttons: dict[str, QToolButton] = {}
         for mode, label, tip in OVERVIEW_MODES:
@@ -400,16 +606,16 @@ class ScanWindow(QMainWindow):
         self.mosaic_mode_box.setToolTip("Cycle mosaic display")
         self.mosaic_mode_box.currentIndexChanged.connect(lambda: self._render_mosaic(force=True))
         toolbar.addWidget(fit)
-        toolbar.addStretch(1)
         toolbar.addWidget(self.mosaic_mode_box)
         self.overview = OverviewCanvas(self.config_data.stage_limits)
         self.overview_hint = QLabel(OVERVIEW_HINTS["navigate"])
-        self.overview_hint.setStyleSheet("color: #888;")
-        overview_layout.addLayout(toolbar)
+        self.overview_hint.setProperty("secondary", True)
+        self.overview_hint.setWordWrap(True)  # long hints wrap instead of widening the window
+        overview_layout.addWidget(toolbar_widget)
         overview_layout.addWidget(self.overview, 1)
         # Accept button under the canvas, so a refocus walk never needs the setup panel.
         self.overview_accept_button = QPushButton("Accept Z ▶")
-        self.overview_accept_button.setStyleSheet("font-weight: 600;")
+        self.overview_accept_button.setProperty("accent", True)
         self.overview_accept_button.clicked.connect(self._set_focus_z_here)
         self.overview_accept_button.hide()
         hint_row = QHBoxLayout()
@@ -433,7 +639,10 @@ class ScanWindow(QMainWindow):
         self.tabs.addTab(self.frame_view, "Camera")
         layout.addWidget(self.tabs, 1)
 
-        controls = QHBoxLayout()
+        controls_widget = QWidget()
+        controls = FlowLayout(controls_widget, spacing=12)  # jog pad wraps below on narrow windows
+        camera_widget = QWidget()
+        camera_bar = FlowLayout(camera_widget)
         self.live_button = QPushButton("Live")
         self.live_button.setCheckable(True)
         self.live_button.toggled.connect(self._toggle_live)
@@ -451,13 +660,11 @@ class ScanWindow(QMainWindow):
             "(over the regions if any, else a 5×5 grid). Current Z only, no Z moves."
         )
         self.preview_button.toggled.connect(self._toggle_spiral_preview)
-        controls.addWidget(self.live_button)
-        controls.addWidget(self.snap_button)
-        controls.addWidget(self.live_channel_box)
-        controls.addWidget(self.preview_button)
-        controls.addStretch(1)
+        for widget in (self.live_button, self.snap_button, self.live_channel_box, self.preview_button):
+            camera_bar.addWidget(widget)
+        controls.addWidget(camera_widget)
         controls.addWidget(self.jog)
-        layout.addLayout(controls)
+        layout.addWidget(controls_widget)
         return wrapper
 
     def _build_review_panel(self) -> QWidget:
@@ -475,7 +682,7 @@ class ScanWindow(QMainWindow):
 
         self.start_button = QPushButton("Start cycle")
         self.start_button.setMinimumHeight(40)
-        self.start_button.setStyleSheet("font-weight: 600;")
+        self.start_button.setProperty("accent", True)
         self.start_button.clicked.connect(self._start_cycle)
         self.pause_button = QPushButton("Pause")
         self.pause_button.clicked.connect(self._toggle_pause)
@@ -488,36 +695,48 @@ class ScanWindow(QMainWindow):
         self.progress.setRange(0, 1000)
         self.progress_label = QLabel()
         self.progress_label.setWordWrap(True)
+        self.progress_label.setProperty("secondary", True)
+        layout.setContentsMargins(8, 0, 0, 0)
         layout.addWidget(self.start_button)
         layout.addLayout(run_row)
         layout.addWidget(self.progress)
         layout.addWidget(self.progress_label)
         layout.addStretch(1)
-        panel.setMinimumWidth(280)
+        panel.setMinimumWidth(REVIEW_MIN_WIDTH)
         return panel
 
-    def _build_device_docks(self) -> None:
-        """Micro-Manager device panels (pymmcore-widgets), only for the MMCore backend."""
+    def _build_device_pages(self) -> None:
+        """Micro-Manager device panels (pymmcore-widgets) on the Devices page, MMCore only."""
 
-        self.device_docks: list[QDockWidget] = []
+        self.device_panels: list[QWidget] = []
+        layout = self.devices_page.layout()
         core = getattr(self.backend, "core", None)
-        if core is None or self.backend.simulated:
+        widgets = None
+        if core is not None and not self.backend.simulated:
+            try:
+                from pymmcore_widgets import CoreLogWidget, PropertyBrowser
+
+                widgets = (
+                    ("Device properties (admin)", PropertyBrowser(mmcore=core)),
+                    ("Micro-Manager log", CoreLogWidget(mmcore=core)),
+                )
+            except ImportError:  # pragma: no cover
+                widgets = None
+        if not widgets:
+            note = QLabel(
+                "Device panels appear here when the Micro-Manager backend is connected "
+                "(start with --backend mmcore). The simulator has no devices to inspect."
+            )
+            note.setProperty("secondary", True)
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            layout.addStretch(1)
             return
-        try:
-            from pymmcore_widgets import CoreLogWidget, PropertyBrowser
-        except ImportError:  # pragma: no cover
-            return
-        menu = self.menuBar().addMenu("Devices")
-        for title, widget in (
-            ("Device properties (admin)", PropertyBrowser(mmcore=core)),
-            ("Micro-Manager log", CoreLogWidget(mmcore=core)),
-        ):
-            dock = QDockWidget(title, self)
-            dock.setWidget(widget)
-            dock.hide()
-            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-            menu.addAction(dock.toggleViewAction())
-            self.device_docks.append(dock)
+        for title, widget in widgets:
+            card = QGroupBox(title)
+            QVBoxLayout(card).addWidget(widget)
+            layout.addWidget(card, 1)
+            self.device_panels.append(widget)
 
     # --------------------------------------------------------- configuration --
     def configuration_html(self) -> str:
@@ -576,19 +795,7 @@ class ScanWindow(QMainWindow):
         )
 
     def show_configuration(self) -> None:
-        from qtpy.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Microscope configuration")
-        dialog.resize(620, 560)
-        layout = QVBoxLayout(dialog)
-        text = QTextBrowser()
-        text.setHtml(self.configuration_html())
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(text)
-        layout.addWidget(buttons)
-        dialog.exec()
+        self.show_page("config")
 
     # ------------------------------------------------------- dialogs (seam) --
     def confirm(self, title: str, text: str) -> bool:
@@ -615,6 +822,8 @@ class ScanWindow(QMainWindow):
             consistent_approach=self.consistent_approach.isChecked(),
             shutter_per_frame=self.shutter_per_frame.isChecked(),
             flat_field=self.flat_field.isChecked(),
+            distortion_correction=self.distortion.isChecked(),
+            keep_uncorrected=self.keep_uncorrected.isChecked(),
             focus_method=self.focus_method_box.currentText(),
         )
         return AcquisitionPlan(
@@ -636,6 +845,7 @@ class ScanWindow(QMainWindow):
             return
         self._update_position()
         self._update_experiment_label()
+        self._update_distortion_label()
         self._apply_locks()
         if self.controller.busy:
             self._update_overview()
@@ -671,11 +881,18 @@ class ScanWindow(QMainWindow):
 
     def _set_safety(self, problems: list[str]) -> None:
         if problems:
-            self.safety_label.setStyleSheet("color: #b5442c;")
+            self._set_tone(self.safety_label, "bad")
             self.safety_label.setText("● " + "<br>● ".join(problems[:5]))
         else:
-            self.safety_label.setStyleSheet("color: #2e7d32;")
+            self._set_tone(self.safety_label, "ok")
             self.safety_label.setText("✓ Plan passes configured safety checks")
+
+    @staticmethod
+    def _set_tone(label: QLabel, tone: str) -> None:
+        if label.property("tone") != tone:
+            label.setProperty("tone", tone)
+            label.style().unpolish(label)
+            label.style().polish(label)
 
     def _apply_locks(self) -> None:
         busy = self.controller.busy
@@ -687,8 +904,13 @@ class ScanWindow(QMainWindow):
                        self.flat_field, self.snap_button, self.live_button, self.jog,
                        self.preview_button):
             widget.setEnabled(not busy)
-        for widget in (self.objective_box, self.overlap_x, self.overlap_y, self.tile_order_box):
+        for widget in (self.objective_box, self.overlap_x, self.overlap_y, self.tile_order_box,
+                       self.distortion):
             widget.setEnabled(not busy and not locked)
+        self.keep_uncorrected.setEnabled(not busy and self.distortion.isChecked())
+        self.calibrate_button.setEnabled(not busy)
+        if self.calibration_dialog is not None:
+            self.calibration_dialog._update()
         self.region_list.set_locked(busy or locked)
         self.shift_button.setEnabled(not busy and locked)
         self.recipe_box.setEnabled(not busy)
@@ -709,8 +931,41 @@ class ScanWindow(QMainWindow):
             "Continue" if status is not None and status.state in ("pausing", "paused") else "Pause"
         )
         self.resume_button.setEnabled(not busy and self.controller.resume_info() is not None)
-        for dock in getattr(self, "device_docks", ()):
-            dock.widget().setEnabled(not busy)
+        for panel in getattr(self, "device_panels", ()):
+            panel.setEnabled(not busy)
+
+    def _update_distortion_label(self) -> None:
+        experiment = self.controller.experiment
+        objective = self.config_data.objective(self.objective_box.currentData())
+        if experiment is not None and experiment.options.distortion_correction:
+            recorded = experiment.calibration.get("distortion", {})
+            text = f"Experiment uses its own copy of the calibration ({recorded.get('calibrated_at', '')[:16]})."
+        else:
+            try:
+                correction = self.controller.load_correction(objective.id)
+            except (OSError, ValueError) as exc:
+                text = f"Calibration file unreadable: {exc}"
+            else:
+                text = (
+                    f"{objective.name}: not calibrated."
+                    if correction is None
+                    else f"{objective.name}: calibrated {correction.created_at[:10]} for "
+                    + ", ".join(self.config_data.channel(c).name for c in sorted(correction.channels)
+                                if any(ch.id == c for ch in self.config_data.channels))
+                )
+        self.distortion_label.setText(text)
+        self.distortion_label.setVisible(self.distortion.isChecked() or experiment is None)
+
+    def open_distortion_calibration(self):
+        from .calibration import DistortionCalibrationDialog
+
+        if self.calibration_dialog is None:
+            self.calibration_dialog = DistortionCalibrationDialog(self)
+            self.objective_box.currentIndexChanged.connect(self.calibration_dialog.sync_objective)
+        self.calibration_dialog.sync_objective()
+        self.calibration_dialog.show()
+        self.calibration_dialog.raise_()
+        return self.calibration_dialog
 
     def _update_position(self) -> None:
         if self.controller.busy:
@@ -740,10 +995,12 @@ class ScanWindow(QMainWindow):
         experiment = self.controller.experiment
         if experiment is None:
             self.experiment_label.setText("No experiment — cycle 1 creates one")
+            self.experiment_label.setToolTip(self.experiment_label.text())
         else:
             self.experiment_label.setText(
                 f"{experiment.project} / {experiment.sample} • {len(experiment.cycles)} cycle(s)"
             )
+            self.experiment_label.setToolTip(self.experiment_label.text())
 
     # --------------------------------------------------------------- inputs --
     def _choose_output(self) -> None:
@@ -1355,6 +1612,8 @@ class ScanWindow(QMainWindow):
                 self.shutter_per_frame.setChecked(options.shutter_per_frame)
                 self.consistent_approach.setChecked(options.consistent_approach)
                 self.flat_field.setChecked(options.flat_field)
+                self.keep_uncorrected.setChecked(options.keep_uncorrected)
+            self.distortion.setChecked(experiment.options.distortion_correction)
             self.objective_box.setCurrentIndex(self.objective_box.findData(experiment.objective_id))
         finally:
             self._loading = False
@@ -1511,11 +1770,47 @@ class ScanWindow(QMainWindow):
         if self.controller.busy and not self.confirm("Quit", "A cycle is running. Abort it and quit?"):
             event.ignore()
             return
-        self.position_timer.stop()
+        self.live_button.setChecked(False)
+        self.stop_spiral_preview()
+        self.position_timer.stop()  # no new device jobs while shutting down
+        if not self.device.stop_and_drain(timeout=DEVICE_DRAIN_TIMEOUT_S):
+            # A camera or stage command is still running on the device worker:
+            # closing the backend under it is unsafe, so stay open.
+            self.warn(
+                "Microscope busy",
+                "A camera or stage command is still running. The program stays open; "
+                "try again when it has finished.",
+            )
+            self._refuse_close(event)
+            return
+        if not self.controller.close(timeout=CLOSE_TIMEOUT_S):
+            self.warn(
+                "Still saving",
+                "The acquisition is stopping but the SSD writer is still saving its current "
+                "frame. The program stays open so no data is lost; try again in a moment.",
+            )
+            self._refuse_close(event)
+            return
         self.poll_timer.stop()
         self.device.shutdown()
-        self.controller.close()
         event.accept()
+
+    def _refuse_close(self, event) -> None:
+        self.position_timer.start()
+        if self.controller.engine is not None and not self.poll_timer.isActive():
+            self.poll_timer.start()
+        event.ignore()
+
+
+class _Rail(QWidget):
+    """Navigation rail: prefers its mode's width but may be squeezed to the compact width."""
+
+    preferred_width = RAIL_WIDE
+
+    def sizeHint(self):  # noqa: N802 - Qt API
+        hint = super().sizeHint()
+        hint.setWidth(self.preferred_width)
+        return hint
 
 
 def main(argv: list[str] | None = None) -> None:

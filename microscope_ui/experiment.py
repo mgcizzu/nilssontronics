@@ -79,6 +79,9 @@ class Experiment:
     base_focus_points: tuple[FocusPoint, ...] = ()
     created_at: str = field(default_factory=lambda: _now())
     cycles: list[CycleRecord] = field(default_factory=list)
+    # Image calibration when cycle 1 started (pixel size, camera, orientation).
+    # Every later cycle and every resume must match it; empty for old files.
+    calibration: dict = field(default_factory=dict)
 
     # -- creation & persistence ----------------------------------------------
     @classmethod
@@ -94,6 +97,7 @@ class Experiment:
         tiles: tuple[Tile, ...],
         options: AcquisitionOptions,
         focus_points: tuple[FocusPoint, ...] = (),
+        calibration: dict | None = None,
     ) -> "Experiment":
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         root = Path(output_root) / slug(project) / f"{slug(sample)}_{timestamp}"
@@ -109,6 +113,7 @@ class Experiment:
             tiles=tiles,
             options=options,
             base_focus_points=focus_points,
+            calibration=dict(calibration or {}),
         )
         experiment.save()
         return experiment
@@ -136,6 +141,7 @@ class Experiment:
             base_focus_points=tuple(FocusPoint(**item) for item in data.get("base_focus_points", [])),
             created_at=data.get("created_at", ""),
             cycles=[_cycle_from_dict(item) for item in data.get("cycles", [])],
+            calibration=dict(data.get("calibration", {})),
         )
 
     def to_dict(self) -> dict:
@@ -149,6 +155,7 @@ class Experiment:
             "objective_id": self.objective_id,
             "overlap_x_percent": self.overlap_x_percent,
             "overlap_y_percent": self.overlap_y_percent,
+            "calibration": self.calibration,
             "coordinate_system": "stage_micrometres (cycle 1 frame; per-cycle offsets below)",
             "regions": [
                 {"shape": region.shape, "vertices_um": [list(v) for v in region.vertices]}
@@ -190,13 +197,24 @@ class Experiment:
                 f"Cycle {unfinished.number} is not complete; resume or finish it first"
             )
         self.cycles.append(record)
-        self.save()
+        try:
+            self.save()
+        except BaseException:
+            self.cycles.pop()  # memory never runs ahead of experiment.json
+            raise
         return record
 
     def update_cycle(self, number: int, **changes) -> CycleRecord:
-        record = replace(self.cycles[number - 1], **changes)
+        """Change a cycle record; the in-memory record changes only if the save succeeds."""
+
+        previous = self.cycles[number - 1]
+        record = replace(previous, **changes)
         self.cycles[number - 1] = record
-        self.save()
+        try:
+            self.save()
+        except BaseException:
+            self.cycles[number - 1] = previous
+            raise
         return record
 
     def resumable_cycle(self) -> CycleRecord | None:

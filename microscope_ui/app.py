@@ -10,6 +10,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import numpy as np
+
 from .backend import HardwareError
 from .backend_mmcore import create_backend
 from .config import DEFAULT_CONFIG_PATH, load_config
@@ -28,6 +30,8 @@ from .mosaic import DiskBackedMosaic, MosaicBounds
 from .optics import automatic_z_stack, recommended_z_step_um
 from .planner import spiral_preview_positions
 from .roi_io import load_roi_set, save_roi_set
+
+LIVE_INTERVAL_MS = 150
 
 
 BG = "#eef3f5"
@@ -61,7 +65,11 @@ class ScanConsole(tk.Tk):
         self.move_original_regions: tuple[ScanRegion, ...] = ()
         self.move_original_focus_points: tuple[FocusPoint, ...] = ()
         self.overview_mode = True
-        self.live = True
+        self.live = False  # Live snaps the real camera; it starts only when asked
+        self.live_job: str | None = None
+        self.last_frame: np.ndarray | None = None
+        self.last_frame_xy: tuple[float, float] = (0.0, 0.0)
+        self.live_photo: tk.PhotoImage | None = None
         self.drag_start: tuple[float, float] | None = None
         self.drag_rectangle_id: int | None = None
         self.preview_job: str | None = None
@@ -115,6 +123,8 @@ class ScanConsole(tk.Tk):
         self.consistent_approach_var = tk.BooleanVar(value=False)
         self.shutter_per_frame_var = tk.BooleanVar(value=True)
         self.flat_field_var = tk.BooleanVar(value=False)
+        self.distortion_var = tk.BooleanVar(value=False)
+        self.keep_uncorrected_var = tk.BooleanVar(value=True)
         self.experiment_var = tk.StringVar(value="No experiment — the first scan creates one")
         self.offset_var = tk.StringVar(value="")
 
@@ -419,6 +429,8 @@ class ScanConsole(tk.Tk):
             ("Close shutter during moves", self.shutter_per_frame_var),
             ("Consistent stage approach (backlash)", self.consistent_approach_var),
             ("Flat-field profile after each cycle", self.flat_field_var),
+            ("Correct lens distortion (calibrated; fixed by cycle 1)", self.distortion_var),
+            ("Keep uncorrected frames too", self.keep_uncorrected_var),
         ):
             ttk.Checkbutton(
                 options, text=text, variable=variable, command=self._input_changed
@@ -736,6 +748,10 @@ class ScanConsole(tk.Tk):
         self._stop_spiral_preview(clear_overlay=True)
         objective = self._selected_objective()
         previous = self.config_data.objective(self.backend.current_objective_id)
+        if self.controller.busy:
+            self.objective_var.set(previous.name)
+            self.progress_text_var.set("The objective cannot change while an acquisition runs")
+            return
         if objective.id == previous.id:
             return
         if objective.immersion != previous.immersion:
@@ -966,12 +982,30 @@ class ScanConsole(tk.Tk):
             self.after_cancel(self.progress_job)
             self.progress_job = None
         self._stop_spiral_preview(clear_overlay=True)
-        self.controller.close()
+        self._set_live(False)
+        if not self.controller.close(timeout=30.0):
+            messagebox.showwarning(
+                "Still saving",
+                "The acquisition is stopping but the SSD writer is still saving its current "
+                "frame. The program stays open so no data is lost; try again in a moment.",
+                parent=self,
+            )
+            if self.progress_job is None and self.controller.engine is not None:
+                self._poll_scan()
+            return
         self.destroy()
 
     def _safe_move(self, action, *args) -> bool:
-        """Run a stage command, reporting refused/failed moves instead of raising."""
+        """Run a stage command, reporting refused/failed moves instead of raising.
 
+        Refused while a cycle runs: the engine owns the stage, and a move during
+        an exposure would put the image at a different place than its tile record.
+        """
+
+        if self.controller.busy:
+            self.progress_text_var.set("The stage is in use by the running acquisition")
+            self.bell()
+            return False
         try:
             action(*args)
         except HardwareError as exc:
@@ -993,24 +1027,100 @@ class ScanConsole(tk.Tk):
         self._render_scene()
 
     def _toggle_live(self) -> None:
-        self.live = not self.live
-        self.live_button.configure(text="● Live" if self.live else "○ Live")
+        self._set_live(not self.live)
         self.progress_text_var.set("Live view running" if self.live else "Live view paused")
         self._update_focus_status()
         self._render_scene()
 
-    def _snap(self) -> None:
+    def _set_live(self, on: bool) -> None:
+        """Start/stop real camera live view (snaps on the GUI thread; the Qt view uses a worker)."""
+
+        if on and self.controller.busy:
+            on = False
+        self.live = on
+        if hasattr(self, "live_button"):
+            self.live_button.configure(text="● Live" if on else "○ Live")
+        if on and self.live_job is None:
+            self.live_job = self.after(1, self._live_tick)
+        elif not on and self.live_job is not None:
+            self.after_cancel(self.live_job)
+            self.live_job = None
+
+    def _live_tick(self) -> None:
+        self.live_job = None
+        if not self.live or self.controller.busy:
+            self._set_live(False)
+            return
+        if self._acquire_frame():
+            self.overview_mode = False
+            self._update_position_label()
+            self._render_scene()
+            self.live_job = self.after(LIVE_INTERVAL_MS, self._live_tick)
+        else:
+            self._set_live(False)
+
+    def _live_channel(self):
+        name = self.preview_channel_var.get()
+        for channel in self.config_data.channels:
+            if channel.name == name:
+                return channel
+        selected = [c for c in self.config_data.channels if self.channel_vars[c.id].get()]
+        return (selected or list(self.config_data.channels))[0]
+
+    def _acquire_frame(self) -> bool:
+        """Snap one real frame with the preview channel's exposure and power."""
+
+        if self.controller.busy:
+            return False
+        channel = self._live_channel()
+        exposure = self._float_or(self.exposure_vars[channel.id], channel.default_exposure_ms)
+        power = self._float_or(self.power_vars[channel.id], channel.default_power_percent)
         try:
+            # A cycle may have left auto-shutter off with the shutter closed.
+            self.backend.set_shutter_per_frame(True)
+            self.backend.set_channel(channel, exposure, power)
             frame = self.backend.snap()
         except HardwareError as exc:
-            self.progress_text_var.set(f"Snap failed: {exc}")
+            self.progress_text_var.set(f"Camera failed: {exc}")
+            return False
+        position = self.backend.position
+        self.last_frame = np.asarray(frame)
+        self.last_frame_xy = (position.x_um, position.y_um)
+        return True
+
+    def _snap(self) -> None:
+        if self.controller.busy:
             return
-        self.live = False
-        self.live_button.configure(text="○ Live")
+        self._set_live(False)
+        if not self._acquire_frame():
+            return
+        frame = self.last_frame
+        self.overview_mode = False
         self.progress_text_var.set(
             f"Snapshot {frame.shape[1]}×{frame.shape[0]} captured • max {int(frame.max())}"
         )
         self._render_scene()
+
+    def _draw_last_frame(self, width: int, height: int) -> bool:
+        """Draw the last camera frame at its field of view (oriented: +col = +X, +row = +Y)."""
+
+        if self.last_frame is None:
+            return False
+        fov_w, fov_h = self.config_data.fov_um(self.backend.current_objective_id)
+        x, y = self.last_frame_xy
+        x0, y0 = self._stage_to_canvas(x - fov_w / 2, y - fov_h / 2)
+        x1, y1 = self._stage_to_canvas(x + fov_w / 2, y + fov_h / 2)
+        out_w = int(min(abs(x1 - x0), 4 * width))
+        out_h = int(min(abs(y1 - y0), 4 * height))
+        if out_w < 2 or out_h < 2:
+            return False
+        self.live_photo = tk.PhotoImage(
+            data=_frame_to_pgm(self.last_frame, out_w, out_h), format="PPM"
+        )
+        self.viewer.create_image(
+            (x0 + x1) / 2, (y0 + y1) / 2, image=self.live_photo, anchor="center", tags="scene"
+        )
+        return True
 
     def _overview(self) -> None:
         self.overview_mode = True
@@ -1111,8 +1221,7 @@ class ScanConsole(tk.Tk):
             self.overview_mode = False
             self.preview_view = None
             self.view_center_override = None
-            self.live = True
-            self.live_button.configure(text="● Live")
+            self._set_live(True)
             self._update_focus_status()
             self._update_position_label()
             self._render_scene()
@@ -1207,8 +1316,7 @@ class ScanConsole(tk.Tk):
         position = self.backend.position
         if not self._safe_move(self.backend.move_z, position.z_um + delta_um):
             return
-        self.live = True
-        self.live_button.configure(text="● Live")
+        self._set_live(True)
         self._update_position_label()
         self._update_focus_status()
         self._render_scene()
@@ -1550,8 +1658,8 @@ class ScanConsole(tk.Tk):
             )
             mosaic_rendered = True
 
-        if not mosaic_rendered and self.overview_mode:
-            # Simulated slide and tissue section.
+        if not mosaic_rendered and self.overview_mode and self.backend.simulated:
+            # Simulated slide and tissue section (simulator only, never on hardware).
             x0, y0 = self._stage_to_canvas(-42000, -26000)
             x1, y1 = self._stage_to_canvas(42000, 26000)
             self.viewer.create_rectangle(x0, y0, x1, y1, fill="#d8dde0", outline="#f4f7f8", width=2, tags="scene")
@@ -1562,26 +1670,13 @@ class ScanConsole(tk.Tk):
                 ry = rng.randint(10, 48)
                 color = "#7a8f8d" if index % 3 else "#637d79"
                 self.viewer.create_oval(cx - rx, cy - ry, cx + rx, cy + ry, fill=color, outline="", tags="scene")
-        elif not mosaic_rendered:
-            selected_colors = [
-                channel.color
-                for channel in self.config_data.channels
-                if self.channel_vars[channel.id].get()
-            ] or ["#a7c5cc"]
-            for index in range(80):
-                cx = rng.randint(0, width)
-                cy = rng.randint(0, height)
-                radius = rng.randint(3, 17)
-                color = selected_colors[index % len(selected_colors)]
-                self.viewer.create_oval(
-                    cx - radius,
-                    cy - radius,
-                    cx + radius,
-                    cy + radius,
-                    fill=color,
-                    outline="",
-                    stipple="gray50" if radius > 10 else "gray75",
-                    tags="scene",
+        if not self.overview_mode and not self.controller.busy:
+            # Live/Snap: the real camera frame goes on top, an earlier cycle's mosaic
+            # is only background (refocusing between cycles needs the live image).
+            if not self._draw_last_frame(width, height) and not mosaic_rendered:
+                self.viewer.create_text(
+                    width / 2, height / 2, text="Press Live or Snap to see the camera",
+                    fill="#9aa5ad", tags="scene",
                 )
 
         for index, region in enumerate(self.regions, start=1):
@@ -1785,6 +1880,8 @@ class ScanConsole(tk.Tk):
             consistent_approach=self.consistent_approach_var.get(),
             shutter_per_frame=self.shutter_per_frame_var.get(),
             flat_field=self.flat_field_var.get(),
+            distortion_correction=self.distortion_var.get(),
+            keep_uncorrected=self.keep_uncorrected_var.get(),
             focus_method=self.focus_method_var.get(),
         )
         return AcquisitionPlan(
@@ -1999,6 +2096,8 @@ class ScanConsole(tk.Tk):
             self.shutter_per_frame_var.set(options.shutter_per_frame)
             self.consistent_approach_var.set(options.consistent_approach)
             self.flat_field_var.set(options.flat_field)
+            self.keep_uncorrected_var.set(options.keep_uncorrected)
+        self.distortion_var.set(experiment.options.distortion_correction)
         self.objective_var.set(objective.name)
         if self.backend.current_objective_id != objective.id:
             self._objective_changed()
@@ -2032,6 +2131,7 @@ class ScanConsole(tk.Tk):
 
     # -- scanning --------------------------------------------------------------
     def _start_scan(self) -> None:
+        self._set_live(False)
         self._stop_spiral_preview(clear_overlay=True)
         self._stop_refocus()
         try:
@@ -2224,8 +2324,7 @@ class ScanConsole(tk.Tk):
         self.overview_mode = False
         self.preview_view = None
         self.view_center_override = None
-        self.live = True
-        self.live_button.configure(text="● Live")
+        self._set_live(True)
         if moved:
             self.progress_text_var.set(
                 f"Refocus F{index + 1} of {len(self.focus_points)}: focus live, then Accept Z"
@@ -2302,6 +2401,18 @@ class ScanConsole(tk.Tk):
         )
         ttk.Label(body, text=details, style="Panel.TLabel", justify="left").pack(anchor="w")
         ttk.Button(body, text="Close", command=dialog.destroy).pack(anchor="e", pady=(20, 0))
+
+
+def _frame_to_pgm(frame: np.ndarray, width: int, height: int) -> bytes:
+    """Contrast-stretched 8-bit PGM of a camera frame, resized (nearest) for Tk."""
+
+    data = np.asarray(frame, dtype=np.float32)
+    low, high = np.percentile(data, (0.5, 99.5)) if data.size else (0.0, 1.0)
+    rows = (np.arange(height) * data.shape[0] / height).astype(np.int64)
+    cols = (np.arange(width) * data.shape[1] / width).astype(np.int64)
+    small = data[np.ix_(rows, cols)]
+    gray = (np.clip((small - low) / max(high - low, 1.0), 0, 1) * 255).astype(np.uint8)
+    return f"P5\n{width} {height}\n255\n".encode("ascii") + gray.tobytes()
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import re
@@ -30,6 +31,11 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> MicroscopeConfig:
     data = json.loads(config_path.read_text(encoding="utf-8"))
     try:
         config = _parse(data)
+        calibration = data.get("calibration", {})
+        directory = Path(calibration.get("directory", "calibration")).expanduser()
+        if not directory.is_absolute():
+            directory = config_path.parent / directory
+        config = replace(config, calibration_dir=directory)
     except (KeyError, TypeError) as exc:
         raise ConfigError(f"Configuration is missing or has a malformed field: {exc}") from exc
     problems = validate_config(config)
@@ -77,6 +83,7 @@ def _parse(data: dict) -> MicroscopeConfig:
         simulator_frame_px=int(simulator.get("frame_size_px", 256)),
         fsync_tiles=bool(storage.get("fsync", True)),
         hardware=dict(data.get("hardware", {})),
+        simulator_options={key: value for key, value in simulator.items() if key != "frame_size_px"},
     )
 
 

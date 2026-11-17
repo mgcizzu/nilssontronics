@@ -17,7 +17,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from qtpy.QtCore import QObject, Signal
+from qtpy.QtCore import QObject, Qt, Signal
 
 from ..backend import HardwareError, StagePosition
 from ..models import Channel
@@ -47,9 +47,15 @@ class DeviceWorker(QObject):
         self._live = False
         self._live_settings: tuple[Channel, float, float] | None = None
         self._applied: tuple[str, float, float] | None = None
+        # Live/snap need per-frame shutter; a cycle may leave it off with the shutter closed.
+        self._illumination_ready = False
         self._stopped = False
         self.last_position: StagePosition = backend.position
-        self._deliver.connect(lambda callback, value: callback(value))
+        # Bound to this QObject (not a lambda): queued results are delivered on the GUI
+        # thread and are dropped together with the worker when its window is deleted.
+        # A free-function connection outlives the window under PySide6 and would run
+        # callbacks into already-deleted widgets.
+        self._deliver.connect(self._run_callback, Qt.ConnectionType.QueuedConnection)
         self._thread = threading.Thread(target=self._run, name="device-worker", daemon=True)
         self._thread.start()
 
@@ -78,6 +84,12 @@ class DeviceWorker(QObject):
         if on:
             self._put(_Job(None))
 
+    def _run_callback(self, callback, value) -> None:
+        with self._lock:
+            stopped = self._stopped
+        if not stopped:  # the window is shutting down: nobody to report to
+            callback(value)
+
     @property
     def live(self) -> bool:
         with self._lock:
@@ -94,9 +106,10 @@ class DeviceWorker(QObject):
         with self._lock:
             self._live = False
             drained = self._idle.wait_for(lambda: self._pending == 0, timeout)
-            # The engine changes channel/exposure/power during a cycle, so the
-            # next live frame must re-apply its own settings.
+            # The engine changes channel/exposure/power and the shutter mode during
+            # a cycle, so the next live frame must re-apply its own settings.
             self._applied = None
+            self._illumination_ready = False
             return drained
 
     def shutdown(self, timeout: float = 5.0) -> None:
@@ -158,10 +171,27 @@ class DeviceWorker(QObject):
         if settings is None:
             raise HardwareError("No live channel selected")
         channel, exposure, power = settings
+        if not self._illumination_ready:
+            self._backend.set_shutter_per_frame(True)  # camera opens the shutter per exposure
+            self._illumination_ready = True
         state = (channel.id, exposure, power)
         if state != self._applied:
             self._backend.set_channel(channel, exposure, power)
             self._applied = state
+        return self._backend.snap()
+
+    def acquire_with(self, channel: Channel, exposure_ms: float, power_percent: float):
+        """Snap one frame with explicit settings (worker thread only, from a job).
+
+        Used by calibration; the next live frame re-applies the live settings.
+        """
+
+        if not self._illumination_ready:
+            self._backend.set_shutter_per_frame(True)
+            self._illumination_ready = True
+        self._applied = None
+        self._backend.set_channel(channel, exposure_ms, power_percent)
+        self._applied = (channel.id, exposure_ms, power_percent)
         return self._backend.snap()
 
     def _live_frame(self) -> None:

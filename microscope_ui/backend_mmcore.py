@@ -73,10 +73,26 @@ class MMCoreBackend:
         return self._objective_id
 
     def _read_objective_id(self) -> str:
+        """Identify the objective in the light path from the turret, never by guessing.
+
+        Safe-Z checks and preflight depend on it, so an unreadable turret is a
+        startup error. Only a setup without a turret device and exactly one
+        configured objective may skip the read.
+        """
+
+        if not self._objective_device:
+            if len(self._config.objectives) == 1:
+                return self._config.objectives[0].id
+            raise HardwareError(
+                "hardware.objective_device is not set but several objectives are configured"
+            )
         try:
             state = int(self._core.getState(self._objective_device))
-        except Exception:
-            return self._config.objectives[0].id
+        except Exception as exc:
+            raise HardwareError(
+                f"Could not read the objective turret '{self._objective_device}': {exc}. "
+                "The objective in the light path is unknown, so safe Z limits cannot be applied."
+            ) from exc
         for objective in self._config.objectives:
             if objective.turret_position + self._turret_offset == state:
                 return objective.id

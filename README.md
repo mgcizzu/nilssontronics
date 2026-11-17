@@ -14,7 +14,7 @@ Python 3.11+ with Tk and NumPy.
 pip install -e .                 # simulator only
 pip install -e ".[hardware]"     # + pymmcore-plus for a real microscope
 pip install -e ".[flatfield]"    # + BaSiC (basicpy) for flat-field estimation
-pip install -e ".[qt]"           # + Qt view (PyQt6, ndv, pymmcore-widgets)
+pip install -e ".[qt]"           # + Qt view (PySide6, ndv, pymmcore-widgets)
 
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # Micro-Manager (see below)
@@ -78,6 +78,60 @@ A new cycle cannot start while an earlier one is unfinished.
 - **Flat-field profile after each cycle:** writes `cycle_NN/flatfield/<ch>.npy`
   (mean 1, `corrected = raw / profile`); raw data are never modified. Uses
   BaSiC when `basicpy` is installed, otherwise a median-based estimate.
+- **Correct lens distortion:** for microscopes that show barrel/pincushion
+  distortion or small shifts between channels (what LAS X corrects on the fly
+  on Leica systems). Off by default and fixed by cycle 1; see below.
+
+## Distortion correction (optional)
+
+Only needed if a straight grid does not image straight, or channels do not
+overlay. When on, every plane is resampled (bicubic) **before** it is saved,
+so `cycle_NN/` holds corrected, channel-registered tiles at exactly the
+configured pixel size, ready for ISS_preprocessing as before.
+
+**Calibrate** once per objective (and camera binning) with a grid slide, at
+one stage position, in every channel you will image. Qt: *Tiling & options →
+Calibrate distortion…* — enter the grid pitch, then for each channel focus in
+Live and press *Snap grid*; *Fit*, read the report, *Save*. Without the Qt
+view, fit saved grid images (already oriented like the app's frames):
+
+```bash
+python3 -m microscope_ui.distortion --objective 20x_air --pitch 10 \
+    --image dapi=grid_dapi.tif --image cy5=grid_cy5.tif
+```
+
+- **Fluorescent grid** (recommended): corrects the lens distortion *and*
+  registers the channels onto a reference channel. **Reflective/brightfield
+  grid**: geometry only.
+- Dots, line crossings and the cells between lines are all detected; the
+  pitch must be ≥ 6 px and the grid should fill the field.
+- The fit is checked against the ideal grid with the given pitch: it reports
+  the RMS error, the distortion at the corners, each channel's shift and its
+  measured pixel size (warning if it differs from `pixel_size_um` by > 1%).
+
+The file is `config/calibration/distortion_<objective>.json` (folder set by
+`"calibration": {"directory": …}` in the configuration, relative to it).
+A calibration stays valid until the optics change (filter cube, camera
+mount, objective service), so later sessions reuse it automatically. To adopt
+one made earlier, on another computer, or used by an old experiment
+(`distortion_correction.json` in its folder), use *Import…* in the
+calibration dialog: it refuses files for unknown objectives or edited by
+hand, flags unknown channels and a different frame size or field of view,
+and asks before replacing the saved calibration.
+When cycle 1 starts, the experiment copies it to
+`distortion_correction.json` and records its fingerprint; every later cycle
+and resume uses that copy, so all cycles share one geometry even if the lab
+recalibrates. Channels not in the calibration cannot be used with correction
+on. *Keep uncorrected frames* (default on) also saves the camera frames in
+`cycle_NN/uncorrected/` (same names), doubling the disk use. Correction costs
+about 0.2 s per 2048² frame on the writer thread.
+
+Model: shared grid pose, plus per channel the true pixel size, radial
+k1/k2, tangential p1/p2 and an XY shift (Brown–Conrady). Camera-to-stage
+rotation is not corrected (that is `camera.orientation`). Try it in the
+simulator: a grid slide lies at stage X 30 000 µm, and
+`simulator.distortion` (`k1`, `chromatic_scale_per_nm`, `channel_shift_px`)
+adds lens errors.
 
 ## Tile grid
 
@@ -98,6 +152,8 @@ Tile centres (and approach points) are checked against the stage limits.
     tiles.jsonl               append-only journal of finished tiles (resume)
     disk_preview/*.u16        fixed-size memory-mapped preview per channel
     flatfield/                optional
+    uncorrected/              optional: camera frames before distortion correction
+  distortion_correction.json  optional: the correction used by every cycle
   cycle_02/ …
 ```
 
@@ -147,8 +203,8 @@ a fixed-size map regardless of scan area; the current tile shows a running MIP.
 
 ```
 app.py            Tk view
-qt/               Qt view (in progress): overview canvas, ndv live view on a device-worker
-                  thread, pymmcore-widgets device docks
+qt/               Qt view: Fluent-style (dark/light) navigation rail, overview canvas, ndv
+                  live view on a device-worker thread, pymmcore-widgets device panels
 controller.py     ScanController: experiments, preflight, start/pause/abort/resume
 engine.py         AcquisitionEngine: one cycle on a worker thread
 acquisition.py    BoundedAsyncWriter: camera → SSD queue
@@ -159,6 +215,7 @@ focus.py          focus surfaces
 backend.py        backend protocol, limit checks, simulator
 backend_mmcore.py pymmcore-plus backend
 flatfield.py      optional flat-field estimation
+distortion.py     optional grid calibration and distortion/channel correction
 ```
 
 The interface never talks to devices; it builds an `AcquisitionPlan` and calls
@@ -218,3 +275,12 @@ with a plain image view; ndv/vispy needs a real OpenGL display.
 CI (`.github/workflows/tests.yml`) runs the suite on pushes to `main` and on pull
 requests: Ubuntu (Python 3.11, 3.13) and macOS (3.13), Qt offscreen. The
 Micro-Manager demo tests are skipped there.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). Third-party dependencies keep their own licences.
+The Qt view uses **PySide6** (Qt for Python, LGPLv3), which an MIT application may
+use as an ordinary dependency; PyQt6 (GPLv3/commercial) is deliberately not used.
+The other runtime dependencies (numpy, tifffile, pymmcore-plus, pymmcore-widgets,
+ndv, superqt, qtpy) are BSD/MIT-style. The Windows 11 / Fluent styling lives in
+`microscope_ui/qt/theme.py` and needs no third-party theme package.

@@ -12,6 +12,8 @@ pipeline (github.com/Moldia/ISS2025, ``mode='tif_autosaved'``)::
     tiles.jsonl                    append-only index of finished tiles (resume journal)
     disk_preview/<ch>.u16          fixed-size memory-mapped preview per channel
     flatfield/                     optional flat-field profiles (never applied to raw data)
+    uncorrected/                   optional: camera frames before distortion correction
+                                   (same file names; only with distortion correction on)
 
 Naming rules (what the pipeline parses):
 
@@ -55,6 +57,7 @@ from .models import Channel, ChannelSetting, Objective, ScanRegion, Tile
 PIPELINE_MODE = "tif_autosaved"
 PART_SUFFIX = ".part"
 METADATA_DIR = "Metadata"
+UNCORRECTED_DIR = "uncorrected"
 APPLICATION = "nilssontronics"
 
 
@@ -125,6 +128,8 @@ class CycleMetadata:
     z_step_um: float | None = None
     project: str = ""
     sample: str = ""
+    # Fingerprint of the distortion correction applied to the planes (None = camera frames).
+    distortion_correction: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,7 +203,7 @@ class DiskBackedMosaic:
         self.closed = False
         self.preview_dir = self.root / "disk_preview"
         self.preview_dir.mkdir(parents=True, exist_ok=True)
-        for stale in self.root.glob(f"*{PART_SUFFIX}"):
+        for stale in (*self.root.glob(f"*{PART_SUFFIX}"), *self.root.glob(f"{UNCORRECTED_DIR}/*{PART_SUFFIX}")):
             stale.unlink()  # planes of a tile that never finished
         self._channel_index = {channel.id: index for index, channel in enumerate(channels)}
         self._names = pipeline_regions(tiles)
@@ -228,6 +233,7 @@ class DiskBackedMosaic:
             self._restore_display_range(channel.id)
 
         index_path = self.root / "tiles.jsonl"
+        _repair_journal_tail(index_path, fsync=fsync)
         self._index = index_path.open("a", encoding="utf-8")
         self._current_tile: dict | None = None
         self._current_planes: list[dict] = []
@@ -336,7 +342,11 @@ class DiskBackedMosaic:
         z_index: int,
         frame: np.ndarray,
         z_um: float | None = None,
+        uncorrected: np.ndarray | None = None,
     ) -> None:
+        """Save one plane; ``uncorrected`` (camera frame before distortion correction)
+        is stored under ``uncorrected/`` with the same name when given."""
+
         if self._current_tile is None:
             raise RuntimeError("Begin a tile before writing planes")
         if channel_id not in self._channel_colors:
@@ -354,9 +364,15 @@ class DiskBackedMosaic:
         final_path = self.root / filename
         part_path = final_path.with_name(filename + PART_SUFFIX)
         _write_plane_tiff(part_path, frame, fsync=self.fsync)
-        self._current_planes.append(
-            {"channel": channel_id, "z_index": z_index, "z_um": z_um, "file": filename}
-        )
+        plane = {"channel": channel_id, "z_index": z_index, "z_um": z_um, "file": filename}
+        if uncorrected is not None:
+            original = f"{UNCORRECTED_DIR}/{filename}"
+            (self.root / UNCORRECTED_DIR).mkdir(exist_ok=True)
+            _write_plane_tiff(
+                self.root / (original + PART_SUFFIX), np.ascontiguousarray(uncorrected), fsync=self.fsync
+            )
+            plane["uncorrected_file"] = original
+        self._current_planes.append(plane)
         self._paint_plane(channel_id, frame)
 
     def _paint_plane(self, channel_id: str, frame: np.ndarray) -> None:
@@ -380,8 +396,13 @@ class DiskBackedMosaic:
             final_path = self.root / plane["file"]
             final_path.with_name(plane["file"] + PART_SUFFIX).replace(final_path)
             paths.append(final_path)
+            if "uncorrected_file" in plane:
+                original = self.root / plane["uncorrected_file"]
+                original.with_name(original.name + PART_SUFFIX).replace(original)
         if self.fsync:
             _fsync_directory(self.root)
+            if any("uncorrected_file" in plane for plane in self._current_planes):
+                _fsync_directory(self.root / UNCORRECTED_DIR)
 
         record = {
             "tile": tile["tile"],
@@ -414,6 +435,8 @@ class DiskBackedMosaic:
 
         for plane in self._current_planes:
             (self.root / (plane["file"] + PART_SUFFIX)).unlink(missing_ok=True)
+            if "uncorrected_file" in plane:
+                (self.root / (plane["uncorrected_file"] + PART_SUFFIX)).unlink(missing_ok=True)
         self._current_tile = None
         self._current_planes = []
         self._current_mip = {}
@@ -528,6 +551,22 @@ def read_tile(cycle_root: Path, tile_index: int) -> tuple[dict, dict[tuple[str, 
     return record, planes
 
 
+def middle_plane(record: dict, channel_id: str) -> int | None:
+    """Z index of the middle plane a finished tile has for ``channel_id`` (None if absent)."""
+
+    z_indices = sorted(int(p["z_index"]) for p in record.get("planes", ()) if p["channel"] == channel_id)
+    return z_indices[len(z_indices) // 2] if z_indices else None
+
+
+def read_plane(cycle_root: Path, record: dict, channel_id: str, z_index: int) -> np.ndarray:
+    """Read one plane of a finished tile (no other planes are loaded)."""
+
+    for plane in record["planes"]:
+        if plane["channel"] == channel_id and int(plane["z_index"]) == int(z_index):
+            return tifffile.imread(Path(cycle_root) / plane["file"])
+    raise KeyError(f"Tile {record.get('tile')} has no plane ({channel_id}, z={z_index})")
+
+
 def write_region_metadata(
     root: Path,
     tiles: Sequence[Tile],
@@ -606,13 +645,15 @@ def write_region_metadata(
             Immersion=objective.immersion,
             RefractiveIndex=f"{objective.immersion_refractive_index:g}",
         )
-        ET.SubElement(
+        acquisition = ET.SubElement(
             image, "Attachment", Name="Acquisition", Application=APPLICATION,
             Cycle=str(metadata.cycle), Project=metadata.project, Sample=metadata.sample,
             PixelSizeUm=f"{pixel_um:.6f}", ZPlanes=str(metadata.z_planes),
             FileNaming="<region>--Stage<tile>--Z<plane>--C<channel>.tif",
             PipelineMode=PIPELINE_MODE,
         )
+        if metadata.distortion_correction:
+            acquisition.set("DistortionCorrection", metadata.distortion_correction)
         ET.indent(data)
         path = folder / f"{region}.xml"
         temporary = path.with_name(path.name + PART_SUFFIX)
@@ -620,6 +661,61 @@ def write_region_metadata(
         temporary.replace(path)
         written.append(path)
     return written
+
+
+def _repair_journal_tail(path: Path, fsync: bool = True) -> None:
+    """Make the journal end with a newline before appending again.
+
+    A crash during an append can leave a last line without its newline; the
+    next record would be glued onto it and both would be unreadable.
+
+    * If that line is a complete record (``tile_records`` already counts it, so
+      resume skips that tile), keep it and add the missing newline.
+    * Otherwise it is a torn fragment that never described a finished tile:
+      cut it; that tile is re-acquired on resume.
+    """
+
+    if not path.exists():
+        return
+    with path.open("rb+") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        if size == 0:
+            return
+        handle.seek(size - 1)
+        if handle.read(1) == b"\n":
+            return
+        # Find the end of the last complete line (0 if there is none).
+        position = size
+        keep = 0
+        while position > 0:
+            step = min(65536, position)
+            position -= step
+            handle.seek(position)
+            chunk = handle.read(step)
+            newline = chunk.rfind(b"\n")
+            if newline != -1:
+                keep = position + newline + 1
+                break
+        handle.seek(keep)
+        tail = handle.read()
+        if _is_complete_record(tail):
+            handle.seek(0, os.SEEK_END)
+            handle.write(b"\n")
+        else:
+            handle.truncate(keep)
+        handle.flush()
+        if fsync:
+            os.fsync(handle.fileno())
+
+
+def _is_complete_record(line: bytes) -> bool:
+    """Same acceptance rule as :func:`tile_records` (minus the file-existence check)."""
+
+    try:
+        record = json.loads(line.decode("utf-8"))
+        return bool(record["planes"]) and isinstance(int(record["tile"]), int)
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return False
 
 
 def _write_plane_tiff(path: Path, frame: np.ndarray, fsync: bool) -> None:

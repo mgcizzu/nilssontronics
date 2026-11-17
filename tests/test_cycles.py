@@ -349,6 +349,26 @@ class MMCoreBackendTests(unittest.TestCase):
             backend.snap()
         self.assertIn("Camera timeout", str(context.exception))
 
+    def test_unreadable_turret_is_a_startup_error_not_a_guess(self) -> None:
+        core = FakeCore()
+
+        def broken(_device):
+            raise RuntimeError("Serial port timeout")
+
+        core.getState = broken
+        with self.assertRaises(HardwareError) as context:
+            MMCoreBackend(load_config(), core=core)
+        self.assertIn("Serial port timeout", str(context.exception))
+        self.assertIn("objective", str(context.exception).lower())
+
+    def test_no_turret_device_needs_exactly_one_objective(self) -> None:
+        config = load_config()
+        config = replace(config, hardware={**config.hardware, "objective_device": ""})
+        with self.assertRaises(HardwareError):
+            MMCoreBackend(config, core=FakeCore())
+        single = replace(config, objectives=(config.objective("20x_air"),))
+        self.assertEqual(MMCoreBackend(single, core=FakeCore()).current_objective_id, "20x_air")
+
     def test_missing_channel_preset_is_rejected_at_startup(self) -> None:
         config = load_config()
         presets = dict(config.hardware["channel_presets"])
