@@ -92,20 +92,52 @@ Tile centres (and approach points) are checked against the stage limits.
 <output>/<project>/<sample>_<timestamp>/
   experiment.json          objective, ROIs, tile list, every cycle's settings,
                            offset, focus points, status (atomic + fsync)
-  cycle_01/
-    tiles/tile_00000.tstack   one finished tile (all channels and Z planes)
+  cycle_01/                 ← one ISS_preprocessing input folder
+    R01--Stage0000--Z00--C00.tif   one uint16 plane per file
+    Metadata/R01.xml          Leica-style tile positions, pixel size, objective, channels
     tiles.jsonl               append-only journal of finished tiles (resume)
     disk_preview/*.u16        fixed-size memory-mapped preview per channel
     flatfield/                optional
   cycle_02/ …
 ```
 
-`.tstack` is an **interim** container (JSON header + raw planes, readable
-with `microscope_ui.mosaic.read_tile_stack`) until the file names and format
-required by the downstream pipeline are agreed; only `mosaic.py` knows it.
+### Feeding ISS_preprocessing
 
-Each tile is written to `.tmp`, fsynced, atomically renamed, then appended to
-`tiles.jsonl` (also fsynced). Every tile in the journal is therefore complete
+Each `cycle_NN` folder is a ready input folder for
+[ISS_preprocessing](https://github.com/Moldia/ISS2025/tree/main/ISS_preprocessing)
+in **`tif_autosaved`** mode (Leica autosave naming):
+
+```python
+pp.preprocessing_main(
+    input_dirs=[".../Sample_…/cycle_01/", ".../Sample_…/cycle_02/", ...],
+    cycles=[1, 2, ...],
+    output_dir_prefix=".../preprocessed/",
+    mode="tif_autosaved",
+    n_total_cycles=N,
+    align_channel=0,        # position of DAPI in the cycle's channel list (C00 = first)
+    pixel_to_um=None,       # read from Metadata/R*.xml; pass a value to override
+    ...
+)
+```
+
+* **`R01`** – region = one connected group of tiles. Separate tissue sections
+  become `R01`, `R02`, … and are stitched separately. The grouping comes from
+  the tile grid fixed by cycle 1, so it is identical in every cycle.
+* **`Stage0000`** – tile within the region (0-based, acquisition order) and the
+  `TileIndex` of its position in `Metadata/R01.xml`.
+* **`Z00`** – Z plane (zero-padded so name order is plane order).
+* **`C00`** – channel, 0-based in the cycle's channel order (the order of the
+  configuration's channel list). Names, exposures and powers per index are in
+  the XML `<Channels>` and in `experiment.json`. Keep DAPI in every cycle so
+  `align_channel` points at it.
+* Positions are the cycle's real stage positions in µm (re-registration offset
+  included); +X = image right, +Y = image down, no flips.
+
+Only `mosaic.py` knows this format.
+
+Each plane is written to `<name>.tif.part` (ignored by the pipeline) and fsynced.
+When the whole tile is done its planes are renamed to `.tif` and the tile is
+appended to `tiles.jsonl` (also fsynced). Every tile in the journal is therefore complete
 on disk after a crash. Camera frames pass through a bounded queue
 (`storage.writer_queue_frames`) to one writer thread: if the SSD falls behind,
 the camera waits; frames are never dropped and RAM never grows. The preview is

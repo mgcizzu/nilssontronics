@@ -13,9 +13,11 @@ See README.md for the architecture, data layout and configuration.
   "Align selected F → stage"). No rotation/affine, no automatic registration.
 - **Refocus = manual**, guided "Refocus all" through stored focus points (Z only).
   No software/hardware autofocus for now.
-- **Output format is NOT ASHLAR/MCMICRO.** It must match a specific downstream
-  pipeline whose file names/format are still to be agreed. `.tstack` in
-  `mosaic.py` is an interim container; keep format knowledge inside `mosaic.py`.
+- **Output = ISS_preprocessing input** (github.com/Moldia/ISS2025, `mode='tif_autosaved'`):
+  each `cycle_NN/` holds `R01--Stage0000--Z00--C00.tif` planes plus
+  `Metadata/R01.xml` (Leica-style TileScanInfo with TileIndex = Stage, µm positions,
+  pixel size). Regions = 8-connected tile groups; C = cycle channel order. Agreed
+  2026-11-17; keep all format knowledge inside `mosaic.py`.
 - **Resume** works per cycle from `cycle_NN/tiles.jsonl`; a new cycle can't start
   while an earlier one is unfinished.
 - **Optional features stay optional:** serpentine order, consistent stage approach,
@@ -33,7 +35,7 @@ See README.md for the architecture, data layout and configuration.
 ## Commands
 ```bash
 pip install -e ".[hardware,qt,test]"
-python3 -m pytest                              # 92 tests, no display needed
+python3 -m pytest                              # 100 tests, no display needed
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # pymmcore-plus (hardware section of config)
 python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv for plain image view)
@@ -48,7 +50,11 @@ python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv f
    calls run on `DeviceWorker` (never the GUI thread), drained before the engine starts.
    Never use pymmcore-widgets StageWidget: it bypasses backend stage-limit checks.
    Next: Marco tries it at the microscope, then decide whether to retire the Tk view.
-2. Agree output file naming/format with the downstream pipeline, then replace `.tstack`.
+2. Run ISS_preprocessing's `align_and_stitch` (ashlar + Java) on our cycles. Verified
+   2026-11-17 with the pipeline's own code: `deconvolve_and_mip(mode='tif_autosaved')` and
+   `mipped_to_OME_tiffs` on 2 simulated cycles × 2 regions — units/pixel size/magnification
+   read from our XML without warnings, tile positions exact, MIPs identical.
+   `tests/test_pipeline_format.py` mirrors its parsing rules for CI.
 3. Before any real-hardware run: calibrate turret positions, pixel sizes, camera
    orientation, stage limits and safe Z ranges at the microscope.
 

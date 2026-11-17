@@ -19,7 +19,7 @@ from .experiment import CycleRecord, Experiment
 from .flatfield import estimate_flat_fields
 from .focus import FocusSurface
 from .models import AcquisitionEstimate, AcquisitionPlan, MicroscopeConfig, Tile, ZSettings
-from .mosaic import DiskBackedMosaic, completed_tile_indices, mosaic_bounds_for_tiles
+from .mosaic import CycleMetadata, DiskBackedMosaic, completed_tile_indices, mosaic_bounds_for_tiles
 from .planner import estimate_acquisition, tiles_for_plan, validate_plan
 
 
@@ -224,11 +224,24 @@ class ScanController:
         channels = tuple(self.config.channel(item.channel_id) for item in record.channels)
         fov_w, fov_h = self.config.fov_um(experiment.objective_id)
         folder = experiment.cycle_folder(record.number)
+        z_planes = max((len(values) for values in z_positions.values()), default=1)
         self.mosaic = DiskBackedMosaic(
             folder,
             mosaic_bounds_for_tiles(list(tiles), fov_w, fov_h),
             channels,
             fsync=self.config.fsync_tiles,
+            tiles=tiles,
+            metadata=CycleMetadata(
+                cycle=record.number,
+                objective=self.config.objective(experiment.objective_id),
+                channel_settings=tuple(record.channels),
+                camera_width_px=self.config.camera_width_px,
+                camera_height_px=self.config.camera_height_px,
+                z_planes=z_planes,
+                z_step_um=record.z.step_um if record.z.mode == "stack" else None,
+                project=experiment.project,
+                sample=experiment.sample,
+            ),
         )
         writer = BoundedAsyncWriter(self.mosaic, queue_capacity=self.config.writer_queue_frames)
         run = CycleRun(

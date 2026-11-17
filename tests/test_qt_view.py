@@ -17,7 +17,7 @@ from qtpy.QtCore import QTimer  # noqa: E402
 from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
 from microscope_ui.models import ScanRegion  # noqa: E402
-from microscope_ui.mosaic import read_tile_stack  # noqa: E402
+from microscope_ui.mosaic import read_tile  # noqa: E402
 from microscope_ui.qt.window import ScanWindow  # noqa: E402
 
 
@@ -79,8 +79,7 @@ def test_two_cycles_with_xy_shift(qtbot, window):
     assert (record.offset_x_um, record.offset_y_um) == (15.0, -7.5)
     tiles_2 = experiment.tiles_for_cycle(2)
     assert [(t.index, t.row, t.col) for t in tiles_1] == [(t.index, t.row, t.col) for t in tiles_2]
-    tile_file = next((experiment.cycle_folder(2) / "tiles").glob("*.tstack"))
-    _header, planes = read_tile_stack(tile_file)
+    _header, planes = read_tile(experiment.cycle_folder(2), 0)
     assert set(planes) == {("dapi", 0), ("cy5", 0)}
 
 

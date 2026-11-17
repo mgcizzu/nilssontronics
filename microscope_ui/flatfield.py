@@ -18,7 +18,7 @@ from typing import Callable
 
 import numpy as np
 
-from .mosaic import read_tile_stack
+from .mosaic import read_tile, tile_records
 
 
 def estimate_flat_fields(
@@ -28,18 +28,18 @@ def estimate_flat_fields(
     should_stop: Callable[[], bool] = lambda: False,
 ) -> Path | None:
     cycle_root = Path(cycle_root)
-    tile_paths = sorted((cycle_root / "tiles").glob("*.tstack"))
-    if len(tile_paths) < 3:
+    tile_ids = sorted(tile_records(cycle_root))
+    if len(tile_ids) < 3:
         return None
-    if len(tile_paths) > max_tiles:
-        picks = np.linspace(0, len(tile_paths) - 1, max_tiles).round().astype(int)
-        tile_paths = [tile_paths[i] for i in sorted(set(picks))]
+    if len(tile_ids) > max_tiles:
+        picks = np.linspace(0, len(tile_ids) - 1, max_tiles).round().astype(int)
+        tile_ids = [tile_ids[i] for i in sorted(set(picks))]
 
     stacks: dict[str, list[np.ndarray]] = {channel: [] for channel in channel_ids}
-    for path in tile_paths:
+    for tile_id in tile_ids:
         if should_stop():
             return None
-        _header, planes = read_tile_stack(path)
+        _record, planes = read_tile(cycle_root, tile_id)
         for channel in channel_ids:
             z_indices = sorted(z for (c, z) in planes if c == channel)
             if not z_indices:
