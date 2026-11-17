@@ -205,6 +205,58 @@ class CompletionOrderTests(ControllerCase):
         self.assertEqual(Experiment.load(experiment.root).cycle(record.number).status, "complete")
 
 
+class FailurePathTests(ControllerCase):
+    def test_quit_never_closes_storage_under_a_busy_writer(self) -> None:
+        release = threading.Event()
+        writing = threading.Event()
+        real_write = DiskBackedMosaic.write_plane
+
+        def stalled_write(mosaic, *args, **kwargs):
+            writing.set()
+            release.wait(10)
+            return real_write(mosaic, *args, **kwargs)
+
+        with mock.patch.object(DiskBackedMosaic, "write_plane", stalled_write):
+            self.controller.start_cycle(self.plan())
+            self.assertTrue(writing.wait(5))
+            mosaic = self.controller.mosaic
+            self.assertFalse(self.controller.close(timeout=0.3))
+            self.assertIs(self.controller.mosaic, mosaic)
+            self.assertFalse(mosaic.closed, "storage closed under an in-flight write")
+            release.set()
+            self.assertTrue(self.controller.close(timeout=10))
+        self.assertIsNone(self.controller.mosaic)
+        self.assertTrue(mosaic.closed)
+        self.assertEqual(self.controller.status().state, "aborted")
+
+    def test_failed_final_save_is_reported_and_stays_resumable(self) -> None:
+        self.controller.start_cycle(self.plan())
+        experiment = self.controller.experiment
+        real_save = experiment.save
+
+        def failing_save():
+            if any(cycle.status == "complete" for cycle in experiment.cycles):
+                raise OSError("No space left on device")
+            return real_save()
+
+        experiment.save = failing_save
+        self.assertTrue(self.controller.wait(30))
+        status = self.controller.status()
+        self.assertEqual(status.state, "failed")
+        self.assertIn("could not be saved", status.message)
+        self.assertIn("No space left on device", status.error)
+        # Memory and disk agree, and the cycle can be resumed.
+        self.assertEqual(experiment.cycle(1).status, "running")
+        self.assertEqual(Experiment.load(experiment.root).cycle(1).status, "running")
+        self.assertIsNotNone(self.controller.resume_info())
+
+        experiment.save = real_save  # the disk problem is fixed
+        self.controller.resume_cycle()
+        self.assertTrue(self.controller.wait(30))
+        self.assertEqual(self.controller.status().state, "complete")
+        self.assertEqual(Experiment.load(experiment.root).cycle(1).status, "complete")
+
+
 # -- 5. Flat-field memory -----------------------------------------------------------
 class FlatFieldMemoryTests(unittest.TestCase):
     def test_one_middle_plane_per_tile_and_bounded_binned_stack(self) -> None:
