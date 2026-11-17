@@ -7,7 +7,7 @@ from typing import Callable
 
 import numpy as np
 from qtpy.QtCore import QSignalBlocker, Qt, Signal
-from qtpy.QtGui import QImage, QPixmap
+from qtpy.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -88,7 +88,7 @@ class ChannelTable(QTableWidget):
         self._power: dict[str, QDoubleSpinBox] = {}
         for row, channel in enumerate(channels):
             check = QCheckBox(channel.name)
-            check.setStyleSheet(f"QCheckBox {{ color: {channel.color}; font-weight: 600; }}")
+            check.setToolTip(f"{channel.name} • emission {channel.emission_wavelength_nm:g} nm")
             check.toggled.connect(self.changed)
             exposure = spin(
                 channel.default_exposure_ms,
@@ -141,6 +141,13 @@ class ChannelTable(QTableWidget):
         for column in (1, 2):
             self.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.setMinimumHeight(self.verticalHeader().length() + self.horizontalHeader().height() + 4)
+        self.refresh_swatches()
+
+    def refresh_swatches(self) -> None:
+        """Keep channel colours readable on both light and dark themes."""
+
+        for channel in self._channels:
+            self._checks[channel.id].setIcon(_swatch(channel.color))
 
     def settings(self) -> tuple[ChannelSetting, ...]:
         return tuple(
@@ -326,6 +333,19 @@ class FrameView(QWidget):
             return
         assert self._label is not None
         self._label.setPixmap(_pixmap_from_array(frame, self._label.size()))
+
+
+def _swatch(color: str, size: int = 10) -> QIcon:
+    pixmap = QPixmap(size * 2, size * 2)
+    pixmap.setDevicePixelRatio(2)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QColor(0, 0, 0, 60))
+    painter.setBrush(QColor(color))
+    painter.drawEllipse(1, 1, size - 2, size - 2)
+    painter.end()
+    return QIcon(pixmap)
 
 
 def _pixmap_from_array(array: np.ndarray, size) -> QPixmap:

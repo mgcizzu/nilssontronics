@@ -26,6 +26,7 @@ from pathlib import Path
 
 import numpy as np
 from qtpy.QtCore import QSettings, Qt, QTimer
+from qtpy.QtGui import QActionGroup
 from qtpy.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -69,6 +70,7 @@ from ..planner import continuous_spiral_preview_positions, spiral_preview_positi
 from ..roi_io import load_roi_set, save_roi_set
 from .device_worker import DeviceWorker
 from .overview import OverviewCanvas, bounded_set_translation
+from .theme import THEME_MODES, ToggleSwitch, apply_theme, set_dark_title_bar
 from .widgets import (
     ChannelTable,
     FrameView,
@@ -136,6 +138,10 @@ class ScanWindow(QMainWindow):
         microscope_menu = self.menuBar().addMenu("Microscope")
         microscope_menu.addAction("Configuration…", self.show_configuration)
         self._build_device_docks()
+        self.apply_theme_mode(self.theme_mode())
+        hints = QApplication.instance().styleHints()
+        if hasattr(hints, "colorSchemeChanged"):
+            hints.colorSchemeChanged.connect(self._system_scheme_changed)
 
         self.device.frame_ready.connect(self._show_live_frame)
         self.device.position_changed.connect(self._position_changed)
@@ -165,13 +171,6 @@ class ScanWindow(QMainWindow):
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
         self.main_splitter.setHandleWidth(9)
-        self.main_splitter.setStyleSheet(
-            "QSplitter::handle:horizontal {"
-            " background: #c8d3d9; border-left: 2px solid #f5f7f8;"
-            " border-right: 2px solid #f5f7f8; margin: 2px 0;"
-            "}"
-            "QSplitter::handle:horizontal:hover { background: #087e8b; }"
-        )
         self.main_splitter.setToolTip("Drag the vertical dividers to resize the panels")
         self.main_splitter.addWidget(self._build_setup_panel())
         self.main_splitter.addWidget(self._build_viewer(use_ndv))
@@ -189,6 +188,41 @@ class ScanWindow(QMainWindow):
         self.view_menu = view_menu
         view_menu.addAction("Reset panel sizes", self.reset_panel_sizes)
         view_menu.addAction("Fit window to screen", self.fit_window_to_screen)
+        theme_menu = view_menu.addMenu("Theme")
+        self.theme_group = QActionGroup(self)
+        self.theme_group.setExclusive(True)
+        self.theme_actions = {}
+        labels = {"system": "Use system setting", "light": "Light", "dark": "Dark"}
+        for mode in THEME_MODES:
+            action = theme_menu.addAction(labels[mode])
+            action.setCheckable(True)
+            action.triggered.connect(
+                lambda checked=False, selected=mode: self.apply_theme_mode(
+                    selected, remember=True
+                )
+            )
+            self.theme_group.addAction(action)
+            self.theme_actions[mode] = action
+
+    # ---------------------------------------------------------------- theme --
+    def theme_mode(self) -> str:
+        mode = str(self.settings.value("theme", "system"))
+        return mode if mode in THEME_MODES else "system"
+
+    def _system_scheme_changed(self, *_args) -> None:
+        if self.theme_mode() == "system":
+            self.apply_theme_mode("system")
+
+    def apply_theme_mode(self, mode: str, remember: bool = False) -> None:
+        palette = apply_theme(QApplication.instance(), mode)
+        self.palette_tokens = palette
+        if remember:
+            self.settings.setValue("theme", mode)
+            self.settings.sync()
+        if hasattr(self, "theme_actions"):
+            self.theme_actions[mode].setChecked(True)
+        self.channel_table.refresh_swatches()
+        set_dark_title_bar(self, palette.dark)
 
     def fit_window_to_screen(self) -> None:
         """Fit the window inside the current screen's usable desktop area."""
@@ -385,17 +419,17 @@ class ScanWindow(QMainWindow):
         self.overlap_y = spin(self.config_data.overlap_y_percent, 0, 50, 0, "%")
         self.tile_order_box = QComboBox()
         self.tile_order_box.addItems(["raster", "serpentine"])
-        self.consistent_approach = QCheckBox("Consistent stage approach")
-        self.shutter_per_frame = QCheckBox("Shutter closed during moves")
+        self.consistent_approach = ToggleSwitch("Consistent stage approach")
+        self.shutter_per_frame = ToggleSwitch("Shutter closed during moves")
         self.shutter_per_frame.setChecked(True)
-        self.flat_field = QCheckBox("Estimate flat-field profiles")
-        self.distortion = QCheckBox("Correct lens distortion and channel registration")
+        self.flat_field = ToggleSwitch("Estimate flat-field profiles")
+        self.distortion = ToggleSwitch("Correct lens distortion and channel registration")
         self.distortion.setToolTip(
             "Resample every plane with the objective's grid-slide calibration before saving, "
             "so ISS_preprocessing gets geometrically corrected, channel-registered tiles. "
             "Fixed by cycle 1."
         )
-        self.keep_uncorrected = QCheckBox("Keep uncorrected frames")
+        self.keep_uncorrected = ToggleSwitch("Keep uncorrected frames")
         self.keep_uncorrected.setChecked(True)
         self.keep_uncorrected.setToolTip(
             "Also save the camera frames in cycle_NN/uncorrected/ (twice the disk space)"
@@ -405,7 +439,7 @@ class ScanWindow(QMainWindow):
         self.calibrate_button.clicked.connect(self.open_distortion_calibration)
         self.distortion_label = QLabel()
         self.distortion_label.setWordWrap(True)
-        self.distortion_label.setStyleSheet("color: #888;")
+        self.distortion_label.setProperty("secondary", True)
         self.calibration_dialog = None
         t_form.addRow("Overlap X", self.overlap_x)
         t_form.addRow("Overlap Y", self.overlap_y)
