@@ -47,6 +47,8 @@ class DeviceWorker(QObject):
         self._live = False
         self._live_settings: tuple[Channel, float, float] | None = None
         self._applied: tuple[str, float, float] | None = None
+        # Live/snap need per-frame shutter; a cycle may leave it off with the shutter closed.
+        self._illumination_ready = False
         self._stopped = False
         self.last_position: StagePosition = backend.position
         self._deliver.connect(lambda callback, value: callback(value))
@@ -94,9 +96,10 @@ class DeviceWorker(QObject):
         with self._lock:
             self._live = False
             drained = self._idle.wait_for(lambda: self._pending == 0, timeout)
-            # The engine changes channel/exposure/power during a cycle, so the
-            # next live frame must re-apply its own settings.
+            # The engine changes channel/exposure/power and the shutter mode during
+            # a cycle, so the next live frame must re-apply its own settings.
             self._applied = None
+            self._illumination_ready = False
             return drained
 
     def shutdown(self, timeout: float = 5.0) -> None:
@@ -158,6 +161,9 @@ class DeviceWorker(QObject):
         if settings is None:
             raise HardwareError("No live channel selected")
         channel, exposure, power = settings
+        if not self._illumination_ready:
+            self._backend.set_shutter_per_frame(True)  # camera opens the shutter per exposure
+            self._illumination_ready = True
         state = (channel.id, exposure, power)
         if state != self._applied:
             self._backend.set_channel(channel, exposure, power)

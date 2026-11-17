@@ -228,6 +228,7 @@ class DiskBackedMosaic:
             self._restore_display_range(channel.id)
 
         index_path = self.root / "tiles.jsonl"
+        _repair_journal_tail(index_path, fsync=fsync)
         self._index = index_path.open("a", encoding="utf-8")
         self._current_tile: dict | None = None
         self._current_planes: list[dict] = []
@@ -620,6 +621,41 @@ def write_region_metadata(
         temporary.replace(path)
         written.append(path)
     return written
+
+
+def _repair_journal_tail(path: Path, fsync: bool = True) -> None:
+    """Cut a torn last line (crash during an append) before appending again.
+
+    Without this the next record would be glued onto the partial line and be
+    unreadable too. The partial line itself never described a finished tile,
+    so dropping it loses nothing: that tile is re-acquired on resume.
+    """
+
+    if not path.exists():
+        return
+    with path.open("rb+") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        if size == 0:
+            return
+        handle.seek(size - 1)
+        if handle.read(1) == b"\n":
+            return
+        # Find the end of the last complete line (0 if there is none).
+        position = size
+        keep = 0
+        while position > 0:
+            step = min(65536, position)
+            position -= step
+            handle.seek(position)
+            chunk = handle.read(step)
+            newline = chunk.rfind(b"\n")
+            if newline != -1:
+                keep = position + newline + 1
+                break
+        handle.truncate(keep)
+        handle.flush()
+        if fsync:
+            os.fsync(handle.fileno())
 
 
 def _write_plane_tiff(path: Path, frame: np.ndarray, fsync: bool) -> None:

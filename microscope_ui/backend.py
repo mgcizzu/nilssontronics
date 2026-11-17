@@ -116,6 +116,8 @@ class SimulatedMicroscope:
         self.shutter_per_frame = True
         self.shutter_open = False
         self.light_on_during_moves = 0
+        # Exposures with auto-shutter off and the shutter closed: no light reaches the sample.
+        self.dark_snaps = 0
         self.move_log: list[tuple[str, float, float]] = []
 
     # -- state -------------------------------------------------------------
@@ -182,6 +184,8 @@ class SimulatedMicroscope:
 
     def snap(self) -> np.ndarray:
         self.snap_count += 1
+        if not self.shutter_per_frame and not self.shutter_open:
+            self.dark_snaps += 1
         return self.render_frame(self._position, self._channel)
 
     def close(self) -> None:
