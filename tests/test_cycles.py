@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -47,6 +48,14 @@ class CycleTests(unittest.TestCase):
         cls.config = load_config()
 
     def setUp(self) -> None:
+        # Estimates assume full 2048×2048 frames; don't let the host's free disk
+        # space decide whether these (tiny simulated) scans may start.
+        free = mock.patch(
+            "microscope_ui.planner.shutil.disk_usage",
+            return_value=mock.Mock(free=10 * 1024**4),
+        )
+        free.start()
+        self.addCleanup(free.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.backend = SlowSimulator(self.config, frame_px=24)
         self.backend.change_objective(self.config.objective("20x_air"))
