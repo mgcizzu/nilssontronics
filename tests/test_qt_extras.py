@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import replace
 from unittest import mock
 
 import pytest
@@ -14,7 +15,7 @@ pytest.importorskip("pytestqt")
 
 from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
-from microscope_ui.models import FocusPoint, ScanRegion  # noqa: E402
+from microscope_ui.models import FocusPoint, ScanRegion, StageLimits  # noqa: E402
 from microscope_ui.qt.window import ScanWindow  # noqa: E402
 
 
@@ -123,16 +124,42 @@ def test_bad_roi_file_warns(window, tmp_path):
 
 
 # -- spiral preview ----------------------------------------------------------
-def test_spiral_preview_images_a_grid_without_moving_z(qtbot, window):
+def test_spiral_preview_continues_past_25_until_stopped_without_moving_z(qtbot, window):
     window.device_move(window.backend.move_z, 1.5)
     qtbot.waitUntil(lambda: window.stage_position.z_um == 1.5, timeout=5000)
     window.preview_button.click()
-    qtbot.waitUntil(lambda: not window.preview_running, timeout=15000)
-    assert window.overview.preview_tile_count == 25  # default 5 × 5 grid
-    assert "complete" in window.overview_hint.text()
+    qtbot.waitUntil(lambda: window.overview.preview_tile_count >= 30, timeout=15000)
+    window.preview_button.click()
+    assert not window.preview_running
+    assert window.overview.preview_tile_count >= 30
     assert window.backend.position.z_um == 1.5
     z_moves = [value for kind, value, _ in window.backend.move_log if kind == "z"]
     assert z_moves == [1.5]
+
+
+def test_spiral_preview_stops_before_stage_limit(qtbot, window):
+    window.config_data = replace(
+        window.config_data,
+        stage_limits=StageLimits(-700, 700, -700, 700, -5000, 5000),
+    )
+    window.start_spiral_preview()
+    qtbot.waitUntil(lambda: not window.preview_running, timeout=15000)
+    assert window.overview.preview_tile_count == 9
+    assert "stage limit" in window.overview_hint.text()
+
+
+def test_new_spiral_retains_existing_preview_tiles(qtbot, window):
+    window.preview_button.click()
+    qtbot.waitUntil(lambda: window.overview.preview_tile_count >= 3, timeout=5000)
+    window.preview_button.click()
+    first_count = window.overview.preview_tile_count
+
+    window.device_move(window.backend.move_xy, 5000, 5000)
+    qtbot.waitUntil(lambda: window.stage_position.x_um == 5000, timeout=5000)
+    window.preview_button.click()
+    qtbot.waitUntil(lambda: window.overview.preview_tile_count >= first_count + 3, timeout=5000)
+    window.preview_button.click()
+    assert window.overview.preview_tile_count >= first_count + 3
 
 
 def test_spiral_preview_follows_regions(qtbot, window):

@@ -64,7 +64,7 @@ from ..models import (
     ZSettings,
 )
 from ..mosaic import DiskBackedMosaic
-from ..planner import spiral_preview_positions
+from ..planner import continuous_spiral_preview_positions, spiral_preview_positions
 from ..roi_io import load_roi_set, save_roi_set
 from .device_worker import DeviceWorker
 from .overview import OverviewCanvas, bounded_set_translation
@@ -448,13 +448,17 @@ class ScanWindow(QMainWindow):
         self.preview_button.setCheckable(True)
         self.preview_button.setToolTip(
             "Snap the Live channel at each tile position, spiralling out from the stage "
-            "(over the regions if any, else a 5×5 grid). Current Z only, no Z moves."
+            "until stopped or a stage limit is reached (over all planned tiles when regions "
+            "exist). Existing preview images are retained. Current Z only, no Z moves."
         )
         self.preview_button.toggled.connect(self._toggle_spiral_preview)
+        self.clear_preview_button = QPushButton("Clear previews")
+        self.clear_preview_button.clicked.connect(self.clear_spiral_previews)
         controls.addWidget(self.live_button)
         controls.addWidget(self.snap_button)
         controls.addWidget(self.live_channel_box)
         controls.addWidget(self.preview_button)
+        controls.addWidget(self.clear_preview_button)
         controls.addStretch(1)
         controls.addWidget(self.jog)
         layout.addLayout(controls)
@@ -1084,31 +1088,46 @@ class ScanWindow(QMainWindow):
         objective_id = self.backend.current_objective_id
         origin = (self.stage_position.x_um, self.stage_position.y_um)
         limits = self.config_data.stage_limits
-        positions = [
-            p
-            for p in spiral_preview_positions(
+        regions = tuple(self.region_list.items)
+        if regions:
+            positions = [
+                p
+                for p in spiral_preview_positions(
+                    self.config_data,
+                    objective_id,
+                    regions,
+                    origin,
+                    overlap_x_percent=self.overlap_x.value(),
+                    overlap_y_percent=self.overlap_y.value(),
+                )
+                if limits.contains_xy(*p)
+            ]
+            if not positions:
+                self.warn(
+                    "No preview positions",
+                    "The preview area has no positions inside the stage limits.",
+                )
+                self.preview_button.setChecked(False)
+                return False
+            self._preview_positions = iter(positions)
+            self._preview_total: int | None = len(positions)
+        else:
+            self._preview_positions = continuous_spiral_preview_positions(
                 self.config_data,
                 objective_id,
-                tuple(self.region_list.items),
                 origin,
                 overlap_x_percent=self.overlap_x.value(),
                 overlap_y_percent=self.overlap_y.value(),
             )
-            if limits.contains_xy(*p)
-        ]
-        if not positions:
-            self.warn("No preview positions", "The preview area has no positions inside the stage limits.")
-            self.preview_button.setChecked(False)
-            return False
+            self._preview_total = None
+        self._preview_limits = limits
         self.live_button.setChecked(False)
         self._push_live_settings()
         self._preview_generation = getattr(self, "_preview_generation", 0) + 1
-        self._preview_positions = positions
         self._preview_index = 0
         self._preview_range: tuple[float, float] | None = None
         self._preview_fov = self.config_data.fov_um(objective_id)
         self._preview_active = True
-        self.overview.clear_preview()
         self.tabs.setCurrentIndex(0)
         if not self.preview_button.isChecked():
             self.preview_button.blockSignals(True)
@@ -1131,20 +1150,30 @@ class ScanWindow(QMainWindow):
         self.preview_button.blockSignals(True)
         self.preview_button.setChecked(False)
         self.preview_button.blockSignals(False)
-        done = self.overview.preview_tile_count
         self.overview_hint.setText(
-            message or f"Spiral preview stopped after {done} of {len(self._preview_positions)} tiles"
+            message or f"Spiral preview stopped after {self._preview_index} tiles"
         )
+
+    def clear_spiral_previews(self) -> None:
+        self.stop_spiral_preview()
+        self.overview.clear_preview()
+        self.overview_hint.setText("Spiral previews cleared")
 
     def _preview_next(self, generation: int) -> None:
         if generation != self._preview_generation:
             return
-        if self._preview_index >= len(self._preview_positions):
+        try:
+            x, y = next(self._preview_positions)
+        except StopIteration:
             self.stop_spiral_preview(
-                f"Spiral preview complete • {len(self._preview_positions)} tiles • current Z only"
+                f"Spiral preview complete • {self._preview_index} tiles • current Z only"
             )
             return
-        x, y = self._preview_positions[self._preview_index]
+        if not self._preview_limits.contains_xy(x, y):
+            self.stop_spiral_preview(
+                f"Spiral preview stopped at stage limit • {self._preview_index} tiles captured"
+            )
+            return
         backend, device = self.backend, self.device
 
         def visit():
@@ -1172,10 +1201,10 @@ class ScanWindow(QMainWindow):
         channel = self.config_data.channel(self.live_channel_box.currentData())
         self.overview.add_preview_tile(frame, center, self._preview_fov, self._preview_range, channel.color)
         self._preview_index += 1
-        self.overview_hint.setText(
-            f"{channel.name} spiral preview • tile {self._preview_index} of "
-            f"{len(self._preview_positions)} • current Z only"
-        )
+        progress = f"tile {self._preview_index}"
+        if self._preview_total is not None:
+            progress += f" of {self._preview_total}"
+        self.overview_hint.setText(f"{channel.name} spiral preview • {progress} • current Z only")
         self._preview_next(generation)
 
     # -------------------------------------------------- refocus & alignment --

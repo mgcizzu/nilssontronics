@@ -9,6 +9,7 @@ from microscope_ui.backend import SimulatedMicroscope, StageLimitError
 from microscope_ui.models import AcquisitionPlan, ChannelSetting, FocusPoint, ScanRegion, ZSettings
 from microscope_ui.optics import automatic_z_stack, recommended_z_step_um
 from microscope_ui.planner import (
+    continuous_spiral_preview_positions,
     estimate_acquisition,
     spiral_preview_positions,
     validate_plan,
@@ -156,6 +157,16 @@ class PlannerTests(unittest.TestCase):
         )
         self.assertEqual(len(positions), 25)
         self.assertEqual(positions[0], (1234, -5678))
+
+    def test_continuous_spiral_has_no_fixed_5_by_5_limit(self) -> None:
+        positions = continuous_spiral_preview_positions(
+            self.config,
+            "20x_air",
+            origin=(1234, -5678),
+        )
+        first_30 = [next(positions) for _ in range(30)]
+        self.assertEqual(first_30[0], (1234, -5678))
+        self.assertEqual(len(set(first_30)), 30)
 
     def test_spiral_preview_uses_independent_xy_overlap(self) -> None:
         positions = spiral_preview_positions(

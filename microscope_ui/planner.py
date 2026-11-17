@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import shutil
+from collections.abc import Iterator
 
 from .focus import FocusSurface
 from .geometry import point_in_polygon, points_are_non_collinear, rectangle_intersects_polygon
@@ -351,3 +352,41 @@ def spiral_preview_positions(
             % (2 * math.pi),
         ),
     )
+
+
+def continuous_spiral_preview_positions(
+    config: MicroscopeConfig,
+    objective_id: str,
+    origin: tuple[float, float],
+    overlap_x_percent: float | None = None,
+    overlap_y_percent: float | None = None,
+) -> Iterator[tuple[float, float]]:
+    """Yield an outward square spiral of tile centres without a fixed size.
+
+    The caller owns the stopping rule.  The Qt preview stops before the first
+    position outside the configured stage limits, which keeps this generator
+    useful without coupling planning code to a particular UI workflow.
+    """
+
+    overlap_x = config.overlap_x_percent if overlap_x_percent is None else overlap_x_percent
+    overlap_y = config.overlap_y_percent if overlap_y_percent is None else overlap_y_percent
+    step_x_um, step_y_um = tile_grid_steps(config, objective_id, overlap_x, overlap_y)
+    grid_x = grid_y = 0
+    yield origin
+
+    run_length = 1
+    while True:
+        for _ in range(run_length):
+            grid_x += 1
+            yield origin[0] + grid_x * step_x_um, origin[1] + grid_y * step_y_um
+        for _ in range(run_length):
+            grid_y += 1
+            yield origin[0] + grid_x * step_x_um, origin[1] + grid_y * step_y_um
+        run_length += 1
+        for _ in range(run_length):
+            grid_x -= 1
+            yield origin[0] + grid_x * step_x_um, origin[1] + grid_y * step_y_um
+        for _ in range(run_length):
+            grid_y -= 1
+            yield origin[0] + grid_x * step_x_um, origin[1] + grid_y * step_y_um
+        run_length += 1
