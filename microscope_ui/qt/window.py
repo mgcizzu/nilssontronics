@@ -515,12 +515,32 @@ class ScanWindow(QMainWindow):
         self.shutter_per_frame = ToggleSwitch("Shutter closed during moves")
         self.shutter_per_frame.setChecked(True)
         self.flat_field = ToggleSwitch("Estimate flat-field profiles")
+        self.distortion = ToggleSwitch("Correct lens distortion")
+        self.distortion.setToolTip(
+            "Resample every plane with the objective's grid-slide calibration before saving, "
+            "so ISS_preprocessing gets geometrically corrected, channel-registered tiles. "
+            "Fixed by cycle 1."
+        )
+        self.keep_uncorrected = ToggleSwitch("Keep uncorrected frames")
+        self.keep_uncorrected.setChecked(True)
+        self.keep_uncorrected.setToolTip("Also save the camera frames in cycle_NN/uncorrected/ (twice the disk space)")
+        self.calibrate_button = QPushButton("Calibrate distortion…")
+        self.calibrate_button.setToolTip("Measure the correction with a grid slide")
+        self.calibrate_button.clicked.connect(self.open_distortion_calibration)
+        self.distortion_label = QLabel()
+        self.distortion_label.setWordWrap(True)
+        self.distortion_label.setProperty("secondary", True)
+        self.calibration_dialog = None
         t_form.addRow("Overlap X", self.overlap_x)
         t_form.addRow("Overlap Y", self.overlap_y)
         t_form.addRow("Tile order", self.tile_order_box)
         t_form.addRow(self.consistent_approach)
         t_form.addRow(self.shutter_per_frame)
         t_form.addRow(self.flat_field)
+        t_form.addRow(self.distortion)
+        t_form.addRow(self.keep_uncorrected)
+        t_form.addRow(self.calibrate_button)
+        t_form.addRow(self.distortion_label)
         layout.addWidget(tiling)
         layout.addStretch(1)
 
@@ -538,6 +558,8 @@ class ScanWindow(QMainWindow):
             self.consistent_approach.toggled,
             self.shutter_per_frame.toggled,
             self.flat_field.toggled,
+            self.distortion.toggled,
+            self.keep_uncorrected.toggled,
             self.project_edit.editingFinished,
             self.sample_edit.editingFinished,
             self.output_edit.editingFinished,
@@ -800,6 +822,8 @@ class ScanWindow(QMainWindow):
             consistent_approach=self.consistent_approach.isChecked(),
             shutter_per_frame=self.shutter_per_frame.isChecked(),
             flat_field=self.flat_field.isChecked(),
+            distortion_correction=self.distortion.isChecked(),
+            keep_uncorrected=self.keep_uncorrected.isChecked(),
             focus_method=self.focus_method_box.currentText(),
         )
         return AcquisitionPlan(
@@ -821,6 +845,7 @@ class ScanWindow(QMainWindow):
             return
         self._update_position()
         self._update_experiment_label()
+        self._update_distortion_label()
         self._apply_locks()
         if self.controller.busy:
             self._update_overview()
@@ -879,8 +904,13 @@ class ScanWindow(QMainWindow):
                        self.flat_field, self.snap_button, self.live_button, self.jog,
                        self.preview_button):
             widget.setEnabled(not busy)
-        for widget in (self.objective_box, self.overlap_x, self.overlap_y, self.tile_order_box):
+        for widget in (self.objective_box, self.overlap_x, self.overlap_y, self.tile_order_box,
+                       self.distortion):
             widget.setEnabled(not busy and not locked)
+        self.keep_uncorrected.setEnabled(not busy and self.distortion.isChecked())
+        self.calibrate_button.setEnabled(not busy)
+        if self.calibration_dialog is not None:
+            self.calibration_dialog._update()
         self.region_list.set_locked(busy or locked)
         self.shift_button.setEnabled(not busy and locked)
         self.recipe_box.setEnabled(not busy)
@@ -903,6 +933,39 @@ class ScanWindow(QMainWindow):
         self.resume_button.setEnabled(not busy and self.controller.resume_info() is not None)
         for panel in getattr(self, "device_panels", ()):
             panel.setEnabled(not busy)
+
+    def _update_distortion_label(self) -> None:
+        experiment = self.controller.experiment
+        objective = self.config_data.objective(self.objective_box.currentData())
+        if experiment is not None and experiment.options.distortion_correction:
+            recorded = experiment.calibration.get("distortion", {})
+            text = f"Experiment uses its own copy of the calibration ({recorded.get('calibrated_at', '')[:16]})."
+        else:
+            try:
+                correction = self.controller.load_correction(objective.id)
+            except (OSError, ValueError) as exc:
+                text = f"Calibration file unreadable: {exc}"
+            else:
+                text = (
+                    f"{objective.name}: not calibrated."
+                    if correction is None
+                    else f"{objective.name}: calibrated {correction.created_at[:10]} for "
+                    + ", ".join(self.config_data.channel(c).name for c in sorted(correction.channels)
+                                if any(ch.id == c for ch in self.config_data.channels))
+                )
+        self.distortion_label.setText(text)
+        self.distortion_label.setVisible(self.distortion.isChecked() or experiment is None)
+
+    def open_distortion_calibration(self):
+        from .calibration import DistortionCalibrationDialog
+
+        if self.calibration_dialog is None:
+            self.calibration_dialog = DistortionCalibrationDialog(self)
+            self.objective_box.currentIndexChanged.connect(self.calibration_dialog.sync_objective)
+        self.calibration_dialog.sync_objective()
+        self.calibration_dialog.show()
+        self.calibration_dialog.raise_()
+        return self.calibration_dialog
 
     def _update_position(self) -> None:
         if self.controller.busy:
@@ -1549,6 +1612,8 @@ class ScanWindow(QMainWindow):
                 self.shutter_per_frame.setChecked(options.shutter_per_frame)
                 self.consistent_approach.setChecked(options.consistent_approach)
                 self.flat_field.setChecked(options.flat_field)
+                self.keep_uncorrected.setChecked(options.keep_uncorrected)
+            self.distortion.setChecked(experiment.options.distortion_correction)
             self.objective_box.setCurrentIndex(self.objective_box.findData(experiment.objective_id))
         finally:
             self._loading = False

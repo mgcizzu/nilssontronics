@@ -31,7 +31,7 @@ class PlaneSink(Protocol):
         z_index: int,
         frame: np.ndarray,
         z_um: float | None = None,
-    ) -> None: ...
+    ) -> None: ...  # a distortion-correcting sink may add ``uncorrected=``
 
     def finish_tile(self): ...
 

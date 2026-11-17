@@ -104,8 +104,21 @@ class SimulatedMicroscope:
     name = "Simulator"
     simulated = True
 
-    def __init__(self, config: MicroscopeConfig, frame_px: int | None = None) -> None:
+    def __init__(
+        self,
+        config: MicroscopeConfig,
+        frame_px: int | None = None,
+        distortion: dict | None = None,
+        calibration_slide: dict | None = None,
+    ) -> None:
         self._config = config
+        options = config.simulator_options
+        # Simulated optics (all off by default): radial lens distortion k1, a per-channel
+        # magnification change per nm of emission away from 550 nm, and per-channel shifts.
+        self.distortion = dict(options.get("distortion", {}) if distortion is None else distortion)
+        # A fluorescent line grid slide somewhere on the stage, visible in every channel.
+        slide = options.get("calibration_slide") if calibration_slide is None else calibration_slide
+        self.calibration_slide = dict(slide) if slide else None
         self._position = StagePosition(0.0, 0.0, 0.0)
         self._objective_id = config.objectives[0].id
         self._channel: Channel | None = None
@@ -204,6 +217,15 @@ class SimulatedMicroscope:
         xs = position.x_um + (np.arange(size) + 0.5 - size / 2) * (fov_w / size)
         ys = position.y_um + (np.arange(size) + 0.5 - size / 2) * (fov_h / size)
         gx, gy = np.meshgrid(xs, ys)
+        if self._distorted(channel):
+            gx, gy = self._distorted_sample_points(position, channel, size, fov_w, fov_h)
+        signal = (self._exposure_ms * max(self._power_percent, 1.0)) * 4.0
+        slide = self.calibration_slide
+        if slide is not None:
+            half = float(slide.get("size_um", 8000.0)) / 2
+            sx, sy = float(slide.get("x_um", 30000.0)), float(slide.get("y_um", 0.0))
+            if abs(position.x_um - sx) < half and abs(position.y_um - sy) < half:
+                return self._render_grid(gx - sx, gy - sy, position, objective, signal, slide)
 
         spacing = 14.0
         cell_x = np.floor(gx / spacing)
@@ -226,8 +248,45 @@ class SimulatedMicroscope:
         defocus = position.z_um - self.sample_focus_z(position.x_um, position.y_um)
         depth_of_field = max(0.5, 2.0 * objective.immersion_refractive_index * 0.55 / objective.numerical_aperture**2)
         sharpness = math.exp(-((defocus / (3 * depth_of_field)) ** 2))
-        signal = (self._exposure_ms * max(self._power_percent, 1.0)) * 4.0
         image = 100.0 + tissue * (signal * (0.15 + 0.85 * sharpness) * nuclei + signal * 0.05)
+        return np.clip(image, 0, 65535).astype(np.uint16)
+
+    # -- simulated optics and calibration slide -------------------------------------
+    def _distorted(self, channel: Channel | None) -> bool:
+        d = self.distortion
+        if not d:
+            return False
+        shift = (d.get("channel_shift_px") or {}).get(channel.id if channel else "", (0, 0))
+        return bool(d.get("k1", 0.0) or d.get("chromatic_scale_per_nm", 0.0) or any(shift))
+
+    def _distorted_sample_points(self, position, channel, size, fov_w, fov_h):
+        """Stage points seen by each camera pixel through the simulated optics."""
+
+        d = self.distortion
+        shift_x, shift_y = (d.get("channel_shift_px") or {}).get(channel.id if channel else "", (0, 0))
+        wavelength = channel.emission_wavelength_nm if channel else 550.0
+        scale = 1.0 + float(d.get("chromatic_scale_per_nm", 0.0)) * (wavelength - 550.0)
+        radius = math.hypot(size, size) / 2
+        cols = np.arange(size) - (size - 1) / 2 - float(shift_x)
+        rows = np.arange(size) - (size - 1) / 2 - float(shift_y)
+        u, v = np.meshgrid(cols / radius, rows / radius)
+        radial = (1.0 + float(d.get("k1", 0.0)) * (u * u + v * v)) / scale
+        gx = position.x_um + u * radial * radius * (fov_w / size)
+        gy = position.y_um + v * radial * radius * (fov_h / size)
+        return gx, gy
+
+    def _render_grid(self, dx_um, dy_um, position, objective, signal, slide) -> np.ndarray:
+        pitch = float(slide.get("pitch_um", 50.0))
+        sigma = float(slide.get("line_width_um", 5.0)) / 2
+        to_line_x = np.abs((dx_um + pitch / 2) % pitch - pitch / 2)
+        to_line_y = np.abs((dy_um + pitch / 2) % pitch - pitch / 2)
+        lines = np.maximum(np.exp(-0.5 * (to_line_x / sigma) ** 2), np.exp(-0.5 * (to_line_y / sigma) ** 2))
+        defocus = position.z_um - float(slide.get("focus_z_um", 0.0))
+        depth_of_field = max(
+            0.5, 2.0 * objective.immersion_refractive_index * 0.55 / objective.numerical_aperture**2
+        )
+        sharpness = math.exp(-((defocus / (3 * depth_of_field)) ** 2))
+        image = 100.0 + signal * (0.1 + 0.9 * sharpness) * lines + signal * 0.05 * (1 - sharpness)
         return np.clip(image, 0, 65535).astype(np.uint16)
 
 

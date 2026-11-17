@@ -209,7 +209,20 @@
     "camera_readout_ms": 25
   },
   "simulator": {
-    "frame_size_px": 256
+    "frame_size_px": 256,
+    "calibration_slide": {
+      "x_um": 30000,
+      "y_um": 0,
+      "size_um": 8000,
+      "pitch_um": 50,
+      "line_width_um": 5,
+      "focus_z_um": 0
+    },
+    "distortion": {
+      "k1": 0.0,
+      "chromatic_scale_per_nm": 0.0,
+      "channel_shift_px": {}
+    }
   },
   "hardware": {
     "backend": "simulator",

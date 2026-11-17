@@ -180,6 +180,20 @@ class DeviceWorker(QObject):
             self._applied = state
         return self._backend.snap()
 
+    def acquire_with(self, channel: Channel, exposure_ms: float, power_percent: float):
+        """Snap one frame with explicit settings (worker thread only, from a job).
+
+        Used by calibration; the next live frame re-applies the live settings.
+        """
+
+        if not self._illumination_ready:
+            self._backend.set_shutter_per_frame(True)
+            self._illumination_ready = True
+        self._applied = None
+        self._backend.set_channel(channel, exposure_ms, power_percent)
+        self._applied = (channel.id, exposure_ms, power_percent)
+        return self._backend.snap()
+
     def _live_frame(self) -> None:
         try:
             frame = self.acquire_frame()

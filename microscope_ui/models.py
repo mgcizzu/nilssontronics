@@ -128,6 +128,10 @@ class MicroscopeConfig:
     simulator_frame_px: int = 256
     fsync_tiles: bool = True
     hardware: dict = field(default_factory=dict)
+    # Simulator extras (calibration slide, simulated lens distortion); see backend.py.
+    simulator_options: dict = field(default_factory=dict)
+    # Folder holding calibration files (distortion corrections); set by load_config.
+    calibration_dir: Path | None = None
 
     def objective(self, objective_id: str) -> Objective:
         try:
@@ -304,6 +308,10 @@ class AcquisitionOptions:
     shutter_per_frame: bool = True
     # Estimate a flat-field profile per channel after each cycle (non-destructive).
     flat_field: bool = False
+    # Resample every plane with the objective's calibrated distortion correction
+    # before saving (fixed by cycle 1). Optionally keep the camera frames too.
+    distortion_correction: bool = False
+    keep_uncorrected: bool = True
     focus_method: FocusMethod = "linear"
 
 
