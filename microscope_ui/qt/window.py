@@ -86,6 +86,7 @@ Z_MODES = (("Single plane (current Z)", "single"), ("Focus map", "focus_map"), (
 LAUNCH_ERRORS = (ControllerError, HardwareError, OSError, ValueError)
 MOSAIC_UNDERLAY_PX = 1024
 PREVIEW_TILE_PX = 256
+DEFAULT_PANEL_SIZES = (380, 720, 280)
 OVERVIEW_MODES = (
     ("navigate", "Navigate", "Drag to pan, wheel to zoom, double-click to move the stage"),
     ("rectangle", "Rectangle", "Drag to draw a rectangular scan region"),
@@ -153,14 +154,36 @@ class ScanWindow(QMainWindow):
         central = QWidget()
         root = QVBoxLayout(central)
         root.addWidget(self._build_header())
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._build_setup_panel())
-        splitter.addWidget(self._build_viewer(use_ndv))
-        splitter.addWidget(self._build_review_panel())
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([460, 720, 320])
-        root.addWidget(splitter, 1)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(9)
+        self.main_splitter.setStyleSheet(
+            "QSplitter::handle:horizontal {"
+            " background: #c8d3d9; border-left: 2px solid #f5f7f8;"
+            " border-right: 2px solid #f5f7f8; margin: 2px 0;"
+            "}"
+            "QSplitter::handle:horizontal:hover { background: #087e8b; }"
+        )
+        self.main_splitter.setToolTip("Drag the vertical dividers to resize the panels")
+        self.main_splitter.addWidget(self._build_setup_panel())
+        self.main_splitter.addWidget(self._build_viewer(use_ndv))
+        self.main_splitter.addWidget(self._build_review_panel())
+        for index in range(self.main_splitter.count()):
+            self.main_splitter.setCollapsible(index, False)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setStretchFactor(2, 0)
+        self.reset_panel_sizes()
+        root.addWidget(self.main_splitter, 1)
         self.setCentralWidget(central)
+
+        view_menu = self.menuBar().addMenu("View")
+        view_menu.addAction("Reset panel sizes", self.reset_panel_sizes)
+
+    def reset_panel_sizes(self) -> None:
+        """Restore a balanced three-panel layout after manual resizing."""
+
+        self.main_splitter.setSizes(list(DEFAULT_PANEL_SIZES))
 
     def _build_header(self) -> QWidget:
         header = QWidget()
@@ -366,7 +389,9 @@ class ScanWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(440)
+        scroll.setMinimumWidth(300)
+        scroll.setToolTip("This panel scrolls; drag its right divider to resize it")
+        self.setup_scroll = scroll
         return scroll
 
     def _build_viewer(self, use_ndv: bool) -> QWidget:
@@ -433,7 +458,7 @@ class ScanWindow(QMainWindow):
         self.tabs.addTab(self.frame_view, "Camera")
         layout.addWidget(self.tabs, 1)
 
-        controls = QHBoxLayout()
+        capture_controls = QHBoxLayout()
         self.live_button = QPushButton("Live")
         self.live_button.setCheckable(True)
         self.live_button.toggled.connect(self._toggle_live)
@@ -454,14 +479,17 @@ class ScanWindow(QMainWindow):
         self.preview_button.toggled.connect(self._toggle_spiral_preview)
         self.clear_preview_button = QPushButton("Clear previews")
         self.clear_preview_button.clicked.connect(self.clear_spiral_previews)
-        controls.addWidget(self.live_button)
-        controls.addWidget(self.snap_button)
-        controls.addWidget(self.live_channel_box)
-        controls.addWidget(self.preview_button)
-        controls.addWidget(self.clear_preview_button)
-        controls.addStretch(1)
-        controls.addWidget(self.jog)
-        layout.addLayout(controls)
+        capture_controls.addWidget(self.live_button)
+        capture_controls.addWidget(self.snap_button)
+        capture_controls.addWidget(self.live_channel_box, 1)
+        capture_controls.addWidget(self.preview_button)
+        capture_controls.addWidget(self.clear_preview_button)
+        layout.addLayout(capture_controls)
+        jog_controls = QHBoxLayout()
+        jog_controls.addStretch(1)
+        jog_controls.addWidget(self.jog)
+        layout.addLayout(jog_controls)
+        wrapper.setMinimumWidth(360)
         return wrapper
 
     def _build_review_panel(self) -> QWidget:
@@ -497,8 +525,13 @@ class ScanWindow(QMainWindow):
         layout.addWidget(self.progress)
         layout.addWidget(self.progress_label)
         layout.addStretch(1)
-        panel.setMinimumWidth(280)
-        return panel
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(220)
+        scroll.setToolTip("This panel scrolls; drag its left divider to resize it")
+        self.review_scroll = scroll
+        return scroll
 
     def _build_device_docks(self) -> None:
         """Micro-Manager device panels (pymmcore-widgets), only for the MMCore backend."""

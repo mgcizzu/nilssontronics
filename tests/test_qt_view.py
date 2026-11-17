@@ -13,6 +13,7 @@ pytest.importorskip("qtpy")
 pytest.importorskip("pytestqt")
 
 from qtpy.QtCore import QTimer  # noqa: E402
+from qtpy.QtWidgets import QScrollArea  # noqa: E402
 
 from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
@@ -53,6 +54,29 @@ def run_cycle(qtbot, win):
     assert win.controller.status() is not None, win.messages
     qtbot.waitUntil(lambda: not win.poll_timer.isActive(), timeout=30000)
     return win.controller.status()
+
+
+def test_main_panels_are_resizable_scrollable_and_resettable(qtbot, window):
+    window.resize(1400, 860)
+    window.show()
+    qtbot.waitExposed(window)
+    splitter = window.main_splitter
+    assert splitter.count() == 3
+    assert splitter.handleWidth() >= 8
+    assert all(not splitter.isCollapsible(index) for index in range(3))
+    assert isinstance(window.setup_scroll, QScrollArea)
+    assert isinstance(window.review_scroll, QScrollArea)
+
+    splitter.setSizes([520, 400, 230])
+    changed = splitter.sizes()
+    assert changed[0] >= 500 and changed[2] <= 250 and all(size > 0 for size in changed)
+    window.reset_panel_sizes()
+    reset = splitter.sizes()
+    assert reset[1] > reset[0] > reset[2] > 0
+
+    reset_actions = [action for action in window.menuBar().actions() if action.text() == "View"]
+    assert reset_actions
+    assert any(action.text() == "Reset panel sizes" for action in reset_actions[0].menu().actions())
 
 
 def test_two_cycles_with_xy_shift(qtbot, window):
