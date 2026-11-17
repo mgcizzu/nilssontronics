@@ -2,7 +2,7 @@
 
 A workflow-focused desktop front end for **cyclic imaging of large tissue
 sections** on a Micro-Manager microscope — a deliberately simplified,
-ZEN-like experience that hides Micro-Manager's device tree and property
+workflow-driven experience that hides Micro-Manager's device tree and property
 browser. It runs on a built-in simulator by default; a pymmcore-plus backend
 drives real hardware.
 

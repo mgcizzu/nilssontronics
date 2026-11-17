@@ -1,6 +1,6 @@
 # CLAUDE.md — nilssontronics
 
-Simplified, ZEN-like desktop front end for Micro-Manager, built for **cyclic
+Simplified, workflow-driven desktop front end for Micro-Manager, built for **cyclic
 imaging of large tissue sections** (combinatorial decoding happens downstream).
 See README.md for the architecture, data layout and configuration.
 
@@ -40,17 +40,16 @@ python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv f
 ```
 
 ## Open items (in order)
-1. Push `feature/cyclic-engine` and open the PR against `main` (needs GitHub auth on this Mac).
-2. Qt port (`microscope_ui/qt/`), keeping controller/engine as is. Done: cycle workflow,
+1. Qt port (`microscope_ui/qt/`), keeping controller/engine as is. Done: cycle workflow,
    overview canvas (draw rectangle/polygon, drag "Move ROI set", double-click stage move,
    focus-point click, mosaic underlay), focus points, live/snap via ndv, MMCore device
    docks. All setup device calls run on `DeviceWorker` (never the GUI thread), drained
    before the engine starts. Missing vs Tk: guided "Refocus all", "Align selected F →
    stage", spiral preview, recipes, flat-field UI, admin dialog.
    Never use pymmcore-widgets StageWidget: it bypasses backend stage-limit checks.
-3. Agree output file naming/format with the downstream pipeline, then replace `.tstack`.
-4. Before any real-hardware run: calibrate turret positions, pixel sizes, camera
+2. Agree output file naming/format with the downstream pipeline, then replace `.tstack`.
+3. Before any real-hardware run: calibrate turret positions, pixel sizes, camera
    orientation, stage limits and safe Z ranges at the microscope.
 
-Done 2026-11-17: tests + app run on Marco's Python (miniforge 3.13, `.venv`);
+Done 2026-11-17: PR mgcizzu/nilssontronics#1 merged; tests + app run on Marco's Python (miniforge 3.13, `.venv`);
 `MMCoreBackend` validated against `MMConfig_demo.cfg` (`tests/test_mmcore_demo.py`).
