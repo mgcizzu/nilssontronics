@@ -217,6 +217,33 @@ def test_window_stays_open_while_storage_cannot_be_closed(qtbot, window):
         assert window.close()
 
 
+def test_window_stays_open_while_a_device_command_runs(qtbot, window):
+    import threading
+
+    import microscope_ui.qt.window as window_module
+
+    window.show()
+    release, started = threading.Event(), threading.Event()
+
+    def stalled_stage_command():
+        started.set()
+        release.wait(10)
+
+    window.device.submit(stalled_stage_command)
+    assert started.wait(5)
+    with mock.patch.object(window_module, "DEVICE_DRAIN_TIMEOUT_S", 0.2), \
+            mock.patch.object(window.controller, "close", wraps=window.controller.close) as close:
+        assert not window.close()
+        close.assert_not_called()  # backend untouched while the command runs
+    assert window.isVisible()
+    assert window.messages[-1][1] == "Microscope busy"
+    assert window.position_timer.isActive()
+
+    release.set()
+    assert window.device.stop_and_drain(5)
+    assert window.close()
+
+
 def test_abort_then_resume(qtbot, window):
     window.backend.delay = 0.02
     window.region_list.append(ScanRegion(-1500, -1000, 3000, 2000))
