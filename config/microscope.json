@@ -1,0 +1,183 @@
+{
+  "microscope_name": "Microscope simulator",
+  "camera": {
+    "width_px": 2048,
+    "height_px": 2048
+  },
+  "bytes_per_pixel": 2,
+  "storage": {
+    "writer_queue_frames": 4
+  },
+  "overlap_x_percent": 10,
+  "overlap_y_percent": 10,
+  "stage_limits": {
+    "x_min_um": -50000,
+    "x_max_um": 50000,
+    "y_min_um": -30000,
+    "y_max_um": 30000,
+    "z_min_um": -5000,
+    "z_max_um": 5000
+  },
+  "objectives": [
+    {
+      "id": "4x_air",
+      "name": "4× overview",
+      "magnification": 4,
+      "numerical_aperture": 0.13,
+      "immersion": "air",
+      "immersion_refractive_index": 1.0,
+      "turret_position": 1,
+      "pixel_size_um": 1.625,
+      "safe_z_min_um": -4000,
+      "safe_z_max_um": 3500
+    },
+    {
+      "id": "10x_air",
+      "name": "10× air",
+      "magnification": 10,
+      "numerical_aperture": 0.30,
+      "immersion": "air",
+      "immersion_refractive_index": 1.0,
+      "turret_position": 2,
+      "pixel_size_um": 0.65,
+      "safe_z_min_um": -3500,
+      "safe_z_max_um": 3000
+    },
+    {
+      "id": "20x_air",
+      "name": "20× air",
+      "magnification": 20,
+      "numerical_aperture": 0.50,
+      "immersion": "air",
+      "immersion_refractive_index": 1.0,
+      "turret_position": 3,
+      "pixel_size_um": 0.325,
+      "safe_z_min_um": -3000,
+      "safe_z_max_um": 2500
+    },
+    {
+      "id": "40x_air",
+      "name": "40× air",
+      "magnification": 40,
+      "numerical_aperture": 0.75,
+      "immersion": "air",
+      "immersion_refractive_index": 1.0,
+      "turret_position": 4,
+      "pixel_size_um": 0.1625,
+      "safe_z_min_um": -2500,
+      "safe_z_max_um": 2000
+    },
+    {
+      "id": "40x_oil",
+      "name": "40× oil",
+      "magnification": 40,
+      "numerical_aperture": 1.30,
+      "immersion": "oil",
+      "immersion_refractive_index": 1.515,
+      "turret_position": 5,
+      "pixel_size_um": 0.1625,
+      "safe_z_min_um": -2000,
+      "safe_z_max_um": 1500
+    },
+    {
+      "id": "63x_oil",
+      "name": "63× oil",
+      "magnification": 63,
+      "numerical_aperture": 1.40,
+      "immersion": "oil",
+      "immersion_refractive_index": 1.515,
+      "turret_position": 6,
+      "pixel_size_um": 0.103,
+      "safe_z_min_um": -1800,
+      "safe_z_max_um": 1200
+    }
+  ],
+  "channels": [
+    {
+      "id": "brightfield",
+      "name": "Brightfield",
+      "color": "#e7e5d8",
+      "emission_wavelength_nm": 550,
+      "default_exposure_ms": 10,
+      "max_exposure_ms": 500,
+      "default_power_percent": 15,
+      "max_power_percent": 60,
+      "manual_prompt": null
+    },
+    {
+      "id": "dapi",
+      "name": "DAPI",
+      "color": "#6c8cff",
+      "emission_wavelength_nm": 461,
+      "default_exposure_ms": 40,
+      "max_exposure_ms": 1000,
+      "default_power_percent": 20,
+      "max_power_percent": 80,
+      "manual_prompt": null
+    },
+    {
+      "id": "af488",
+      "name": "AF488 / GFP",
+      "color": "#58d68d",
+      "emission_wavelength_nm": 520,
+      "default_exposure_ms": 60,
+      "max_exposure_ms": 1500,
+      "default_power_percent": 20,
+      "max_power_percent": 80,
+      "manual_prompt": null
+    },
+    {
+      "id": "cy3",
+      "name": "Cy3",
+      "color": "#ffb347",
+      "emission_wavelength_nm": 570,
+      "default_exposure_ms": 80,
+      "max_exposure_ms": 2000,
+      "default_power_percent": 25,
+      "max_power_percent": 80,
+      "manual_prompt": "Check that the green/yellow illumination paddle is in the Cy3 position."
+    },
+    {
+      "id": "cy5",
+      "name": "Cy5",
+      "color": "#ff5b78",
+      "emission_wavelength_nm": 670,
+      "default_exposure_ms": 100,
+      "max_exposure_ms": 2500,
+      "default_power_percent": 30,
+      "max_power_percent": 85,
+      "manual_prompt": null
+    },
+    {
+      "id": "af750",
+      "name": "AF750 / NIR",
+      "color": "#c67cff",
+      "emission_wavelength_nm": 780,
+      "default_exposure_ms": 150,
+      "max_exposure_ms": 3000,
+      "default_power_percent": 35,
+      "max_power_percent": 90,
+      "manual_prompt": null
+    }
+  ],
+  "recipes": [
+    {
+      "name": "Tissue survey",
+      "objective_id": "10x_air",
+      "channels": ["dapi", "af488"],
+      "z_mode": "single"
+    },
+    {
+      "name": "Four-colour section",
+      "objective_id": "20x_air",
+      "channels": ["dapi", "af488", "cy3", "cy5"],
+      "z_mode": "focus_map"
+    },
+    {
+      "name": "High-resolution oil",
+      "objective_id": "63x_oil",
+      "channels": ["dapi", "af488", "cy5"],
+      "z_mode": "stack"
+    }
+  ]
+}

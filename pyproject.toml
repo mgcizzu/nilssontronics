@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microscope-scan-console"
+version = "0.1.0"
+description = "A workflow-focused desktop front end for microscope acquisition"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+microscope-scan-console = "microscope_ui.app:main"
+
+[tool.setuptools.packages.find]
+include = ["microscope_ui*"]
