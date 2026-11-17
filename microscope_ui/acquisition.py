@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from threading import Condition, Lock, Thread
 import time
-from typing import Protocol
+from typing import Callable, Protocol
+
+import numpy as np
 
 
 class PlaneSink(Protocol):
@@ -18,18 +20,22 @@ class PlaneSink(Protocol):
         fov_width_um: float,
         fov_height_um: float,
         z_planes: int,
+        row: int = 0,
+        col: int = 0,
+        z_positions_um: tuple[float, ...] = (),
     ) -> None: ...
 
     def write_plane(
         self,
         channel_id: str,
         z_index: int,
-        payload: bytes | None = None,
-        width: int = 64,
-        height: int = 64,
+        frame: np.ndarray,
+        z_um: float | None = None,
     ) -> None: ...
 
     def finish_tile(self): ...
+
+    def abandon_tile(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,9 +50,11 @@ class PlaneWriteRequest:
     z_planes: int
     channel_id: str
     z_index: int
-    payload: bytes
-    width: int
-    height: int
+    frame: np.ndarray
+    z_um: float | None = None
+    row: int = 0
+    col: int = 0
+    z_positions_um: tuple[float, ...] = ()
     is_last_plane: bool = False
 
 
@@ -132,6 +140,33 @@ class BoundedAsyncWriter:
             self._state_changed.notify_all()
             return True
 
+    def submit(
+        self,
+        request: PlaneWriteRequest,
+        should_stop: Callable[[], bool] = lambda: False,
+        poll_s: float = 0.05,
+    ) -> bool:
+        """Block the acquisition thread only while the queue is full.
+
+        Returns False without queuing if ``should_stop`` becomes true or the
+        writer fails/stops accepting. Never drops a frame silently.
+        """
+
+        while True:
+            if self.try_submit(request):
+                return True
+            with self._state_changed:
+                if not self._accepting or self._failure is not None:
+                    return False
+                if should_stop():
+                    return False
+                self._state_changed.wait(poll_s)
+
+    @property
+    def backpressure(self) -> bool:
+        with self._state_lock:
+            return self._pending_frames >= self._capacity
+
     def snapshot(self) -> WriterSnapshot:
         with self._state_lock:
             return WriterSnapshot(
@@ -196,6 +231,11 @@ class BoundedAsyncWriter:
         while True:
             item = self._queue.get()
             if item is _STOP:
+                if current_tile is not None:
+                    # Unfinished tile (abort/stop): discard it so the resume
+                    # journal never lists a partial tile.
+                    self._safe_abandon()
+                    current_tile = None
                 self._queue.task_done()
                 with self._state_changed:
                     self._busy = False
@@ -206,6 +246,7 @@ class BoundedAsyncWriter:
             with self._state_changed:
                 self._busy = True
                 self._state_changed.notify_all()
+            plane_counted = False
             try:
                 if current_tile is None:
                     self._sink.begin_tile(
@@ -215,6 +256,9 @@ class BoundedAsyncWriter:
                         item.fov_width_um,
                         item.fov_height_um,
                         item.z_planes,
+                        item.row,
+                        item.col,
+                        item.z_positions_um,
                     )
                     current_tile = item.tile_index
                 elif current_tile != item.tile_index:
@@ -226,13 +270,14 @@ class BoundedAsyncWriter:
                 self._sink.write_plane(
                     item.channel_id,
                     item.z_index,
-                    item.payload,
-                    item.width,
-                    item.height,
+                    item.frame,
+                    item.z_um,
                 )
                 with self._state_changed:
                     self._written_frames += 1
                     self._pending_frames -= 1
+                    self._state_changed.notify_all()
+                plane_counted = True
 
                 if item.is_last_plane:
                     self._sink.finish_tile()
@@ -240,10 +285,12 @@ class BoundedAsyncWriter:
                     with self._state_changed:
                         self._completed_tiles += 1
             except Exception as exc:  # The UI reports the exact storage failure.
+                self._safe_abandon()
                 with self._state_changed:
                     self._failure = f"{type(exc).__name__}: {exc}"
                     self._accepting = False
-                    self._pending_frames -= 1
+                    if not plane_counted:
+                        self._pending_frames -= 1
                     self._busy = False
                     self._state_changed.notify_all()
                 self._queue.task_done()
@@ -254,6 +301,15 @@ class BoundedAsyncWriter:
                 with self._state_changed:
                     self._busy = False
                     self._state_changed.notify_all()
+
+    def _safe_abandon(self) -> None:
+        abandon = getattr(self._sink, "abandon_tile", None)
+        if abandon is None:
+            return
+        try:
+            abandon()
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
 
     def _discard_pending(self) -> None:
         discarded = 0

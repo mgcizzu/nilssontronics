@@ -1,124 +1,184 @@
 # Microscope Scan Console
 
-A workflow-focused desktop prototype for operating a microscope without exposing
-Micro-Manager's device tree and property browser. Version 0.1 runs entirely on a
-simulated microscope and sends **no hardware commands**.
+A workflow-focused desktop front end for **cyclic imaging of large tissue
+sections** on a Micro-Manager microscope — a deliberately simplified,
+ZEN-like experience that hides Micro-Manager's device tree and property
+browser. It runs on a built-in simulator by default; a pymmcore-plus backend
+drives real hardware.
 
-## Try the prototype
+## Try it
 
-Python 3.11 or newer with Tk support is the only requirement.
+Python 3.11+ with Tk and NumPy.
 
 ```bash
-python3 -m microscope_ui
+pip install -e .                 # simulator only
+pip install -e ".[hardware]"     # + pymmcore-plus for a real microscope
+pip install -e ".[flatfield]"    # + BaSiC (basicpy) for flat-field estimation
+pip install -e ".[qt]"           # + Qt view (PyQt6, ndv, pymmcore-widgets)
+
+python3 -m microscope_ui                       # simulator
+python3 -m microscope_ui --backend mmcore      # Micro-Manager (see below)
+python3 -m microscope_ui --config my_scope.json
+python3 -m microscope_ui.qt                    # Qt view (work in progress), same flags
 ```
 
-The prototype supports:
+## Cyclic imaging workflow
 
-- any number of configuration-defined objectives, including immersion-change warnings;
-- named channels with exposure sliders and illumination safety limits;
-- independent X and Y tile overlap controls, both defaulting to 10%;
-- live **Set Begin** / **Set End** capture for absolute Z-stack limits;
-- automatic endpoint-inclusive Z plane counts derived from objective NA;
-- rectangular and irregular-polygon ROIs drawn directly on the overview;
-- reusable ROI-set files containing outlines and focus-point XYZ coordinates;
-- reloadable, editable focus points captured from the current live XYZ position;
-- drag-to-translate for an entire ROI/focus-point set while preserving focus Z values;
-- single-channel, single-plane center-out spiral previews;
-- guarded single-plane, Z-stack, and surface-following acquisition modes;
-- configuration-defined acquisition recipes;
-- estimates for tiles, frames, time, and storage;
-- XY, Z, exposure, illumination, and disk-space preflight checks;
-- incremental disk-backed scan mosaics with composite and per-channel display;
-- a bounded asynchronous camera-to-SSD queue with safe backpressure;
-- immediate per-plane flushing by a dedicated writer into one tile stack at a time;
-- fixed-size memory-mapped preview maps and an append-only recovery index.
+An **experiment** fixes the objective, ROI set, overlap and tile order once.
+That produces one tile list (index, grid row/column, stage XY, acquisition
+order) which **every cycle replays exactly**. Channels, exposures and
+illumination power are chosen freely per cycle (decoding happens downstream,
+so no marker mapping is stored).
 
-Use **Rectangle** to drag a rectangular ROI. In **Irregular polygon** mode, click
-each corner and double-click or right-click to close the shape; Escape cancels an
-unfinished outline. Use **Move ROI set** to drag every ROI and focus point together
-in XY as one registration object.
+1. **Cycle 1.** Choose objective and overlap, draw rectangular or polygon ROIs,
+   capture focus points, pick channels, then **Review and start cycle 1**. This
+   creates the experiment folder. From now on the objective, overlap, tile
+   order and ROI shapes are locked.
+2. **Strip / restain and remount the slide.**
+3. **Re-align by translation.** Either drag the whole set in **Move ROI set**
+   mode, or – more precisely – select a focus point, drive the stage until the
+   same landmark is centred in Live, and press **Align selected F → stage**.
+   The offset relative to cycle 1 is shown under the viewer and stored with
+   the cycle.
+4. **Refocus.** Press **Refocus all**: the stage visits F1, F2, … in turn; focus
+   in Live and press **Accept Z ▶** for each (Z only is updated). Single focus
+   points can still be clicked and updated with **Update Z**.
+5. **Review and start cycle N.** Repeat from step 2.
 
-To record focus, choose **Focus points** and click the sample to move there. Focus
-the live image with the physical microscope control (or the simulator's Z jog
-buttons), then press **Capture XYZ**. Click a reloaded numbered marker to navigate
-back to its stored XYZ; after refocusing, **Update Z** replaces only that point's Z
-coordinate. Surface following requires at least three points inside the selected
-ROIs that do not all lie on one line.
+**Pause** stops between tiles (after the current tile is saved). **Abort**
+stops after the current frame; the unfinished tile is discarded.
+After an abort, error, power cut or crash, **Open…** the experiment (or keep
+it open) and **Resume cycle**: only tiles missing from that cycle's journal
+are acquired, with the cycle's original channels, powers and focus positions.
+A new cycle cannot start while an earlier one is unfinished.
 
-The **Spiral preview** channel menu lists the currently enabled acquisition
-channels. Choose one and press the button to acquire a center-out XY preview at
-the current Z. The preview never runs a Z-stack. If ROIs exist it covers their tile
-positions; otherwise it previews a 5×5 field around the current stage position.
+## Z modes
 
-The image viewer uses pointer-centred mouse-wheel zoom. Move the pointer over the
-green **Live Z (wheel)** toolbar instead to jog focus by 1 µm per wheel step;
-holding Shift changes that to 10 µm. The Overview button resets the image to 100%.
+- **Single** – the Z at the moment the cycle starts (checked against the
+  objective's safe range).
+- **Z-stack** – absolute Begin/End captured from live Z; plane count from the
+  widefield axial Nyquist interval `n·λ/NA²` (shortest enabled emission).
+- **Surface map** – one plane per tile at the Z of a focus surface:
+  - *Triangulated* (default): piecewise-linear over a Delaunay triangulation,
+    so local warping of large sections is followed; outside the points' hull
+    Z is held at the nearest hull edge (never extrapolated).
+  - *Plane fit*: least-squares plane, robust for noisy points on flat sections.
 
-For a Z-stack, select **Z-stack**, focus the first limit in Live mode, and press
-**Set Begin**. Move Z to the other limit and press **Set End**. The app calculates
-the plane count and actual endpoint-inclusive spacing automatically. It estimates
-the widefield axial Nyquist interval as `n × wavelength / NA²`, using the selected
-objective's immersion refractive index and the shortest enabled channel emission
-wavelength. Changing the objective clears captured limits; changing enabled
-channels recalculates the plane count.
+  Every tile's surface Z is checked against the safe range before scanning.
 
-**Save ROI set** and **Load ROI set** preserve regions and focus points in a small,
-human-readable JSON file using stage coordinates in micrometres. Select **Review
-and start scan** to exercise the full preflight and confirmation flow.
+## Options (all optional)
 
-## Large-scan storage and display
+- **Tile order:** *Raster* (default; every row left→right, the same X approach
+  direction) or *Serpentine* (shorter travel). Fixed per experiment.
+- **Close shutter during moves** (default on): light only during exposures.
+  Off keeps the shutter open per tile/channel for speed, still closing it for
+  stage and Z moves.
+- **Consistent stage approach:** every XY target is approached from the same
+  side after an overshoot of `stage.approach_offset_um` (set it in the config).
+- **Flat-field profile after each cycle:** writes `cycle_NN/flatfield/<ch>.npy`
+  (mean 1, `corrected = raw / profile`); raw data are never modified. Uses
+  BaSiC when `basicpy` is installed, otherwise a median-based estimate.
 
-During a simulated full scan, the camera side places each channel/Z plane into a
-strictly bounded queue and immediately proceeds when space remains. A dedicated
-writer appends and flushes those frames to the current tile's `.simstack` file.
-Only that one tile container remains open; completing it atomically renames the
-file and appends a record to `tiles.jsonl`. A crash therefore leaves previously
-completed tiles and their index intact. Real camera frames will use the same
-lifecycle boundary with an OME-Zarr writer instead of the compact simulator
-payload.
+## Tile grid
 
-The default queue holds at most four frame payloads, configured by
-`storage.writer_queue_frames` in `config/microscope.json`. At 2048×2048 and 16-bit,
-that bounds writer-owned image payloads to 32 MiB. If the SSD falls behind long
-enough to fill the queue, acquisition pauses safely until one slot is released;
-it does not grow RAM use or drop a frame. The status line reports acquired and
-saved frame counts, buffer occupancy, and any backpressure independently.
+All ROIs share **one grid** anchored on their combined bounding box, so
+overlapping ROIs never produce duplicate tiles and the requested overlap is
+exact everywhere. A grid cell is kept when its field of view overlaps any ROI.
+Tile centres (and approach points) are checked against the stage limits.
 
-The on-screen mosaic is assembled from fixed-size memory-mapped RGB files under
-`disk_preview/`. Its disk and RAM requirements do not grow with the physical scan
-area. The viewer keeps only one screen-sized image while the writer owns only its
-bounded frame queue, throttling redraws independently of camera timing. The current tile is
-outlined; Z planes appear while acquired and are replaced by a MIP when that tile
-stack completes. **Scan mosaic display** switches between the composite and any
-enabled channel without interrupting acquisition. Pan/zoom continues to read from
-the disk preview rather than retaining acquired tiles in RAM.
+## Data layout
+
+```
+<output>/<project>/<sample>_<timestamp>/
+  experiment.json          objective, ROIs, tile list, every cycle's settings,
+                           offset, focus points, status (atomic + fsync)
+  cycle_01/
+    tiles/tile_00000.tstack   one finished tile (all channels and Z planes)
+    tiles.jsonl               append-only journal of finished tiles (resume)
+    disk_preview/*.u16        fixed-size memory-mapped preview per channel
+    flatfield/                optional
+  cycle_02/ …
+```
+
+`.tstack` is an **interim** container (JSON header + raw planes, readable
+with `microscope_ui.mosaic.read_tile_stack`) until the file names and format
+required by the downstream pipeline are agreed; only `mosaic.py` knows it.
+
+Each tile is written to `.tmp`, fsynced, atomically renamed, then appended to
+`tiles.jsonl` (also fsynced). Every tile in the journal is therefore complete
+on disk after a crash. Camera frames pass through a bounded queue
+(`storage.writer_queue_frames`) to one writer thread: if the SSD falls behind,
+the camera waits; frames are never dropped and RAM never grows. The preview is
+a fixed-size map regardless of scan area; the current tile shows a running MIP.
+
+## Architecture
+
+```
+app.py            Tk view
+qt/               Qt view (in progress): overview canvas, ndv live view on a device-worker
+                  thread, pymmcore-widgets device docks
+controller.py     ScanController: experiments, preflight, start/pause/abort/resume
+engine.py         AcquisitionEngine: one cycle on a worker thread
+acquisition.py    BoundedAsyncWriter: camera → SSD queue
+mosaic.py         tile storage, journal, preview maps
+experiment.py     Experiment → Cycle model (experiment.json)
+planner.py        tile grid, estimates, validation
+focus.py          focus surfaces
+backend.py        backend protocol, limit checks, simulator
+backend_mmcore.py pymmcore-plus backend
+flatfield.py      optional flat-field estimation
+```
+
+The interface never talks to devices; it builds an `AcquisitionPlan` and calls
+the controller, so the whole acquisition path is tested without a display.
+
+## Hardware (pymmcore-plus)
+
+Set `"backend": "mmcore"` (or pass `--backend mmcore`) and fill the
+`hardware` section of the configuration:
+
+| key | meaning |
+| --- | --- |
+| `mm_config_path` | Micro-Manager `.cfg` file |
+| `mm_adapter_path` | Micro-Manager install folder (optional; default discovery otherwise) |
+| `channel_group`, `channel_presets` | config group and one preset per channel id |
+| `objective_device`, `turret_position_offset` | turret state device; MM state = `turret_position + offset` |
+| `objective_change_z_um` | clearance Z used before rotating the turret |
+| `power_properties` | optional per channel: `{"device", "property", "scale", "offset"}` |
+| `pixel_size_configs` | optional per objective: MM pixel-size preset to select |
+| `settle_timeout_ms` | device wait timeout |
+
+`camera.orientation` (`flip_x`, `flip_y`, `transpose`) maps camera pixels to
+stage axes; set it so that a stage move to +X moves image content to −column.
+
+Safety rules in the backend: XY/Z targets outside the configured limits (and
+the objective's safe Z range) are **refused before any command is sent**,
+never clamped; objective changes move to the clearance Z first and leave Z
+there for a deliberate refocus; device faults are reported as plain messages.
+
+The shipped `hardware` values match Micro-Manager's demo configuration
+(`MMConfig_demo.cfg`). **No real-hardware run should start until turret
+positions, pixel sizes, orientation, stage limits and safe Z ranges have been
+calibrated at the microscope by an operator.**
 
 ## Configuration
 
-Edit [`config/microscope.json`](config/microscope.json) to define objectives,
-channels, stage limits, camera size, overlap, and recipes. The supplied values are
-examples, not measured values for the real microscope. In particular, turret
-positions, pixel sizes, stage limits, and safe Z ranges must be calibrated before
-hardware use.
+`config/microscope.json` defines objectives, channels, stage limits, camera
+size and orientation, overlap, timing used for estimates, recipes and the
+hardware mapping. The file is validated on start-up and every problem is
+listed (unique IDs, NA ≤ n, safe Z inside stage limits, default ≤ max
+exposure/power, recipe references, …).
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m pytest           # or: python3 -m unittest discover -s tests
 ```
 
-## Architecture and hardware integration
-
-The interface uses the narrow `MicroscopeBackend` protocol in
-`microscope_ui/backend.py`. `SimulatedMicroscope` implements it now. The next
-hardware milestone is a `pymmcore-plus` implementation that:
-
-1. loads a known-good Micro-Manager configuration;
-2. maps objective and channel IDs to verified configuration presets;
-3. performs safe-Z turret changes and waits for devices to settle;
-4. exposes live and snapped images to the viewer;
-5. runs a `useq-schema` acquisition and writes OME-Zarr or OME-TIFF;
-6. reports device faults without exposing raw device properties to normal users.
-
-No real-hardware backend should be enabled until the device mappings and travel
-limits have been checked at the microscope by an operator.
+`tests/test_mmcore_demo.py` runs `MMCoreBackend` against a real `CMMCorePlus`
+loaded with `MMConfig_demo.cfg`; it is skipped unless Micro-Manager is found
+(`mmcore install`, or `MICROMANAGER_PATH`). On Apple silicon, `mmcore install`
+fetches only the arm64 test adapters (DemoCamera etc.), which is all this needs;
+an x86_64 `/Applications/Micro-Manager*` build cannot be loaded by arm64 Python.
+`tests/test_qt_view.py` needs `.[qt]` and runs headless (`QT_QPA_PLATFORM=offscreen`)
+with a plain image view; ndv/vispy needs a real OpenGL display.

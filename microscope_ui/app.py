@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import argparse
+from dataclasses import replace
 import json
 import math
 import random
-import re
 import time
-from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .acquisition import BoundedAsyncWriter, PlaneWriteRequest
-from .backend import SimulatedMicroscope
+from .backend import HardwareError
+from .backend_mmcore import create_backend
 from .config import DEFAULT_CONFIG_PATH, load_config
+from .controller import ControllerError, ScanController
+from .experiment import Experiment
 from .models import (
+    AcquisitionOptions,
     AcquisitionPlan,
     ChannelSetting,
     FocusPoint,
@@ -21,19 +24,9 @@ from .models import (
     ScanRegion,
     ZSettings,
 )
-from .mosaic import (
-    DiskBackedMosaic,
-    MosaicBounds,
-    mosaic_bounds_for_regions,
-    simulated_plane_payload,
-)
+from .mosaic import DiskBackedMosaic, MosaicBounds
 from .optics import automatic_z_stack, recommended_z_step_um
-from .planner import (
-    estimate_acquisition,
-    spiral_preview_positions,
-    tile_positions_for_regions,
-    validate_plan,
-)
+from .planner import spiral_preview_positions
 from .roi_io import load_roi_set, save_roi_set
 
 
@@ -49,11 +42,13 @@ WARNING = "#b66a18"
 
 
 class ScanConsole(tk.Tk):
-    def __init__(self, config: MicroscopeConfig) -> None:
+    def __init__(self, config: MicroscopeConfig, backend=None) -> None:
         super().__init__()
         self.config_data = config
-        self.backend = SimulatedMicroscope(config)
-        self.title("Microscope Scan Console — Simulator")
+        self.backend = backend if backend is not None else create_backend(config)
+        self.controller = ScanController(config, self.backend)
+        self.config_path = DEFAULT_CONFIG_PATH
+        self.title(f"Microscope Scan Console — {self.backend.name}")
         self.geometry("1440x900")
         self.minsize(1160, 760)
         self.configure(bg=BG)
@@ -78,25 +73,9 @@ class ScanConsole(tk.Tk):
         self.view_zoom = 1.0
         self.view_center_override: tuple[float, float] | None = None
         self.progress_job: str | None = None
-        self.scan_started_at = 0.0
-        self.scan_simulated_seconds = 0.0
-        self.active_plan: AcquisitionPlan | None = None
-        self.active_estimate = None
-        self.active_mosaic: DiskBackedMosaic | None = None
-        self.scan_writer: BoundedAsyncWriter | None = None
-        self.active_scan_folder: Path | None = None
-        self.scan_tile_positions: list[tuple[float, float]] = []
-        self.scan_capture_tile_index = 0
-        self.scan_tile_index = 0
-        self.scan_channel_index = 0
-        self.scan_z_index = 0
-        self.scan_frame_index = 0
-        self.scan_written_frames = 0
-        self.scan_tile_started = False
-        self.current_frame_label = ""
-        self.active_tile_center: tuple[float, float] | None = None
         self.mosaic_photo: tk.PhotoImage | None = None
         self.last_mosaic_render_time = 0.0
+        self.refocus_index: int | None = None
 
         self.objective_var = tk.StringVar()
         self.recipe_var = tk.StringVar(value="Custom")
@@ -116,7 +95,10 @@ class ScanConsole(tk.Tk):
         self.project_var = tk.StringVar(value="Demo project")
         self.sample_var = tk.StringVar(value="Sample 001")
         self.output_var = tk.StringVar(value=str(Path.cwd()))
-        self.status_var = tk.StringVar(value="SIMULATOR CONNECTED")
+        self.idle_status = (
+            "SIMULATOR CONNECTED" if self.backend.simulated else f"{self.backend.name.upper()} CONNECTED"
+        )
+        self.status_var = tk.StringVar(value=self.idle_status)
         self.position_var = tk.StringVar()
         self.region_var = tk.StringVar(value="No scan regions")
         self.focus_status_var = tk.StringVar(value="No focus point selected")
@@ -127,6 +109,14 @@ class ScanConsole(tk.Tk):
         self.progress_text_var = tk.StringVar(value="Ready")
         self.channel_vars: dict[str, tk.BooleanVar] = {}
         self.exposure_vars: dict[str, tk.DoubleVar] = {}
+        self.power_vars: dict[str, tk.DoubleVar] = {}
+        self.tile_order_var = tk.StringVar(value="raster")
+        self.focus_method_var = tk.StringVar(value="linear")
+        self.consistent_approach_var = tk.BooleanVar(value=False)
+        self.shutter_per_frame_var = tk.BooleanVar(value=True)
+        self.flat_field_var = tk.BooleanVar(value=False)
+        self.experiment_var = tk.StringVar(value="No experiment — the first scan creates one")
+        self.offset_var = tk.StringVar(value="")
 
         self._configure_styles()
         self._build_header()
@@ -206,18 +196,36 @@ class ScanConsole(tk.Tk):
         workspace.grid_rowconfigure(0, weight=1)
         workspace.grid_columnconfigure(1, weight=1)
 
-        left = ttk.Frame(workspace, style="Panel.TFrame", padding=12, width=330)
-        left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
-        left.grid_propagate(False)
+        # The setup column scrolls so every section fits on smaller screens.
+        left_container = ttk.Frame(workspace, style="Panel.TFrame", width=345)
+        left_container.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
+        left_container.grid_propagate(False)
+        left_container.grid_rowconfigure(0, weight=1)
+        left_canvas = tk.Canvas(left_container, bg=PANEL, highlightthickness=0, width=330)
+        left_scroll = ttk.Scrollbar(left_container, orient="vertical", command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_canvas.grid(row=0, column=0, sticky="ns")
+        left_scroll.grid(row=0, column=1, sticky="ns")
+        left = ttk.Frame(left_canvas, style="Panel.TFrame", padding=12, width=330)
+        left_window = left_canvas.create_window(0, 0, window=left, anchor="nw")
+        left.bind(
+            "<Configure>",
+            lambda _e: left_canvas.configure(scrollregion=left_canvas.bbox("all")),
+        )
+        left_canvas.bind(
+            "<Configure>", lambda e: left_canvas.itemconfigure(left_window, width=e.width)
+        )
+        self.left_canvas = left_canvas
 
         center = ttk.Frame(workspace, style="Panel.TFrame", padding=10)
         center.grid(row=0, column=1, sticky="nsew")
         center.grid_rowconfigure(3, weight=1)
         center.grid_columnconfigure(0, weight=1)
 
-        right = ttk.Frame(workspace, style="Panel.TFrame", padding=14, width=300)
+        right = ttk.Frame(workspace, style="Panel.TFrame", padding=14, width=310)
         right.grid(row=0, column=2, sticky="nse", padx=(10, 0))
         right.grid_propagate(False)
+        right.pack_propagate(False)
 
         self._build_setup_panel(left)
         self._build_viewer(center)
@@ -230,7 +238,7 @@ class ScanConsole(tk.Tk):
 
     def _build_setup_panel(self, parent: ttk.Frame) -> None:
         recipe = self._section(parent, "Recipe")
-        recipe_names = ["Custom", *(item["name"] for item in self.config_data.recipes)]
+        recipe_names = ["Custom", *(item.name for item in self.config_data.recipes)]
         recipe_box = ttk.Combobox(
             recipe,
             textvariable=self.recipe_var,
@@ -252,6 +260,7 @@ class ScanConsole(tk.Tk):
         self.objective_box.bind("<<ComboboxSelected>>", self._objective_changed)
         self.objective_detail_label = ttk.Label(objective, style="Muted.TLabel", wraplength=285)
         self.objective_detail_label.pack(fill="x", pady=(5, 0))
+        self.objective_lock_widgets: list[tk.Misc] = [self.objective_box, recipe_box]
         overlap_row = ttk.Frame(objective, style="Panel.TFrame")
         overlap_row.pack(fill="x", pady=(7, 0))
         ttk.Label(
@@ -276,6 +285,7 @@ class ScanConsole(tk.Tk):
                 command=self._input_changed,
             )
             overlap_entry.pack(side="left")
+            self.objective_lock_widgets.append(overlap_entry)
             overlap_entry.bind("<FocusOut>", self._input_changed)
             overlap_entry.bind("<Return>", self._input_changed)
             ttk.Label(overlap_row, text="%", style="Muted.TLabel").pack(side="left")
@@ -284,15 +294,17 @@ class ScanConsole(tk.Tk):
         header = ttk.Frame(channels, style="Panel.TFrame")
         header.pack(fill="x")
         ttk.Label(header, text="Channel", style="Muted.TLabel").pack(side="left")
-        ttk.Label(header, text="Exposure (ms)", style="Muted.TLabel").pack(side="right")
+        ttk.Label(header, text="Exposure ms · Power %", style="Muted.TLabel").pack(side="right")
         for channel in self.config_data.channels:
             row = ttk.Frame(channels, style="Panel.TFrame")
             row.pack(fill="x", pady=1)
             selected = tk.BooleanVar(value=channel.id in {"dapi", "af488"})
             exposure = tk.DoubleVar(value=channel.default_exposure_ms)
             exposure_label = tk.StringVar(value=f"{channel.default_exposure_ms:g}")
+            power = tk.DoubleVar(value=channel.default_power_percent)
             self.channel_vars[channel.id] = selected
             self.exposure_vars[channel.id] = exposure
+            self.power_vars[channel.id] = power
             check = ttk.Checkbutton(
                 row,
                 text=channel.name,
@@ -302,6 +314,20 @@ class ScanConsole(tk.Tk):
             check.pack(side="left")
             swatch = tk.Label(row, bg=channel.color, width=2, height=1)
             swatch.pack(side="left", padx=(2, 5))
+            power_box = ttk.Spinbox(
+                row,
+                from_=0,
+                to=channel.max_power_percent,
+                increment=1,
+                textvariable=power,
+                width=3,
+                justify="right",
+                format="%.0f",
+                command=self._input_changed,
+            )
+            power_box.pack(side="right", padx=(3, 0))
+            power_box.bind("<FocusOut>", self._input_changed)
+            power_box.bind("<Return>", self._input_changed)
             value_label = ttk.Label(
                 row,
                 textvariable=exposure_label,
@@ -364,7 +390,40 @@ class ScanConsole(tk.Tk):
             style="Muted.TLabel",
             wraplength=285,
         ).pack(fill="x", pady=(5, 0))
-        save = self._section(parent, "4  Save")
+        options = self._section(parent, "4  Options")
+        order_row = ttk.Frame(options, style="Panel.TFrame")
+        order_row.pack(fill="x")
+        ttk.Label(order_row, text="Tile order", style="Muted.TLabel").pack(side="left")
+        for value, label in (("raster", "Raster"), ("serpentine", "Serpentine")):
+            button = ttk.Radiobutton(
+                order_row,
+                text=label,
+                value=value,
+                variable=self.tile_order_var,
+                command=self._input_changed,
+            )
+            button.pack(side="left", padx=(6, 0))
+            self.objective_lock_widgets.append(button)
+        surface_row = ttk.Frame(options, style="Panel.TFrame")
+        surface_row.pack(fill="x", pady=(2, 0))
+        ttk.Label(surface_row, text="Surface", style="Muted.TLabel").pack(side="left")
+        for value, label in (("linear", "Triangulated"), ("plane", "Plane fit")):
+            ttk.Radiobutton(
+                surface_row,
+                text=label,
+                value=value,
+                variable=self.focus_method_var,
+                command=self._input_changed,
+            ).pack(side="left", padx=(6, 0))
+        for text, variable in (
+            ("Close shutter during moves", self.shutter_per_frame_var),
+            ("Consistent stage approach (backlash)", self.consistent_approach_var),
+            ("Flat-field profile after each cycle", self.flat_field_var),
+        ):
+            ttk.Checkbutton(
+                options, text=text, variable=variable, command=self._input_changed
+            ).pack(anchor="w")
+        save = self._section(parent, "5  Save")
         self._labeled_entry(save, "Project", self.project_var)
         self._labeled_entry(save, "Sample", self.sample_var)
         folder = ttk.Frame(save, style="Panel.TFrame")
@@ -397,19 +456,23 @@ class ScanConsole(tk.Tk):
         selection_bar = ttk.Frame(parent, style="Panel.TFrame")
         selection_bar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(selection_bar, text="Draw:", style="Muted.TLabel").pack(side="left", padx=(0, 4))
+        self.draw_shape_buttons: list[ttk.Radiobutton] = []
         for value, label in (
             ("rectangle", "Rectangle"),
             ("polygon", "Irregular polygon"),
             ("focus", "Focus points"),
             ("move_set", "Move ROI set"),
         ):
-            ttk.Radiobutton(
+            button = ttk.Radiobutton(
                 selection_bar,
                 text=label,
                 value=value,
                 variable=self.interaction_mode_var,
                 command=self._interaction_mode_changed,
-            ).pack(side="left", padx=(0, 6))
+            )
+            button.pack(side="left", padx=(0, 6))
+            if value in ("rectangle", "polygon"):
+                self.draw_shape_buttons.append(button)
         self.preview_button = ttk.Button(
             selection_bar,
             text="Spiral preview",
@@ -438,12 +501,20 @@ class ScanConsole(tk.Tk):
             side="left", padx=10
         )
         ttk.Button(focus_bar, text="Delete", width=6, command=self._delete_selected_focus).pack(side="right")
-        ttk.Button(
+        self.update_z_button = ttk.Button(
             focus_bar,
             text="Update Z",
-            width=8,
+            width=9,
             command=self._update_selected_focus_z,
-        ).pack(side="right", padx=5)
+        )
+        self.update_z_button.pack(side="right", padx=5)
+        self.refocus_button = ttk.Button(
+            focus_bar,
+            text="Refocus all",
+            width=10,
+            command=self._toggle_refocus,
+        )
+        self.refocus_button.pack(side="right", padx=(0, 5))
         ttk.Button(
             focus_bar,
             text="Capture XYZ",
@@ -487,14 +558,26 @@ class ScanConsole(tk.Tk):
 
         region_bar = ttk.Frame(parent, style="Panel.TFrame")
         region_bar.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-        ttk.Label(region_bar, textvariable=self.region_var, style="Panel.TLabel").pack(side="left")
-        ttk.Button(region_bar, text="Clear all", command=self._clear_regions).pack(side="right")
+        info_row = ttk.Frame(region_bar, style="Panel.TFrame")
+        info_row.pack(side="top", fill="x", pady=(0, 4))
+        ttk.Label(info_row, textvariable=self.region_var, style="Panel.TLabel").pack(side="left")
+        ttk.Label(info_row, textvariable=self.offset_var, style="Muted.TLabel").pack(
+            side="right"
+        )
+        self.clear_button = ttk.Button(region_bar, text="Clear all", command=self._clear_regions)
+        self.clear_button.pack(side="right")
         ttk.Button(region_bar, text="Save ROI set…", command=self._save_roi_set).pack(
             side="right", padx=5
         )
-        ttk.Button(region_bar, text="Load ROI set…", command=self._load_roi_set).pack(
-            side="right"
+        self.load_roi_button = ttk.Button(
+            region_bar, text="Load ROI set…", command=self._load_roi_set
         )
+        self.load_roi_button.pack(side="right")
+        ttk.Button(
+            region_bar,
+            text="Align selected F → stage",
+            command=self._align_selected_focus_to_stage,
+        ).pack(side="left")
 
     def _build_review_panel(self, parent: ttk.Frame) -> None:
         ttk.Label(
@@ -508,7 +591,31 @@ class ScanConsole(tk.Tk):
             text="The plan is checked before any hardware moves.",
             style="Muted.TLabel",
             wraplength=265,
-        ).pack(anchor="w", pady=(2, 18))
+        ).pack(anchor="w", pady=(2, 6))
+
+        experiment = ttk.LabelFrame(parent, text="Experiment", style="Section.TLabelframe", padding=8)
+        experiment.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            experiment,
+            textvariable=self.experiment_var,
+            style="Panel.TLabel",
+            wraplength=250,
+            justify="left",
+        ).pack(anchor="w")
+        experiment_buttons = ttk.Frame(experiment, style="Panel.TFrame")
+        experiment_buttons.pack(fill="x", pady=(6, 0))
+        self.new_experiment_button = ttk.Button(
+            experiment_buttons, text="New", width=6, command=self._new_experiment
+        )
+        self.new_experiment_button.pack(side="left")
+        self.open_experiment_button = ttk.Button(
+            experiment_buttons, text="Open…", width=7, command=self._open_experiment
+        )
+        self.open_experiment_button.pack(side="left", padx=4)
+        self.resume_button = ttk.Button(
+            experiment_buttons, text="Resume cycle", command=self._resume_cycle
+        )
+        self.resume_button.pack(side="left")
 
         summary = tk.Frame(parent, bg="#f3f7f8", padx=12, pady=12)
         summary.pack(fill="x")
@@ -523,7 +630,7 @@ class ScanConsole(tk.Tk):
             font=("TkDefaultFont", 11),
         ).pack(fill="x")
 
-        ttk.Separator(parent).pack(fill="x", pady=18)
+        ttk.Separator(parent).pack(fill="x", pady=10)
         ttk.Label(parent, text="Preflight", style="Panel.TLabel", font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
         self.safety_label = tk.Label(
             parent,
@@ -543,10 +650,16 @@ class ScanConsole(tk.Tk):
             style="Status.Horizontal.TProgressbar",
         )
         self.progress.pack(fill="x", pady=(4, 5))
-        ttk.Label(parent, textvariable=self.progress_text_var, style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(
+            parent,
+            textvariable=self.progress_text_var,
+            style="Muted.TLabel",
+            wraplength=275,
+            justify="left",
+        ).pack(anchor="w", fill="x")
 
         display_frame = ttk.Frame(parent, style="Panel.TFrame")
-        display_frame.pack(fill="x", pady=(16, 0))
+        display_frame.pack(fill="x", pady=(10, 0))
         ttk.Label(
             display_frame,
             text="Scan mosaic display",
@@ -561,39 +674,37 @@ class ScanConsole(tk.Tk):
         )
         self.mosaic_view_box.pack(fill="x", pady=(5, 0))
         self.mosaic_view_box.bind("<<ComboboxSelected>>", self._mosaic_view_changed)
-        ttk.Label(
-            display_frame,
-            text="Switch channels while acquisition continues.",
-            style="Muted.TLabel",
-            wraplength=265,
-        ).pack(anchor="w", pady=(4, 0))
 
         spacer = ttk.Frame(parent, style="Panel.TFrame")
         spacer.pack(fill="both", expand=True)
+        run_controls = ttk.Frame(parent, style="Panel.TFrame")
+        run_controls.pack(fill="x", pady=(12, 0))
+        self.pause_button = ttk.Button(
+            run_controls, text="Pause", command=self._toggle_pause, state="disabled"
+        )
+        self.pause_button.pack(side="left", fill="x", expand=True)
+        self.abort_button = ttk.Button(
+            run_controls, text="Abort", command=self._abort_scan_clicked, state="disabled"
+        )
+        self.abort_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self.scan_button = ttk.Button(
             parent,
-            text="Review and start scan",
+            text="Review and start cycle 1",
             style="Primary.TButton",
             command=self._start_scan,
         )
-        self.scan_button.pack(fill="x", pady=(12, 0))
-        ttk.Label(
-            parent,
-            text=(
-                f"Bounded {self.config_data.writer_queue_frames}-frame camera → SSD "
-                "buffer; pauses safely only when full."
-            ),
-            style="Muted.TLabel",
-            wraplength=265,
-            justify="center",
-        ).pack(pady=(8, 0))
+        self.scan_button.pack(fill="x", pady=(8, 0))
 
     def _build_footer(self) -> None:
         footer = tk.Frame(self, bg="#dce7e9", height=30)
         footer.grid(row=2, column=0, sticky="ew")
         tk.Label(
             footer,
-            text="SIMULATION MODE — no microscope hardware commands are sent",
+            text=(
+                "SIMULATION MODE — no microscope hardware commands are sent"
+                if self.backend.simulated
+                else f"HARDWARE MODE — {self.backend.name} is controlling the microscope"
+            ),
             bg="#dce7e9",
             fg="#536a73",
             font=("TkDefaultFont", 9, "bold"),
@@ -638,7 +749,19 @@ class ScanConsole(tk.Tk):
             if not messagebox.askokcancel("Immersion change", prompt, parent=self):
                 self.objective_var.set(previous.name)
                 return
-        self.backend.change_objective(objective)
+        try:
+            self.backend.change_objective(objective)
+        except HardwareError as exc:
+            messagebox.showerror("Objective change failed", str(exc), parent=self)
+            self.objective_var.set(previous.name)
+            return
+        if not self.backend.simulated:
+            messagebox.showinfo(
+                "Refocus",
+                "Z was moved to the clearance height for the objective change.\n"
+                "Refocus in Live before capturing positions.",
+                parent=self,
+            )
         self._set_objective_detail(objective)
         self._reset_z_stack_capture()
         self.recipe_var.set("Custom")
@@ -649,16 +772,24 @@ class ScanConsole(tk.Tk):
         name = self.recipe_var.get()
         if name == "Custom":
             return
-        recipe = next(item for item in self.config_data.recipes if item["name"] == name)
-        objective = self.config_data.objective(recipe["objective_id"])
+        recipe = self.config_data.recipe(name)
+        if self.controller.experiment is not None and recipe.objective_id != self.controller.experiment.objective_id:
+            messagebox.showinfo(
+                "Objective is fixed",
+                "This experiment's objective is fixed; the recipe's objective was not applied.",
+                parent=self,
+            )
+            self.recipe_var.set("Custom")
+            return
+        objective = self.config_data.objective(recipe.objective_id)
         self.objective_var.set(objective.name)
         self._objective_changed()
         self.recipe_var.set(name)
-        selected = set(recipe["channels"])
+        selected = set(recipe.channels)
         for channel_id, variable in self.channel_vars.items():
             variable.set(channel_id in selected)
         self._sync_preview_channels()
-        self.z_mode_var.set(recipe.get("z_mode", "single"))
+        self.z_mode_var.set(recipe.z_mode)
         self._z_mode_changed()
         self._input_changed()
 
@@ -824,16 +955,30 @@ class ScanConsole(tk.Tk):
         self._render_scene()
 
     def _on_close(self) -> None:
+        if self.controller.busy and not messagebox.askyesno(
+            "Acquisition running",
+            "An acquisition is running. Stop it safely and close?\n\n"
+            "Finished tiles are kept and the cycle can be resumed later.",
+            parent=self,
+        ):
+            return
         if self.progress_job is not None:
             self.after_cancel(self.progress_job)
             self.progress_job = None
         self._stop_spiral_preview(clear_overlay=True)
-        if self.scan_writer is not None:
-            self.scan_writer.shutdown(drain=False)
-            self.scan_writer = None
-        if self.active_mosaic is not None:
-            self.active_mosaic.close()
+        self.controller.close()
         self.destroy()
+
+    def _safe_move(self, action, *args) -> bool:
+        """Run a stage command, reporting refused/failed moves instead of raising."""
+
+        try:
+            action(*args)
+        except HardwareError as exc:
+            self.progress_text_var.set(f"Move refused: {exc}")
+            self.bell()
+            return False
+        return True
 
     def _interaction_mode_changed(self) -> None:
         self.polygon_draft.clear()
@@ -855,10 +1000,16 @@ class ScanConsole(tk.Tk):
         self._render_scene()
 
     def _snap(self) -> None:
-        self.backend.snap()
+        try:
+            frame = self.backend.snap()
+        except HardwareError as exc:
+            self.progress_text_var.set(f"Snap failed: {exc}")
+            return
         self.live = False
         self.live_button.configure(text="○ Live")
-        self.progress_text_var.set(f"Snapshot {self.backend.snap_count} captured in memory")
+        self.progress_text_var.set(
+            f"Snapshot {frame.shape[1]}×{frame.shape[0]} captured • max {int(frame.max())}"
+        )
         self._render_scene()
 
     def _overview(self) -> None:
@@ -873,7 +1024,8 @@ class ScanConsole(tk.Tk):
         objective = self._selected_objective()
         step = self.config_data.camera_width_px * objective.pixel_size_um * 0.65
         position = self.backend.position
-        self.backend.move_xy(position.x_um + dx * step, position.y_um + dy * step)
+        if not self._safe_move(self.backend.move_xy, position.x_um + dx * step, position.y_um + dy * step):
+            return
         self.overview_mode = False
         self.preview_view = None
         self.view_center_override = None
@@ -927,6 +1079,11 @@ class ScanConsole(tk.Tk):
 
     def _start_region(self, event) -> None:
         mode = self.interaction_mode_var.get()
+        if mode in ("rectangle", "polygon", "move_set", "focus") and self.controller.busy:
+            return
+        if mode in ("rectangle", "polygon") and self._rois_locked():
+            self.progress_text_var.set("ROIs are fixed for this experiment — use Move ROI set")
+            return
         if mode == "polygon":
             point = self._canvas_to_stage(event.x, event.y)
             if not self.polygon_draft or math.dist(point, self.polygon_draft[-1]) > 1:
@@ -939,17 +1096,18 @@ class ScanConsole(tk.Tk):
             if selected is not None:
                 self.selected_focus_index = selected
                 point = self.focus_points[selected]
-                self.backend.move_xy(point.x_um, point.y_um)
-                self.backend.move_z(point.z_um)
-                self.progress_text_var.set(
-                    f"Focus point F{selected + 1} loaded at Z {point.z_um:g} µm"
-                )
+                if self._safe_move(self.backend.move_xy, point.x_um, point.y_um) and self._safe_move(
+                    self.backend.move_z, point.z_um
+                ):
+                    self.progress_text_var.set(
+                        f"Focus point F{selected + 1} loaded at Z {point.z_um:g} µm"
+                    )
             else:
                 self.selected_focus_index = None
-                self.backend.move_xy(x_um, y_um)
-                self.progress_text_var.set(
-                    "Position loaded — focus live, then press Capture focus here"
-                )
+                if self._safe_move(self.backend.move_xy, x_um, y_um):
+                    self.progress_text_var.set(
+                        "Position loaded — focus live, then press Capture XYZ"
+                    )
             self.overview_mode = False
             self.preview_view = None
             self.view_center_override = None
@@ -1047,7 +1205,8 @@ class ScanConsole(tk.Tk):
 
     def _jog_z(self, delta_um: float) -> None:
         position = self.backend.position
-        self.backend.move_z(position.z_um + delta_um)
+        if not self._safe_move(self.backend.move_z, position.z_um + delta_um):
+            return
         self.live = True
         self.live_button.configure(text="● Live")
         self._update_position_label()
@@ -1085,6 +1244,14 @@ class ScanConsole(tk.Tk):
         current = self.backend.position
         self.focus_points[index] = FocusPoint(previous.x_um, previous.y_um, current.z_um)
         self.progress_text_var.set(f"Updated F{index + 1} to Z {current.z_um:g} µm")
+        if self.refocus_index is not None:
+            if index + 1 < len(self.focus_points):
+                self._refocus_goto(index + 1)
+            else:
+                self._stop_refocus()
+                self.progress_text_var.set(
+                    f"All {len(self.focus_points)} focus points refocused for this cycle"
+                )
         self._update_focus_status()
         self._render_scene()
         self._input_changed()
@@ -1092,6 +1259,7 @@ class ScanConsole(tk.Tk):
     def _delete_selected_focus(self) -> None:
         if self.selected_focus_index is None:
             return
+        self._stop_refocus()
         deleted = self.selected_focus_index + 1
         del self.focus_points[self.selected_focus_index]
         self.selected_focus_index = None
@@ -1151,7 +1319,8 @@ class ScanConsole(tk.Tk):
 
     def _move_stage_to_click(self, event) -> None:
         x_um, y_um = self._canvas_to_stage(event.x, event.y)
-        self.backend.move_xy(x_um, y_um)
+        if not self._safe_move(self.backend.move_xy, x_um, y_um):
+            return
         self.overview_mode = False
         self.preview_view = None
         self.view_zoom = 1.0
@@ -1161,6 +1330,9 @@ class ScanConsole(tk.Tk):
         self._render_scene()
 
     def _clear_regions(self) -> None:
+        if self._rois_locked() or self.controller.busy:
+            return
+        self._stop_refocus()
         self._stop_spiral_preview(clear_overlay=True)
         self.regions.clear()
         self.focus_points.clear()
@@ -1196,6 +1368,8 @@ class ScanConsole(tk.Tk):
         self.progress_text_var.set(f"ROI set saved • {path}")
 
     def _load_roi_set(self) -> None:
+        if self._rois_locked() or self.controller.busy:
+            return
         path = filedialog.askopenfilename(
             parent=self,
             title="Load ROI and focus-point set",
@@ -1301,7 +1475,7 @@ class ScanConsole(tk.Tk):
         if self.preview_index >= len(self.preview_positions):
             self.preview_job = None
             self.preview_button.configure(text="Spiral preview")
-            self.status_var.set("SIMULATOR CONNECTED")
+            self.status_var.set(self.idle_status)
             self.progress_text_var.set(
                 f"Spiral preview complete • {len(self.preview_completed)} tiles • no Z movement"
             )
@@ -1309,7 +1483,10 @@ class ScanConsole(tk.Tk):
             return
 
         position = self.preview_positions[self.preview_index]
-        self.backend.move_xy(*position)
+        if not self._safe_move(self.backend.move_xy, *position):
+            self._stop_spiral_preview(clear_overlay=False)
+            self._render_scene()
+            return
         self.preview_completed.append(position)
         self.preview_index += 1
         self._update_position_label()
@@ -1329,7 +1506,7 @@ class ScanConsole(tk.Tk):
             self.preview_job = None
         self.preview_button.configure(text="Spiral preview")
         if self.status_var.get() == "SPIRAL PREVIEW RUNNING":
-            self.status_var.set("SIMULATOR CONNECTED")
+            self.status_var.set(self.idle_status)
         if clear_overlay:
             self.preview_positions = []
             self.preview_completed = []
@@ -1347,7 +1524,9 @@ class ScanConsole(tk.Tk):
         rng = random.Random(rng_seed)
 
         mosaic_rendered = False
-        if self.active_mosaic is not None and not self.active_mosaic.closed:
+        mosaic = self.controller.mosaic
+        engine_status = self.controller.status()
+        if mosaic is not None and not mosaic.closed:
             center_x, center_y, view_width, view_height = self._view_geometry()
             view_bounds = MosaicBounds(
                 center_x - view_width / 2,
@@ -1355,7 +1534,7 @@ class ScanConsole(tk.Tk):
                 center_y - view_height / 2,
                 center_y + view_height / 2,
             )
-            ppm = self.active_mosaic.render_viewport_ppm(
+            ppm = mosaic.render_viewport_ppm(
                 view_bounds,
                 width,
                 height,
@@ -1412,7 +1591,7 @@ class ScanConsole(tk.Tk):
                 *flat_points,
                 outline="#69f0d0",
                 width=3,
-                fill="" if self.active_mosaic is not None else "#0a6d73",
+                fill="" if mosaic is not None else "#0a6d73",
                 stipple="gray12",
                 tags="scene",
             )
@@ -1519,11 +1698,12 @@ class ScanConsole(tk.Tk):
                         font=("TkDefaultFont", 9, "bold"),
                         tags="scene",
                     )
-        if self.active_tile_center is not None and self.active_mosaic is not None:
+        current_tile = engine_status.current_tile if engine_status else None
+        if current_tile is not None and mosaic is not None:
             objective = self._selected_objective()
             tile_width = self.config_data.camera_width_px * objective.pixel_size_um
             tile_height = self.config_data.camera_height_px * objective.pixel_size_um
-            tile_x, tile_y = self.active_tile_center
+            tile_x, tile_y = current_tile.x_um, current_tile.y_um
             x0, y0 = self._stage_to_canvas(
                 tile_x - tile_width / 2,
                 tile_y - tile_height / 2,
@@ -1546,15 +1726,12 @@ class ScanConsole(tk.Tk):
         px, py = self._stage_to_canvas(position.x_um, position.y_um)
         self.viewer.create_line(px - 10, py, px + 10, py, fill="#ffffff", width=1, tags="scene")
         self.viewer.create_line(px, py - 10, px, py + 10, fill="#ffffff", width=1, tags="scene")
-        if self.active_mosaic is not None:
-            acquired = min(self.scan_tile_index, len(self.scan_tile_positions))
-            total = len(self.scan_tile_positions)
-            projection = self.current_frame_label or (
-                "MIP" if self.active_plan and self.active_plan.z.plane_count > 1 else "PLANE"
-            )
+        if mosaic is not None and engine_status is not None:
+            cycle = self.controller.active_cycle or 0
             mode = (
-                f"DISK MOSAIC • {self.mosaic_view_var.get()} • {projection} • "
-                f"{acquired}/{total} TILES • {self.view_zoom * 100:.0f}%"
+                f"CYCLE {cycle} MOSAIC • {self.mosaic_view_var.get()} • MIP • "
+                f"{engine_status.tiles_done}/{engine_status.tiles_total} TILES • "
+                f"{self.view_zoom * 100:.0f}%"
             )
         elif self.preview_job is not None or self.preview_completed:
             channel_name = (
@@ -1582,6 +1759,7 @@ class ScanConsole(tk.Tk):
         except (ValueError, tk.TclError):
             return default
 
+    # -- plan ------------------------------------------------------------------
     def _build_plan(self) -> AcquisitionPlan:
         objective = self._selected_objective()
         channels = []
@@ -1591,7 +1769,7 @@ class ScanConsole(tk.Tk):
                     ChannelSetting(
                         channel_id=channel.id,
                         exposure_ms=self._float_or(self.exposure_vars[channel.id], -1),
-                        power_percent=channel.default_power_percent,
+                        power_percent=self._float_or(self.power_vars[channel.id], -1),
                     )
                 )
         z = ZSettings(
@@ -1602,6 +1780,13 @@ class ScanConsole(tk.Tk):
             begin_captured=self.z_begin_captured,
             end_captured=self.z_end_captured,
         )
+        options = AcquisitionOptions(
+            tile_order=self.tile_order_var.get(),
+            consistent_approach=self.consistent_approach_var.get(),
+            shutter_per_frame=self.shutter_per_frame_var.get(),
+            flat_field=self.flat_field_var.get(),
+            focus_method=self.focus_method_var.get(),
+        )
         return AcquisitionPlan(
             project=self.project_var.get().strip(),
             sample=self.sample_var.get().strip(),
@@ -1611,30 +1796,56 @@ class ScanConsole(tk.Tk):
             regions=tuple(self.regions),
             z=z,
             focus_points=tuple(self.focus_points),
-            overlap_x_percent=self.overlap_x_var.get(),
-            overlap_y_percent=self.overlap_y_var.get(),
+            overlap_x_percent=self._float_or(self.overlap_x_var, -1),
+            overlap_y_percent=self._float_or(self.overlap_y_var, -1),
+            options=options,
         )
 
     def _input_changed(self, _event=None) -> None:
+        self._update_offset_label()
+        self._apply_locks()
+        if self.controller.busy:
+            return
         try:
             plan = self._build_plan()
-            estimate = estimate_acquisition(self.config_data, plan)
-        except (ValueError, KeyError):
+            tiles, estimate = self.controller.estimate(plan)
+        except (ValueError, KeyError) as exc:
+            self.summary_var.set(str(exc))
+            self.safety_var.set("● " + str(exc))
+            self.safety_label.configure(fg=WARNING)
             return
         channel_names = [self.config_data.channel(item.channel_id).name for item in plan.channels]
+        experiment = self.controller.experiment
+        cycle_text = (
+            f"Cycle {experiment.next_cycle_number} of experiment"
+            if experiment is not None
+            else "Cycle 1 (new experiment)"
+        )
         if plan.regions:
             self.region_var.set(
                 f"{len(plan.regions)} region{'s' if len(plan.regions) != 1 else ''} • "
                 f"{len(plan.focus_points)} focus point{'s' if len(plan.focus_points) != 1 else ''} • "
                 f"{estimate.tiles:,} tiles"
             )
+            surface_text = ""
+            if plan.z.mode == "focus_map" and len(plan.focus_points) >= 3:
+                try:
+                    from .focus import FocusSurface
+
+                    low, high = FocusSurface(plan.focus_points, plan.options.focus_method).z_range(
+                        tile.xy for tile in tiles
+                    )
+                    surface_text = f"\nSurface Z {low:.1f} … {high:.1f} µm"
+                except ValueError:
+                    surface_text = ""
             self.summary_var.set(
+                f"{cycle_text}\n"
                 f"{self.config_data.objective(plan.objective_id).name}\n"
                 f"{', '.join(channel_names) or 'No channels'}\n\n"
-                f"{len(plan.regions)} regions  •  {estimate.tiles:,} tiles\n"
-                f"Overlap X {plan.overlap_x_percent:.0f}%  •  Y {plan.overlap_y_percent:.0f}%\n"
-                f"{len(plan.focus_points)} focus points\n"
-                f"{estimate.frames:,} frames  •  {estimate.z_planes} Z planes\n"
+                f"{estimate.tiles:,} tiles • {plan.options.tile_order}\n"
+                f"Overlap X {plan.overlap_x_percent:.0f}%  •  Y {plan.overlap_y_percent:.0f}% (exact)\n"
+                f"{estimate.frames:,} frames  •  {estimate.z_planes} Z plane"
+                f"{'s' if estimate.z_planes != 1 else ''}{surface_text}\n"
                 f"About {estimate.duration_label}  •  {estimate.data_label}"
             )
         else:
@@ -1643,7 +1854,7 @@ class ScanConsole(tk.Tk):
                 f"{'s' if len(plan.focus_points) != 1 else ''}"
             )
             self.summary_var.set("Draw a region on the overview to calculate the scan.")
-        problems = validate_plan(self.config_data, plan)
+        problems = self.controller.preflight(plan)
         if problems:
             self.safety_var.set("● " + "\n● ".join(problems[:4]))
             self.safety_label.configure(fg=WARNING)
@@ -1651,10 +1862,183 @@ class ScanConsole(tk.Tk):
             self.safety_var.set("✓ Plan passes configured safety checks")
             self.safety_label.configure(fg=SUCCESS)
 
+    # -- locks -----------------------------------------------------------------
+    def _rois_locked(self) -> bool:
+        return self.controller.experiment is not None
+
+    def _apply_locks(self) -> None:
+        if not hasattr(self, "scan_button"):
+            return
+        busy = self.controller.busy
+        locked = self._rois_locked()
+        lock_state = "disabled" if locked or busy else "normal"
+        for widget in self.objective_lock_widgets:
+            try:
+                if isinstance(widget, ttk.Combobox):
+                    widget.configure(state="disabled" if locked or busy else "readonly")
+                else:
+                    widget.configure(state=lock_state)
+            except tk.TclError:
+                pass
+        for button in self.draw_shape_buttons:
+            button.configure(state=lock_state)
+        if (locked or busy) and self.interaction_mode_var.get() in ("rectangle", "polygon"):
+            self.interaction_mode_var.set("move_set")
+            self._interaction_mode_changed()
+        self.clear_button.configure(state=lock_state)
+        self.load_roi_button.configure(state=lock_state)
+        idle = "disabled" if busy else "normal"
+        self.scan_button.configure(state=idle)
+        self.new_experiment_button.configure(state=idle)
+        self.open_experiment_button.configure(state=idle)
+        resumable = (not busy) and self.controller.resume_info() is not None
+        self.resume_button.configure(state="normal" if resumable else "disabled")
+        self.pause_button.configure(state="normal" if busy else "disabled")
+        self.abort_button.configure(state="normal" if busy else "disabled")
+        experiment = self.controller.experiment
+        next_cycle = experiment.next_cycle_number if experiment else 1
+        self.scan_button.configure(text=f"Review and start cycle {next_cycle}")
+        self._update_experiment_label()
+
+    def _update_experiment_label(self) -> None:
+        experiment = self.controller.experiment
+        if experiment is None:
+            self.experiment_var.set("No experiment — the first cycle creates one")
+            return
+        done = sum(1 for cycle in experiment.cycles if cycle.status == "complete")
+        lines = [
+            f"{experiment.project} / {experiment.sample}",
+            f"{len(experiment.tiles):,} tiles • {done} cycle{'s' if done != 1 else ''} complete",
+        ]
+        info = self.controller.resume_info()
+        if info is not None and not self.controller.busy:
+            record, finished, total = info
+            lines.append(f"Cycle {record.number} {record.status}: {finished}/{total} tiles saved")
+        self.experiment_var.set("\n".join(lines))
+
+    def _update_offset_label(self) -> None:
+        experiment = self.controller.experiment
+        if experiment is None:
+            self.offset_var.set("")
+            return
+        try:
+            dx, dy = experiment.offset_of(tuple(self.regions))
+        except ValueError:
+            self.offset_var.set("ROI set differs from the experiment")
+            return
+        self.offset_var.set(f"Offset vs cycle 1: ΔX {dx:+.1f} ΔY {dy:+.1f} µm")
+
+    # -- experiment actions ----------------------------------------------------
+    def _new_experiment(self) -> None:
+        if self.controller.experiment is not None and not messagebox.askyesno(
+            "New experiment",
+            "Close the current experiment? Its data stays on disk and can be reopened.\n\n"
+            "The next scan will create a new experiment with a new tile grid.",
+            parent=self,
+        ):
+            return
+        try:
+            self.controller.new_experiment()
+        except ControllerError as exc:
+            messagebox.showerror("Cannot start a new experiment", str(exc), parent=self)
+            return
+        self.progress_text_var.set("New experiment — ROIs and objective can be edited")
+        self._render_scene()
+        self._input_changed()
+
+    def _open_experiment(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Open experiment",
+            initialdir=self.output_var.get(),
+            filetypes=(("Experiment", "experiment.json"), ("JSON", "*.json")),
+        )
+        if not path:
+            return
+        try:
+            experiment = self.controller.open_experiment(path)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError, ControllerError) as exc:
+            messagebox.showerror("Could not open experiment", str(exc), parent=self)
+            return
+        self._load_experiment_into_view(experiment)
+        info = self.controller.resume_info()
+        if info is not None:
+            record, finished, total = info
+            if messagebox.askyesno(
+                "Resume unfinished cycle?",
+                f"Cycle {record.number} stopped ({record.status}) with {finished} of {total} "
+                "tiles saved.\n\nResume it now with its original settings?",
+                parent=self,
+            ):
+                self._resume_cycle(confirm=False)
+
+    def _load_experiment_into_view(self, experiment: Experiment) -> None:
+        objective = self.config_data.objective(experiment.objective_id)
+        last = experiment.cycles[-1] if experiment.cycles else None
+        dx = last.offset_x_um if last else 0.0
+        dy = last.offset_y_um if last else 0.0
+        self.regions = list(experiment.regions_with_offset(dx, dy))
+        self.focus_points = list(last.focus_points if last else experiment.base_focus_points)
+        self.selected_focus_index = None
+        self.project_var.set(experiment.project)
+        self.sample_var.set(experiment.sample)
+        self.output_var.set(str(experiment.root.parent.parent))
+        self.overlap_x_var.set(experiment.overlap_x_percent)
+        self.overlap_y_var.set(experiment.overlap_y_percent)
+        self.tile_order_var.set(experiment.options.tile_order)
+        if last is not None:
+            selected = {item.channel_id: item for item in last.channels}
+            for channel in self.config_data.channels:
+                self.channel_vars[channel.id].set(channel.id in selected)
+                if channel.id in selected:
+                    self.exposure_vars[channel.id].set(selected[channel.id].exposure_ms)
+                    self.power_vars[channel.id].set(selected[channel.id].power_percent)
+            self.z_mode_var.set(last.z.mode)
+            options = last.options or experiment.options
+            self.focus_method_var.set(options.focus_method)
+            self.shutter_per_frame_var.set(options.shutter_per_frame)
+            self.consistent_approach_var.set(options.consistent_approach)
+            self.flat_field_var.set(options.flat_field)
+        self.objective_var.set(objective.name)
+        if self.backend.current_objective_id != objective.id:
+            self._objective_changed()
+        self._sync_preview_channels()
+        self._z_mode_changed()
+        self.overview_mode = True
+        self.preview_view = None
+        self.progress_text_var.set(f"Experiment opened • {experiment.root}")
+        self._render_scene()
+        self._input_changed()
+
+    def _resume_cycle(self, confirm: bool = True) -> None:
+        info = self.controller.resume_info()
+        if info is None:
+            return
+        record, finished, total = info
+        if confirm and not messagebox.askokcancel(
+            "Resume cycle",
+            f"Resume cycle {record.number} at the first unsaved tile "
+            f"({finished} of {total} already saved)?\n\n"
+            "The original channels, exposures, powers and focus positions are reused.",
+            parent=self,
+        ):
+            return
+        try:
+            self.controller.resume_cycle()
+        except (ControllerError, HardwareError, OSError, ValueError) as exc:
+            messagebox.showerror("Could not resume", str(exc), parent=self)
+            return
+        self._after_launch()
+
+    # -- scanning --------------------------------------------------------------
     def _start_scan(self) -> None:
         self._stop_spiral_preview(clear_overlay=True)
-        plan = self._build_plan()
-        problems = validate_plan(self.config_data, plan)
+        self._stop_refocus()
+        try:
+            plan = self._build_plan()
+            problems = self.controller.preflight(plan)
+        except (ValueError, KeyError) as exc:
+            problems = [str(exc)]
         if problems:
             messagebox.showwarning(
                 "Preflight needs attention",
@@ -1662,7 +2046,7 @@ class ScanConsole(tk.Tk):
                 parent=self,
             )
             return
-        estimate = estimate_acquisition(self.config_data, plan)
+        tiles, estimate = self.controller.estimate(plan)
         prompts = [
             self.config_data.channel(setting.channel_id).manual_prompt
             for setting in plan.channels
@@ -1671,73 +2055,33 @@ class ScanConsole(tk.Tk):
         prompt_text = ""
         if prompts:
             prompt_text = "\n\nManual checks:\n• " + "\n• ".join(prompts)
+        experiment = self.controller.experiment
+        cycle_number = experiment.next_cycle_number if experiment else 1
+        offset_text = ""
+        if experiment is not None:
+            dx, dy = experiment.offset_of(plan.regions)
+            offset_text = f"\nROI offset vs cycle 1: ΔX {dx:+.1f}  ΔY {dy:+.1f} µm"
+        mode = "simulated scan" if self.backend.simulated else "scan on the microscope"
         confirmation = (
+            f"Cycle {cycle_number}{' (new experiment)' if experiment is None else ''}\n"
             f"Objective: {self.config_data.objective(plan.objective_id).name}\n"
-            f"Regions: {len(plan.regions)}  |  Tiles: {estimate.tiles:,}\n"
-            f"Frames: {estimate.frames:,}  |  Estimated data: {estimate.data_label}\n"
-            f"Estimated real acquisition time: {estimate.duration_label}"
-            f"{prompt_text}\n\nStart the simulated scan?"
+            f"Tiles: {estimate.tiles:,} ({plan.options.tile_order})  |  Frames: {estimate.frames:,}\n"
+            f"Estimated data: {estimate.data_label}  |  Time: {estimate.duration_label}"
+            f"{offset_text}{prompt_text}\n\nStart the {mode}?"
         )
         if not messagebox.askokcancel("Ready to scan", confirmation, parent=self):
             return
-
-        objective = self.config_data.objective(plan.objective_id)
-        fov_width_um = self.config_data.camera_width_px * objective.pixel_size_um
-        fov_height_um = self.config_data.camera_height_px * objective.pixel_size_um
-        tile_positions = tile_positions_for_regions(
-            self.config_data,
-            plan.objective_id,
-            plan.regions,
-            plan.overlap_x_percent,
-            plan.overlap_y_percent,
-        )
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        scan_folder = (
-            plan.output_root
-            / self._slug(plan.project)
-            / f"{self._slug(plan.sample)}_{timestamp}"
-        )
-        channels = tuple(
-            self.config_data.channel(setting.channel_id) for setting in plan.channels
-        )
         try:
-            scan_folder.mkdir(parents=True, exist_ok=False)
-            if self.scan_writer is not None:
-                if not self.scan_writer.shutdown(drain=False):
-                    raise RuntimeError("The previous SSD writer did not stop safely")
-                self.scan_writer = None
-            if self.active_mosaic is not None:
-                self.active_mosaic.close()
-            mosaic_bounds = mosaic_bounds_for_regions(
-                plan.regions,
-                fov_width_um,
-                fov_height_um,
-            )
-            mosaic = DiskBackedMosaic(scan_folder, mosaic_bounds, channels)
-            writer = BoundedAsyncWriter(
-                mosaic,
-                queue_capacity=self.config_data.writer_queue_frames,
-            )
-        except (OSError, RuntimeError, ValueError) as exc:
-            messagebox.showerror("Could not prepare scan storage", str(exc), parent=self)
+            self.controller.start_cycle(plan)
+        except (ControllerError, HardwareError, OSError, ValueError) as exc:
+            messagebox.showerror("Could not start the cycle", str(exc), parent=self)
+            self._input_changed()
             return
+        self._after_launch()
 
-        self.active_plan = plan
-        self.active_estimate = estimate
-        self.active_scan_folder = scan_folder
-        self.active_mosaic = mosaic
-        self.scan_writer = writer
-        self.scan_tile_positions = tile_positions
-        self.scan_capture_tile_index = 0
-        self.scan_tile_index = 0
-        self.scan_channel_index = 0
-        self.scan_z_index = 0
-        self.scan_frame_index = 0
-        self.scan_written_frames = 0
-        self.scan_tile_started = False
-        self.current_frame_label = ""
-        self.active_tile_center = None
-        self.mosaic_photo = None
+    def _after_launch(self) -> None:
+        mosaic = self.controller.mosaic
+        assert mosaic is not None
         self.mosaic_view_box.configure(values=mosaic.display_modes)
         self.mosaic_view_var.set(DiskBackedMosaic.COMPOSITE)
         self.preview_view = (
@@ -1750,251 +2094,172 @@ class ScanConsole(tk.Tk):
         self.view_center_override = None
         self.overview_mode = True
         self.last_mosaic_render_time = 0.0
-        self._write_scan_manifest("running")
-        self.scan_button.configure(state="disabled")
         self.progress["value"] = 0
-        self.scan_started_at = time.monotonic()
-        self.scan_simulated_seconds = min(14.0, max(4.0, 3.5 + math.log10(max(1, estimate.frames)) * 2.0))
-        self.status_var.set("SIMULATED ACQUISITION RUNNING")
-        self.progress_text_var.set("Starting acquisition…")
-        self._tick_scan()
-
-    def _tick_scan(self) -> None:
-        assert self.active_plan is not None
-        assert self.active_estimate is not None
-        assert self.active_mosaic is not None
-        assert self.scan_writer is not None
-
-        previous_completed_tiles = self.scan_tile_index
-        writer_state = self.scan_writer.snapshot()
-        self.scan_tile_index = writer_state.completed_tiles
-        self.scan_written_frames = writer_state.written_frames
-        if writer_state.failure is not None:
-            self._abort_scan(f"SSD writer stopped: {writer_state.failure}")
-            return
-
-        total_tiles = len(self.scan_tile_positions)
-        all_frames_captured = self.scan_capture_tile_index >= total_tiles
-        backpressure = False
-        if not all_frames_captured:
-            tile_number = self.scan_capture_tile_index + 1
-            x_um, y_um = self.scan_tile_positions[self.scan_capture_tile_index]
-            objective = self.config_data.objective(self.active_plan.objective_id)
-            fov_width_um = self.config_data.camera_width_px * objective.pixel_size_um
-            fov_height_um = self.config_data.camera_height_px * objective.pixel_size_um
-            try:
-                if not self.scan_tile_started:
-                    self.backend.move_xy(x_um, y_um)
-                    self.scan_tile_started = True
-                    self.active_tile_center = (x_um, y_um)
-
-                if self.scan_writer.can_accept():
-                    channel_setting = self.active_plan.channels[self.scan_channel_index]
-                    channel = self.config_data.channel(channel_setting.channel_id)
-                    z_index = self.scan_z_index
-                    last_z = z_index + 1 >= self.active_plan.z.plane_count
-                    last_channel = (
-                        self.scan_channel_index + 1 >= len(self.active_plan.channels)
-                    )
-                    is_last_plane = last_z and last_channel
-
-                    # This is the camera side of the pipeline. Once this immutable
-                    # frame exists, the UI hands ownership to the bounded SSD queue
-                    # and is free to acquire the next frame.
-                    self.backend.snap()
-                    payload = simulated_plane_payload(tile_number, channel.id, z_index)
-                    request = PlaneWriteRequest(
-                        tile_index=tile_number,
-                        x_um=x_um,
-                        y_um=y_um,
-                        fov_width_um=fov_width_um,
-                        fov_height_um=fov_height_um,
-                        z_planes=self.active_plan.z.plane_count,
-                        channel_id=channel.id,
-                        z_index=z_index,
-                        payload=payload,
-                        width=64,
-                        height=64,
-                        is_last_plane=is_last_plane,
-                    )
-                    if not self.scan_writer.try_submit(request):
-                        backpressure = True
-                    else:
-                        self.scan_frame_index += 1
-                        self.current_frame_label = (
-                            f"CAPTURED {channel.name} • Z {z_index + 1}/"
-                            f"{self.active_plan.z.plane_count}"
-                        )
-                        self.scan_z_index += 1
-                        if self.scan_z_index >= self.active_plan.z.plane_count:
-                            self.scan_z_index = 0
-                            self.scan_channel_index += 1
-                            if self.scan_channel_index >= len(self.active_plan.channels):
-                                self.scan_channel_index = 0
-                                self.scan_capture_tile_index += 1
-                                self.scan_tile_started = False
-                else:
-                    backpressure = True
-            except (OSError, RuntimeError, KeyError, ValueError) as exc:
-                self._abort_scan(f"Tile {tile_number} could not be acquired: {exc}")
-                return
-
-        writer_state = self.scan_writer.snapshot()
-        self.scan_tile_index = writer_state.completed_tiles
-        self.scan_written_frames = writer_state.written_frames
-        if writer_state.failure is not None:
-            self._abort_scan(f"SSD writer stopped: {writer_state.failure}")
-            return
-
-        all_frames_captured = self.scan_capture_tile_index >= total_tiles
-        if (
-            all_frames_captured
-            and writer_state.idle
-            and writer_state.written_frames >= self.active_estimate.frames
-            and writer_state.completed_tiles >= total_tiles
-        ):
-            self._finish_scan()
-            return
-
-        fraction = self.scan_frame_index / self.active_estimate.frames
-        self.progress["value"] = fraction * 100
-        remaining = max(0, round(self.scan_simulated_seconds * (1.0 - fraction)))
-        tile_written = writer_state.completed_tiles > previous_completed_tiles
-        if all_frames_captured:
-            activity = "Camera complete — draining SSD buffer"
-        elif backpressure:
-            activity = "SSD buffer full — camera paused safely"
-        elif tile_written and self.active_plan.z.plane_count > 1:
-            activity = "MIP ready"
-        else:
-            activity = self.current_frame_label or "Acquiring"
-        display_tile = min(self.scan_capture_tile_index + 1, total_tiles)
-        self.progress_text_var.set(
-            f"Tile {display_tile:,} of {total_tiles:,} • {activity} • "
-            f"{self.scan_frame_index:,} acquired / {writer_state.written_frames:,} saved • "
-            f"SSD buffer {writer_state.queue_depth}/{writer_state.queue_capacity} • "
-            f"{remaining}s simulator time remaining"
+        self.status_var.set(
+            "SIMULATED ACQUISITION RUNNING" if self.backend.simulated else "ACQUISITION RUNNING"
         )
+        self.progress_text_var.set("Starting acquisition…")
+        self._apply_locks()
+        self._poll_scan()
+
+    def _poll_scan(self) -> None:
+        status = self.controller.status()
+        if status is None:
+            return
+        self.progress["value"] = status.fraction * 100
+        channel = (
+            self.config_data.channel(status.current_channel_id).name
+            if status.current_channel_id
+            else ""
+        )
+        parts = [
+            f"Cycle {self.controller.active_cycle}",
+            f"{status.tiles_done:,}/{status.tiles_total:,} tiles saved",
+        ]
+        if status.state in ("pausing", "paused", "aborting", "draining", "post-processing"):
+            parts.append(status.message)
+        elif status.current_tile is not None:
+            parts.append(
+                f"tile {status.current_tile.index + 1} • {channel} • Z {status.current_z_index + 1}/"
+                f"{status.current_z_planes}"
+            )
+        if status.backpressure:
+            parts.append("SSD buffer full — camera waiting safely")
+        acquired_since = status.tiles_done - status.tiles_skipped
+        if status.started_monotonic and acquired_since > 0 and not status.finished:
+            elapsed = time.monotonic() - status.started_monotonic
+            remaining_tiles = status.tiles_total - status.tiles_done
+            eta = elapsed / acquired_since * remaining_tiles
+            parts.append(f"~{int(eta // 60)}m {int(eta % 60)}s left")
+        self.progress_text_var.set(" • ".join(parts))
         self._update_position_label()
         now = time.monotonic()
-        if now - self.last_mosaic_render_time >= 0.15 or tile_written:
+        if now - self.last_mosaic_render_time >= 0.3 or status.finished:
             self._render_scene()
             self.last_mosaic_render_time = now
-        if backpressure or all_frames_captured:
-            delay_ms = 8
-        else:
-            delay_ms = int(
-                max(
-                    8,
-                    min(
-                        250,
-                        self.scan_simulated_seconds
-                        / max(1, self.active_estimate.frames)
-                        * 1000,
-                    ),
-                )
-            )
-        self.progress_job = self.after(delay_ms, self._tick_scan)
+        if status.finished:
+            self.progress_job = None
+            self._scan_finished_ui(status)
+            return
+        self.progress_job = self.after(150, self._poll_scan)
 
-    def _finish_scan(self) -> None:
-        assert self.active_plan is not None
-        assert self.active_estimate is not None
-        if self.scan_writer is not None:
-            writer_state = self.scan_writer.snapshot()
-            self.scan_tile_index = writer_state.completed_tiles
-            self.scan_written_frames = writer_state.written_frames
-            if not self.scan_writer.shutdown(drain=True):
-                self._abort_scan("The SSD writer did not stop after the buffer drained")
-                return
-            self.scan_writer = None
-        try:
-            manifest_path = self._write_scan_manifest("complete")
-        except OSError as exc:
-            messagebox.showerror("Could not save manifest", str(exc), parent=self)
-            self.progress_text_var.set("Scan finished, but the manifest could not be saved")
-        else:
-            self.progress_text_var.set(f"Simulation complete • {manifest_path}")
+    def _scan_finished_ui(self, status) -> None:
+        self.status_var.set(self.idle_status if status.state != "failed" else "ACQUISITION FAILED")
+        self.pause_button.configure(text="Pause")
+        experiment = self.controller.experiment
+        folder = (
+            experiment.cycle_folder(self.controller.active_cycle)
+            if experiment is not None and self.controller.active_cycle
+            else None
+        )
+        self._apply_locks()
+        self._input_changed()
+        if status.state == "complete":
+            self.progress_text_var.set(f"{status.message} • {folder}")
             messagebox.showinfo(
-                "Simulation complete",
-                f"The disk-backed acquisition completed.\n\n"
-                f"Tiles and mosaic preview:\n{self.active_scan_folder}\n\n"
-                f"Manifest:\n{manifest_path}",
+                "Cycle complete",
+                f"Cycle {self.controller.active_cycle} finished: {status.tiles_done:,} tiles.\n\n"
+                f"{status.message}\n\nData:\n{folder}\n\n"
+                "Strip/restain, then re-align the ROI set and refocus before the next cycle.",
                 parent=self,
             )
-        self.status_var.set("SIMULATOR CONNECTED")
-        self.scan_button.configure(state="normal")
-        self.progress_job = None
-        self.active_tile_center = None
-        self.current_frame_label = ""
+        elif status.state == "aborted":
+            self.progress_text_var.set(
+                f"Stopped • {status.tiles_done}/{status.tiles_total} tiles saved • resumable"
+            )
+        else:
+            self.progress_text_var.set(status.error or "Acquisition failed")
+            messagebox.showerror(
+                "Acquisition stopped",
+                f"{status.error}\n\n{status.tiles_done} of {status.tiles_total} tiles are saved. "
+                "Fix the problem, then press Resume cycle.",
+                parent=self,
+            )
+
+    def _toggle_pause(self) -> None:
+        status = self.controller.status()
+        if status is None:
+            return
+        if status.state in ("pausing", "paused"):
+            self.controller.resume()
+            self.pause_button.configure(text="Pause")
+        else:
+            self.controller.pause()
+            self.pause_button.configure(text="Continue")
+
+    def _abort_scan_clicked(self) -> None:
+        if not messagebox.askyesno(
+            "Abort acquisition",
+            "Stop after the current frame? The unfinished tile is discarded; every saved "
+            "tile is kept and the cycle can be resumed later.",
+            parent=self,
+        ):
+            return
+        self.controller.abort()
+
+    # -- refocus & alignment ---------------------------------------------------
+    def _toggle_refocus(self) -> None:
+        if self.refocus_index is not None:
+            self._stop_refocus()
+            self.progress_text_var.set("Refocus stopped")
+            return
+        if not self.focus_points:
+            messagebox.showinfo("No focus points", "Capture or load focus points first.", parent=self)
+            return
+        if self.controller.busy:
+            return
+        self.interaction_mode_var.set("focus")
+        self._interaction_mode_changed()
+        self.refocus_button.configure(text="Stop refocus")
+        self.update_z_button.configure(text="Accept Z ▶")
+        self._refocus_goto(0)
+
+    def _refocus_goto(self, index: int) -> None:
+        self.refocus_index = index
+        self.selected_focus_index = index
+        point = self.focus_points[index]
+        moved = self._safe_move(self.backend.move_xy, point.x_um, point.y_um) and self._safe_move(
+            self.backend.move_z, point.z_um
+        )
+        self.overview_mode = False
+        self.preview_view = None
+        self.view_center_override = None
+        self.live = True
+        self.live_button.configure(text="● Live")
+        if moved:
+            self.progress_text_var.set(
+                f"Refocus F{index + 1} of {len(self.focus_points)}: focus live, then Accept Z"
+            )
+        self._update_position_label()
+        self._update_focus_status()
         self._render_scene()
 
-    def _abort_scan(self, reason: str) -> None:
-        if self.scan_writer is not None:
-            writer_state = self.scan_writer.snapshot()
-            self.scan_tile_index = writer_state.completed_tiles
-            self.scan_written_frames = writer_state.written_frames
-            self.scan_writer.shutdown(drain=False)
-            self.scan_writer = None
-        try:
-            self._write_scan_manifest("failed", reason)
-        except OSError:
-            pass
-        self.status_var.set("ACQUISITION FAILED")
-        self.progress_text_var.set(reason)
-        self.scan_button.configure(state="normal")
-        self.progress_job = None
-        messagebox.showerror("Acquisition stopped", reason, parent=self)
+    def _stop_refocus(self) -> None:
+        self.refocus_index = None
+        if hasattr(self, "refocus_button"):
+            self.refocus_button.configure(text="Refocus all")
+            self.update_z_button.configure(text="Update Z")
 
-    def _write_scan_manifest(self, status: str, error: str | None = None) -> Path:
-        assert self.active_plan is not None
-        assert self.active_estimate is not None
-        assert self.active_scan_folder is not None
-        manifest = {
-            "prototype": True,
-            "simulation_only": True,
-            "status": status,
-            "updated_at": datetime.now().astimezone().isoformat(),
-            "error": error,
-            "plan": self.active_plan.to_dict(),
-            "estimate": {
-                "tiles": self.active_estimate.tiles,
-                "frames": self.active_estimate.frames,
-                "z_planes": self.active_estimate.z_planes,
-                "duration_seconds": self.active_estimate.duration_seconds,
-                "data_bytes": self.active_estimate.data_bytes,
-            },
-            "storage": {
-                "policy": (
-                    "bounded asynchronous frame queue; one SSD writer; "
-                    "close each tile immediately; fixed-size disk preview"
-                ),
-                "writer_queue_capacity_frames": self.config_data.writer_queue_frames,
-                "maximum_pipeline_payload_bytes": (
-                    self.config_data.writer_queue_frames
-                    * self.config_data.camera_width_px
-                    * self.config_data.camera_height_px
-                    * self.config_data.bytes_per_pixel
-                ),
-                "frames_acquired": self.scan_frame_index,
-                "frames_written": self.scan_written_frames,
-                "tiles_written": self.scan_tile_index,
-                "tile_index": "tiles.jsonl",
-                "simulated_tiles": "simulated_tiles/",
-                "preview_maps": "disk_preview/",
-                "preview_disk_bytes": (
-                    self.active_mosaic.disk_preview_bytes if self.active_mosaic else 0
-                ),
-            },
-        }
-        manifest_path = self.active_scan_folder / "acquisition_manifest.json"
-        temporary_path = manifest_path.with_suffix(".tmp")
-        temporary_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        temporary_path.replace(manifest_path)
-        return manifest_path
-
-    def _slug(self, value: str) -> str:
-        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
-        return cleaned.strip("._") or "unnamed"
+    def _align_selected_focus_to_stage(self) -> None:
+        if self.selected_focus_index is None:
+            messagebox.showinfo(
+                "Select a focus point",
+                "Click a focus point (Focus points mode), navigate the stage so the same "
+                "landmark is centred in Live, then press this button. The whole ROI set "
+                "moves so that point sits at the current stage position (Z is kept).",
+                parent=self,
+            )
+            return
+        point = self.focus_points[self.selected_focus_index]
+        position = self.backend.position
+        dx, dy = position.x_um - point.x_um, position.y_um - point.y_um
+        self.regions = [region.translated(dx, dy) for region in self.regions]
+        self.focus_points = [p.translated_xy(dx, dy) for p in self.focus_points]
+        self.progress_text_var.set(
+            f"ROI set moved by ΔX {dx:+.1f} ΔY {dy:+.1f} µm to align F{self.selected_focus_index + 1}"
+        )
+        self._render_scene()
+        self._input_changed()
 
     def _show_admin(self) -> None:
         dialog = tk.Toplevel(self)
@@ -2014,15 +2279,19 @@ class ScanConsole(tk.Tk):
             body,
             text=(
                 "This build uses simulated stage, camera, turret, and acquisition calls. "
-                "A pymmcore-plus adapter will replace the simulator after the workflow "
-                "and safety rules are approved."
+                "Set hardware.backend to \"mmcore\" in the configuration to use the "
+                "pymmcore-plus adapter."
+                if self.backend.simulated
+                else f"Backend: {self.backend.name} (pymmcore-plus). Moves outside the "
+                "configured limits are refused before any command is sent."
             ),
             style="Muted.TLabel",
             wraplength=480,
             justify="left",
         ).pack(anchor="w", pady=(4, 16))
         details = (
-            f"Configuration: {DEFAULT_CONFIG_PATH}\n"
+            f"Configuration: {self.config_path}\n"
+            f"Backend: {self.backend.name}\n"
             f"Microscope: {self.config_data.microscope_name}\n"
             f"Objectives: {len(self.config_data.objectives)}\n"
             f"Channels: {len(self.config_data.channels)}\n"
@@ -2035,16 +2304,28 @@ class ScanConsole(tk.Tk):
         ttk.Button(body, text="Close", command=dialog.destroy).pack(anchor="e", pady=(20, 0))
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Microscope Scan Console")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="configuration JSON")
+    parser.add_argument(
+        "--backend",
+        choices=("simulator", "mmcore"),
+        help="override hardware.backend from the configuration",
+    )
+    args = parser.parse_args(argv)
     try:
-        config = load_config()
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        config = load_config(args.config)
+        if args.backend:
+            config = replace(config, hardware={**config.hardware, "backend": args.backend})
+        backend = create_backend(config)
+    except (OSError, ValueError, json.JSONDecodeError, HardwareError) as exc:
         root = tk.Tk()
         root.withdraw()
-        messagebox.showerror("Configuration error", str(exc))
+        messagebox.showerror("Startup error", str(exc))
         root.destroy()
         raise SystemExit(1) from exc
-    app = ScanConsole(config)
+    app = ScanConsole(config, backend)
+    app.config_path = Path(args.config)
     app.mainloop()
 
 

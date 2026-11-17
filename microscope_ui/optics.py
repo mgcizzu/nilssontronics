@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import math
 
-from .models import Channel, Objective
+from .models import Channel, Objective, endpoint_inclusive_plane_count
 
 
 def recommended_z_step_um(
@@ -39,8 +38,8 @@ def automatic_z_stack(
     if recommended_step_um_value <= 0:
         raise ValueError("Recommended Z step must be greater than zero")
     distance = abs(end_um - begin_um)
-    if distance == 0:
+    planes = endpoint_inclusive_plane_count(distance, recommended_step_um_value)
+    if planes == 1:
         return 1, recommended_step_um_value
-    planes = math.ceil(distance / recommended_step_um_value) + 1
     actual_step_um = distance / (planes - 1)
     return planes, actual_step_um

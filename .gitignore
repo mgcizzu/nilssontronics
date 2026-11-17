@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 scan_output/
 recipes/*.json
+*.egg-info/
