@@ -27,6 +27,50 @@ class ControllerError(RuntimeError):
     pass
 
 
+def calibration_snapshot(config: MicroscopeConfig, objective_id: str) -> dict:
+    """What fixes the geometry of saved images; stored with the experiment."""
+
+    objective = config.objective(objective_id)
+    orientation = config.camera_orientation
+    return {
+        "objective_id": objective.id,
+        "pixel_size_um": objective.pixel_size_um,
+        "magnification": objective.magnification,
+        "camera_width_px": config.camera_width_px,
+        "camera_height_px": config.camera_height_px,
+        "camera_orientation": {
+            "flip_x": orientation.flip_x,
+            "flip_y": orientation.flip_y,
+            "transpose": orientation.transpose,
+        },
+    }
+
+
+def calibration_differences(recorded: dict, current: dict) -> list[str]:
+    """Human-readable differences between two calibration snapshots."""
+
+    labels = {
+        "objective_id": "objective",
+        "pixel_size_um": "pixel size (µm/px)",
+        "magnification": "magnification",
+        "camera_width_px": "camera width (px)",
+        "camera_height_px": "camera height (px)",
+        "camera_orientation": "camera orientation",
+    }
+    differences = []
+    for key, label in labels.items():
+        old, new = recorded.get(key), current.get(key)
+        if isinstance(old, float) or isinstance(new, float):
+            same = old is not None and new is not None and abs(float(old) - float(new)) <= 1e-9 * max(
+                1.0, abs(float(old))
+            )
+        else:
+            same = old == new
+        if not same:
+            differences.append(f"{label}: {old} when cycle 1 started, now {new}")
+    return differences
+
+
 class ScanController:
     def __init__(self, config: MicroscopeConfig, backend: MicroscopeBackend) -> None:
         self.config = config
@@ -59,7 +103,7 @@ class ScanController:
         experiment = self.experiment
         if experiment is None:
             return []
-        problems = []
+        problems = self.calibration_problems()
         if plan.objective_id != experiment.objective_id:
             problems.append("The objective is fixed for this experiment.")
         if (plan.overlap_x_percent, plan.overlap_y_percent) != (
@@ -79,6 +123,28 @@ class ScanController:
                 f"Cycle {unfinished.number} is unfinished — resume it before starting a new cycle."
             )
         return problems
+
+    def calibration_problems(self) -> list[str]:
+        """Refuse to add images to an experiment whose calibration has changed."""
+
+        experiment = self.experiment
+        if experiment is None:
+            return []
+        if not experiment.calibration:
+            return [
+                "This experiment has no calibration record (created by an older version), so "
+                "its pixel size and camera geometry cannot be verified. Start a new experiment."
+            ]
+        differences = calibration_differences(
+            experiment.calibration, calibration_snapshot(self.config, experiment.objective_id)
+        )
+        if not differences:
+            return []
+        return [
+            "The configuration no longer matches this experiment's images ("
+            + "; ".join(differences)
+            + "). Restore the original calibration or start a new experiment."
+        ]
 
     def estimate(self, plan: AcquisitionPlan) -> tuple[list[Tile], AcquisitionEstimate]:
         tiles = self.tiles_for(plan)
@@ -154,6 +220,7 @@ class ScanController:
                 tiles,
                 plan.options,
                 plan.focus_points,
+                calibration=calibration_snapshot(self.config, plan.objective_id),
             )
             dx = dy = 0.0
         else:
@@ -185,6 +252,9 @@ class ScanController:
             raise ControllerError("Every cycle in this experiment is complete")
         if self.backend.current_objective_id != self.experiment.objective_id:
             raise ControllerError("Put the experiment's objective in the light path first")
+        problems = self.calibration_problems()
+        if problems:
+            raise ControllerError("\n".join(problems))
         skip = frozenset(completed_tile_indices(self.experiment.cycle_folder(record.number)))
         with self._experiment_lock:
             record = self.experiment.update_cycle(record.number, status="running", error=None)
@@ -275,14 +345,15 @@ class ScanController:
             writer,
             run,
             post_process=post_process,
-            on_finished=lambda status, number=record.number: self._cycle_finished(number, status),
+            # Bound to this experiment: the record must land in the experiment the
+            # cycle belongs to, whatever is open by the time it finishes.
+            on_finished=lambda status, number=record.number, experiment=experiment: (
+                self._cycle_finished(experiment, number, status)
+            ),
         )
         self.engine.start()
 
-    def _cycle_finished(self, number: int, status: EngineStatus) -> None:
-        experiment = self.experiment
-        if experiment is None:
-            return
+    def _cycle_finished(self, experiment: Experiment, number: int, status: EngineStatus) -> None:
         state = {"complete": "complete", "aborted": "aborted"}.get(status.state, "failed")
         with self._experiment_lock:
             experiment.update_cycle(

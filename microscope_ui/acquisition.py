@@ -196,6 +196,16 @@ class BoundedAsyncWriter:
                 self._state_changed.wait(remaining)
             return self._failure is None
 
+    @property
+    def stopped(self) -> bool:
+        """True once the writer thread has exited (no further access to the sink)."""
+
+        return not self._thread.is_alive()
+
+    def wait_stopped(self, timeout: float | None = None) -> bool:
+        self._thread.join(timeout)
+        return self.stopped
+
     def shutdown(self, *, drain: bool, timeout: float = 5.0) -> bool:
         """Stop the worker after draining, or discard frames that have not begun."""
 
