@@ -81,6 +81,7 @@ from .widgets import (
 
 POSITION_REFRESH_MS = 1000
 CLOSE_TIMEOUT_S = 30.0
+DEVICE_DRAIN_TIMEOUT_S = 30.0
 POLL_INTERVAL_MS = 150
 MOSAIC_REFRESH_S = 0.3
 Z_MODES = (("Single plane (current Z)", "single"), ("Focus map", "focus_map"), ("Z-stack", "stack"))
@@ -1514,21 +1515,34 @@ class ScanWindow(QMainWindow):
             return
         self.live_button.setChecked(False)
         self.stop_spiral_preview()
-        self.device.stop_and_drain()
+        self.position_timer.stop()  # no new device jobs while shutting down
+        if not self.device.stop_and_drain(timeout=DEVICE_DRAIN_TIMEOUT_S):
+            # A camera or stage command is still running on the device worker:
+            # closing the backend under it is unsafe, so stay open.
+            self.warn(
+                "Microscope busy",
+                "A camera or stage command is still running. The program stays open; "
+                "try again when it has finished.",
+            )
+            self._refuse_close(event)
+            return
         if not self.controller.close(timeout=CLOSE_TIMEOUT_S):
             self.warn(
                 "Still saving",
                 "The acquisition is stopping but the SSD writer is still saving its current "
                 "frame. The program stays open so no data is lost; try again in a moment.",
             )
-            if not self.poll_timer.isActive():
-                self.poll_timer.start()
-            event.ignore()
+            self._refuse_close(event)
             return
-        self.position_timer.stop()
         self.poll_timer.stop()
         self.device.shutdown()
         event.accept()
+
+    def _refuse_close(self, event) -> None:
+        self.position_timer.start()
+        if self.controller.engine is not None and not self.poll_timer.isActive():
+            self.poll_timer.start()
+        event.ignore()
 
 
 def main(argv: list[str] | None = None) -> None:
