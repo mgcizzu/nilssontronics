@@ -8,6 +8,27 @@ from typing import Literal
 
 Immersion = Literal["air", "oil", "water", "silicone", "other"]
 ZMode = Literal["single", "stack", "focus_map"]
+TileOrder = Literal["raster", "serpentine"]
+FocusMethod = Literal["linear", "plane"]
+
+Z_MODES: tuple[str, ...] = ("single", "stack", "focus_map")
+TILE_ORDERS: tuple[str, ...] = ("raster", "serpentine")
+FOCUS_METHODS: tuple[str, ...] = ("linear", "plane")
+
+
+def endpoint_inclusive_plane_count(distance_um: float, step_um: float) -> int:
+    """Planes needed to cover ``distance_um`` with spacing no larger than ``step_um``.
+
+    This is the single definition used by the optics helpers, the plan model and
+    the acquisition engine so that estimates and real acquisitions always agree.
+    """
+
+    if step_um <= 0:
+        raise ValueError("Z step must be greater than zero")
+    distance_um = abs(distance_um)
+    if distance_um == 0:
+        return 1
+    return math.ceil(distance_um / step_um - 1e-9) + 1
 
 
 @dataclass(frozen=True)
@@ -46,6 +67,47 @@ class StageLimits:
     z_min_um: float
     z_max_um: float
 
+    def contains_xy(self, x_um: float, y_um: float) -> bool:
+        return (
+            self.x_min_um <= x_um <= self.x_max_um
+            and self.y_min_um <= y_um <= self.y_max_um
+        )
+
+    def contains_z(self, z_um: float) -> bool:
+        return self.z_min_um <= z_um <= self.z_max_um
+
+
+@dataclass(frozen=True)
+class Recipe:
+    name: str
+    objective_id: str
+    channels: tuple[str, ...]
+    z_mode: ZMode = "single"
+
+
+@dataclass(frozen=True)
+class Timing:
+    """Hardware timing used only for estimates (seconds unless stated)."""
+
+    stage_speed_um_per_s: float = 5000.0
+    stage_settle_s: float = 0.10
+    z_move_s: float = 0.03
+    channel_switch_s: float = 0.12
+    camera_readout_ms: float = 25.0
+
+
+@dataclass(frozen=True)
+class CameraOrientation:
+    """How camera pixels map onto stage axes.
+
+    Applied by the hardware backend so every frame handed to the rest of the
+    program already has +column = +stage X and +row = +stage Y.
+    """
+
+    flip_x: bool = False
+    flip_y: bool = False
+    transpose: bool = False
+
 
 @dataclass(frozen=True)
 class MicroscopeConfig:
@@ -59,7 +121,13 @@ class MicroscopeConfig:
     channels: tuple[Channel, ...]
     stage_limits: StageLimits
     writer_queue_frames: int = 4
-    recipes: tuple[dict, ...] = ()
+    recipes: tuple[Recipe, ...] = ()
+    timing: Timing = field(default_factory=Timing)
+    camera_orientation: CameraOrientation = field(default_factory=CameraOrientation)
+    approach_offset_um: float = 0.0
+    simulator_frame_px: int = 256
+    fsync_tiles: bool = True
+    hardware: dict = field(default_factory=dict)
 
     def objective(self, objective_id: str) -> Objective:
         try:
@@ -72,6 +140,26 @@ class MicroscopeConfig:
             return next(item for item in self.channels if item.id == channel_id)
         except StopIteration as exc:
             raise KeyError(f"Unknown channel: {channel_id}") from exc
+
+    def recipe(self, name: str) -> Recipe:
+        try:
+            return next(item for item in self.recipes if item.name == name)
+        except StopIteration as exc:
+            raise KeyError(f"Unknown recipe: {name}") from exc
+
+    def fov_um(self, objective_id: str) -> tuple[float, float]:
+        objective = self.objective(objective_id)
+        return (
+            self.camera_width_px * objective.pixel_size_um,
+            self.camera_height_px * objective.pixel_size_um,
+        )
+
+    def safe_z_range(self, objective_id: str) -> tuple[float, float]:
+        objective = self.objective(objective_id)
+        return (
+            max(self.stage_limits.z_min_um, objective.safe_z_min_um),
+            min(self.stage_limits.z_max_um, objective.safe_z_max_um),
+        )
 
 
 @dataclass(frozen=True)
@@ -145,6 +233,28 @@ class FocusPoint:
 
 
 @dataclass(frozen=True)
+class Tile:
+    """One field of view in the experiment's fixed tile grid.
+
+    ``index`` is the acquisition order (0-based) and never changes between
+    cycles; ``row``/``col`` are positions in the shared grid.
+    """
+
+    index: int
+    row: int
+    col: int
+    x_um: float
+    y_um: float
+
+    def translated(self, dx_um: float, dy_um: float) -> "Tile":
+        return Tile(self.index, self.row, self.col, self.x_um + dx_um, self.y_um + dy_um)
+
+    @property
+    def xy(self) -> tuple[float, float]:
+        return (self.x_um, self.y_um)
+
+
+@dataclass(frozen=True)
 class ChannelSetting:
     channel_id: str
     exposure_ms: float
@@ -157,8 +267,10 @@ class ZSettings:
     bottom_um: float = 0.0
     top_um: float = 0.0
     step_um: float = 1.0
-    begin_captured: bool = True
-    end_captured: bool = True
+    # Begin/End must be captured explicitly from live Z; a plan built without
+    # them is never valid for a Z-stack.
+    begin_captured: bool = False
+    end_captured: bool = False
 
     @property
     def plane_count(self) -> int:
@@ -166,10 +278,33 @@ class ZSettings:
             return 1
         if not self.begin_captured or not self.end_captured or self.step_um <= 0:
             return 0
-        distance = abs(self.top_um - self.bottom_um)
-        if distance == 0:
-            return 1
-        return math.ceil(distance / self.step_um - 1e-9) + 1
+        return endpoint_inclusive_plane_count(self.top_um - self.bottom_um, self.step_um)
+
+    def stack_positions(self) -> tuple[float, ...]:
+        """Absolute Z positions from Begin to End inclusive (stack mode only)."""
+
+        count = self.plane_count
+        if self.mode != "stack" or count == 0:
+            return ()
+        if count == 1:
+            return (self.bottom_um,)
+        spacing = (self.top_um - self.bottom_um) / (count - 1)
+        return tuple(self.bottom_um + index * spacing for index in range(count))
+
+
+@dataclass(frozen=True)
+class AcquisitionOptions:
+    """Optional behaviours, all off/conservative by default."""
+
+    tile_order: TileOrder = "raster"
+    # Approach every XY target from the same side (needs approach_offset_um > 0
+    # in the configuration) to cancel stage backlash.
+    consistent_approach: bool = False
+    # Close the light path during stage and Z moves (per-frame shutter).
+    shutter_per_frame: bool = True
+    # Estimate a flat-field profile per channel after each cycle (non-destructive).
+    flat_field: bool = False
+    focus_method: FocusMethod = "linear"
 
 
 @dataclass(frozen=True)
@@ -184,6 +319,7 @@ class AcquisitionPlan:
     focus_points: tuple[FocusPoint, ...] = ()
     overlap_x_percent: float = 10.0
     overlap_y_percent: float = 10.0
+    options: AcquisitionOptions = field(default_factory=AcquisitionOptions)
 
     def to_dict(self) -> dict:
         result = asdict(self)
@@ -198,6 +334,8 @@ class AcquisitionEstimate:
     z_planes: int
     duration_seconds: float
     data_bytes: int
+    actual_overlap_x_percent: float = 0.0
+    actual_overlap_y_percent: float = 0.0
 
     @property
     def duration_label(self) -> str:

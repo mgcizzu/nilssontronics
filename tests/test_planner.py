@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from microscope_ui.config import load_config
-from microscope_ui.backend import SimulatedMicroscope
+from microscope_ui.backend import SimulatedMicroscope, StageLimitError
 from microscope_ui.models import AcquisitionPlan, ChannelSetting, FocusPoint, ScanRegion, ZSettings
 from microscope_ui.optics import automatic_z_stack, recommended_z_step_um
 from microscope_ui.planner import (
@@ -47,7 +47,7 @@ class PlannerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             plan = self.make_plan(
                 Path(temp_dir),
-                z=ZSettings(mode="stack", bottom_um=-2, top_um=2, step_um=1),
+                z=ZSettings(mode="stack", bottom_um=-2, top_um=2, step_um=1, begin_captured=True, end_captured=True),
             )
             estimate = estimate_acquisition(self.config, plan)
         self.assertEqual(estimate.z_planes, 5)
@@ -80,7 +80,7 @@ class PlannerTests(unittest.TestCase):
             plan = self.make_plan(
                 Path(temp_dir),
                 objective_id="63x_oil",
-                z=ZSettings(mode="stack", bottom_um=-10, top_um=2000, step_um=1),
+                z=ZSettings(mode="stack", bottom_um=-10, top_um=2000, step_um=1, begin_captured=True, end_captured=True),
             )
             problems = validate_plan(self.config, plan)
         self.assertTrue(any("z range" in item.lower() for item in problems))
@@ -172,10 +172,14 @@ class PlannerTests(unittest.TestCase):
         y_step = y_values[1] - y_values[0]
         self.assertAlmostEqual(y_step, x_step / 2)
 
-    def test_simulated_z_jog_respects_stage_limits(self) -> None:
+    def test_simulated_moves_outside_limits_are_refused_not_clamped(self) -> None:
         backend = SimulatedMicroscope(self.config)
-        backend.move_z(self.config.stage_limits.z_max_um + 1000)
-        self.assertEqual(backend.position.z_um, self.config.stage_limits.z_max_um)
+        start = backend.position
+        with self.assertRaises(StageLimitError):
+            backend.move_z(self.config.stage_limits.z_max_um + 1000)
+        with self.assertRaises(StageLimitError):
+            backend.move_xy(self.config.stage_limits.x_max_um + 1, 0)
+        self.assertEqual(backend.position, start)
 
     def test_na_based_z_step_matches_widefield_nyquist_example(self) -> None:
         objective = self.config.objective("63x_oil")

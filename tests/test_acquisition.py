@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from threading import Event
+
+import numpy as np
 import json
 from pathlib import Path
 import tempfile
@@ -22,18 +24,11 @@ class BlockingSink:
     def begin_tile(self, *_args) -> None:
         pass
 
-    def write_plane(
-        self,
-        channel_id: str,
-        z_index: int,
-        payload: bytes | None = None,
-        width: int = 64,
-        height: int = 64,
-    ) -> None:
+    def write_plane(self, channel_id: str, z_index: int, frame, z_um=None) -> None:
         self.write_started.set()
         if not self.release_write.wait(2.0):
             raise TimeoutError("test did not release the simulated SSD")
-        self.frames.append((channel_id, z_index, payload or b""))
+        self.frames.append((channel_id, z_index, frame))
 
     def finish_tile(self) -> None:
         self.finished_tiles += 1
@@ -49,9 +44,7 @@ def request(z_index: int, *, last: bool = False) -> PlaneWriteRequest:
         z_planes=2,
         channel_id="dapi",
         z_index=z_index,
-        payload=bytes([z_index]) * 16,
-        width=4,
-        height=4,
+        frame=np.full((4, 4), z_index, dtype=np.uint16),
         is_last_plane=last,
     )
 
@@ -121,7 +114,7 @@ class BoundedAsyncWriterTests(unittest.TestCase):
                 writer.shutdown(drain=False)
                 mosaic.close()
 
-            self.assertTrue((root / "simulated_tiles/tile_0000001.simstack").exists())
+            self.assertTrue((root / "tiles/tile_00001.tstack").exists())
             records = [
                 json.loads(line)
                 for line in (root / "tiles.jsonl").read_text(encoding="utf-8").splitlines()
