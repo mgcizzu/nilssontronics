@@ -20,9 +20,11 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from html import escape
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QApplication,
@@ -56,11 +58,14 @@ from ..experiment import Experiment
 from ..models import (
     AcquisitionOptions,
     AcquisitionPlan,
+    ChannelSetting,
     FocusPoint,
     MicroscopeConfig,
     ZSettings,
 )
 from ..mosaic import DiskBackedMosaic
+from ..planner import spiral_preview_positions
+from ..roi_io import load_roi_set, save_roi_set
 from .device_worker import DeviceWorker
 from .overview import OverviewCanvas, bounded_set_translation
 from .widgets import (
@@ -80,6 +85,7 @@ MOSAIC_REFRESH_S = 0.3
 Z_MODES = (("Single plane (current Z)", "single"), ("Focus map", "focus_map"), ("Z-stack", "stack"))
 LAUNCH_ERRORS = (ControllerError, HardwareError, OSError, ValueError)
 MOSAIC_UNDERLAY_PX = 1024
+PREVIEW_TILE_PX = 256
 OVERVIEW_MODES = (
     ("navigate", "Navigate", "Drag to pan, wheel to zoom, double-click to move the stage"),
     ("rectangle", "Rectangle", "Drag to draw a rectangular scan region"),
@@ -97,9 +103,16 @@ OVERVIEW_HINTS = {
 
 
 class ScanWindow(QMainWindow):
-    def __init__(self, config: MicroscopeConfig, backend=None, use_ndv: bool = True) -> None:
+    def __init__(
+        self,
+        config: MicroscopeConfig,
+        backend=None,
+        use_ndv: bool = True,
+        config_path: Path | str = DEFAULT_CONFIG_PATH,
+    ) -> None:
         super().__init__()
         self.config_data = config
+        self.config_path = Path(config_path)
         self.backend = backend if backend is not None else create_backend(config)
         self.controller = ScanController(config, self.backend)
         self.device = DeviceWorker(self.backend, self)
@@ -111,6 +124,8 @@ class ScanWindow(QMainWindow):
         self.setWindowTitle(f"Microscope Scan Console — {self.backend.name}")
         self.resize(1400, 860)
         self._build_ui(use_ndv)
+        microscope_menu = self.menuBar().addMenu("Microscope")
+        microscope_menu.addAction("Configuration…", self.show_configuration)
         self._build_device_docks()
 
         self.device.frame_ready.connect(self.frame_view.show_frame)
@@ -205,11 +220,23 @@ class ScanWindow(QMainWindow):
         # Optics
         optics = QGroupBox("Objective && channels")
         optics_layout = QVBoxLayout(optics)
+        self.recipe_box = QComboBox()
+        self.recipe_box.addItem("Custom")
+        for recipe in self.config_data.recipes:
+            self.recipe_box.addItem(recipe.name)
+        self.recipe_box.setToolTip("Recipe: objective, channels and Z mode presets from the configuration")
+        self.recipe_box.activated.connect(self._apply_recipe)
+        self._applying_recipe = False
+        recipe_row = QHBoxLayout()
+        recipe_row.addWidget(QLabel("Recipe"))
+        recipe_row.addWidget(self.recipe_box, 1)
+        optics_layout.addLayout(recipe_row)
         self.objective_box = QComboBox()
         for objective in self.config_data.objectives:
             self.objective_box.addItem(objective.name, objective.id)
         self.objective_box.activated.connect(self._objective_selected)
         self.channel_table = ChannelTable(self.config_data.channels)
+        self.channel_table.changed.connect(self._recipe_to_custom)
         optics_layout.addWidget(self.objective_box)
         optics_layout.addWidget(self.channel_table)
         layout.addWidget(optics)
@@ -219,11 +246,21 @@ class ScanWindow(QMainWindow):
         regions_layout = QVBoxLayout(regions)
         self.region_list = ItemList(describe_region)
         self.add_region_button = self.region_list.add_button("Add…", self._add_region)
+        self.save_set_button = QPushButton("Save set…")
+        self.save_set_button.setToolTip("Save regions and focus points to a JSON file")
+        self.save_set_button.clicked.connect(self._save_roi_set)
+        self.load_set_button = QPushButton("Load set…")
+        self.load_set_button.setToolTip("Replace regions and focus points from a saved set")
+        self.load_set_button.clicked.connect(self._load_roi_set)
         self.shift_button = QPushButton("Shift ROI set…")
         self.shift_button.setToolTip("Re-register for this cycle: XY translation of the whole set")
         self.shift_button.clicked.connect(self._shift_roi_set)
+        set_row = QHBoxLayout()
+        set_row.addWidget(self.save_set_button)
+        set_row.addWidget(self.load_set_button)
+        set_row.addWidget(self.shift_button)
         regions_layout.addWidget(self.region_list)
-        regions_layout.addWidget(self.shift_button)
+        regions_layout.addLayout(set_row)
         layout.addWidget(regions)
 
         focus = QGroupBox("Focus points")
@@ -407,9 +444,17 @@ class ScanWindow(QMainWindow):
             self.live_channel_box.addItem(channel.name, channel.id)
         self.jog = StageJog()
         self.jog.move_requested.connect(self._jog)
+        self.preview_button = QPushButton("Spiral preview")
+        self.preview_button.setCheckable(True)
+        self.preview_button.setToolTip(
+            "Snap the Live channel at each tile position, spiralling out from the stage "
+            "(over the regions if any, else a 5×5 grid). Current Z only, no Z moves."
+        )
+        self.preview_button.toggled.connect(self._toggle_spiral_preview)
         controls.addWidget(self.live_button)
         controls.addWidget(self.snap_button)
         controls.addWidget(self.live_channel_box)
+        controls.addWidget(self.preview_button)
         controls.addStretch(1)
         controls.addWidget(self.jog)
         layout.addLayout(controls)
@@ -473,6 +518,77 @@ class ScanWindow(QMainWindow):
             self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
             menu.addAction(dock.toggleViewAction())
             self.device_docks.append(dock)
+
+    # --------------------------------------------------------- configuration --
+    def configuration_html(self) -> str:
+        """Read-only summary of the configuration and hardware boundary."""
+
+        c = self.config_data
+        hw = c.hardware
+        limits = c.stage_limits
+        mmcore = not self.backend.simulated
+        boundary = (
+            f"Backend <b>{escape(self.backend.name)}</b> (pymmcore-plus). Moves outside the "
+            "configured limits are refused before any command is sent."
+            if mmcore
+            else "Simulated stage, camera and turret. Set <code>hardware.backend</code> to "
+            "<code>\"mmcore\"</code> (or start with <code>--backend mmcore</code>) for Micro-Manager."
+        )
+        rows = [
+            ("Configuration", escape(str(self.config_path))),
+            ("Microscope", escape(c.microscope_name)),
+            ("Camera", f"{c.camera_width_px} × {c.camera_height_px} px, {8 * c.bytes_per_pixel}-bit"),
+            ("Stage X", f"{limits.x_min_um:g} … {limits.x_max_um:g} µm"),
+            ("Stage Y", f"{limits.y_min_um:g} … {limits.y_max_um:g} µm"),
+            ("Stage Z", f"{limits.z_min_um:g} … {limits.z_max_um:g} µm"),
+            ("Default overlap", f"X {c.overlap_x_percent:g}% • Y {c.overlap_y_percent:g}%"),
+        ]
+        if mmcore:
+            rows += [
+                ("MM config", escape(str(hw.get("mm_config_path", "")))),
+                ("Channel group", escape(str(hw.get("channel_group", "Channel")))),
+                ("Objective change Z", f"{hw.get('objective_change_z_um', limits.z_min_um)} µm"),
+            ]
+        summary = "".join(f"<tr><td><b>{k}</b></td><td>{v}</td></tr>" for k, v in rows)
+        current = self.backend.current_objective_id
+        objectives = "".join(
+            f"<tr><td>{'▶ ' if o.id == current else ''}{escape(o.name)}</td><td>{o.turret_position}</td>"
+            f"<td>{o.numerical_aperture:g} {escape(o.immersion)}</td><td>{o.pixel_size_um:g}</td>"
+            f"<td>{o.safe_z_min_um:g} … {o.safe_z_max_um:g}</td></tr>"
+            for o in c.objectives
+        )
+        presets = hw.get("channel_presets", {})
+        channels = "".join(
+            f"<tr><td style='color:{ch.color}'><b>{escape(ch.name)}</b></td>"
+            f"<td>{ch.max_exposure_ms:g} ms</td><td>{ch.max_power_percent:g}%</td>"
+            + (f"<td>{escape(str(presets.get(ch.id, '—')))}</td>" if mmcore else "")
+            + "</tr>"
+            for ch in c.channels
+        )
+        preset_head = "<th>MM preset</th>" if mmcore else ""
+        return (
+            f"<h3>Hardware boundary</h3><p>{boundary}</p>"
+            f"<table cellpadding=3>{summary}</table>"
+            "<h3>Objectives</h3><table cellpadding=3><tr><th align=left>Name</th><th>Turret</th>"
+            f"<th>NA</th><th>µm/px</th><th>Safe Z (µm)</th></tr>{objectives}</table>"
+            "<h3>Channels</h3><table cellpadding=3><tr><th align=left>Name</th><th>Max exposure</th>"
+            f"<th>Max power</th>{preset_head}</tr>{channels}</table>"
+        )
+
+    def show_configuration(self) -> None:
+        from qtpy.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Microscope configuration")
+        dialog.resize(620, 560)
+        layout = QVBoxLayout(dialog)
+        text = QTextBrowser()
+        text.setHtml(self.configuration_html())
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(text)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     # ------------------------------------------------------- dialogs (seam) --
     def confirm(self, title: str, text: str) -> bool:
@@ -568,12 +684,16 @@ class ScanWindow(QMainWindow):
         for widget in (self.new_button, self.open_button, self.project_edit, self.sample_edit,
                        self.output_edit, self.channel_table, self.focus_method_box,
                        self.z_mode_box, self.consistent_approach, self.shutter_per_frame,
-                       self.flat_field, self.snap_button, self.live_button, self.jog):
+                       self.flat_field, self.snap_button, self.live_button, self.jog,
+                       self.preview_button):
             widget.setEnabled(not busy)
         for widget in (self.objective_box, self.overlap_x, self.overlap_y, self.tile_order_box):
             widget.setEnabled(not busy and not locked)
         self.region_list.set_locked(busy or locked)
         self.shift_button.setEnabled(not busy and locked)
+        self.recipe_box.setEnabled(not busy)
+        self.save_set_button.setEnabled(not busy)
+        self.load_set_button.setEnabled(not busy and not locked)
         for mode, button in self.mode_buttons.items():
             allowed = mode == "navigate" or (not busy and (mode not in ("rectangle", "polygon") or not locked))
             button.setEnabled(allowed)
@@ -638,6 +758,7 @@ class ScanWindow(QMainWindow):
             self.objective_box.setCurrentIndex(index)
 
     def _objective_selected(self, _index: int) -> None:
+        self._recipe_to_custom()
         objective = self.config_data.objective(self.objective_box.currentData())
         previous = self.config_data.objective(self.backend.current_objective_id)
         if objective.id == previous.id:
@@ -650,6 +771,8 @@ class ScanWindow(QMainWindow):
         ):
             self._sync_objective_box()
             return
+        self.stop_spiral_preview()
+        self.overview.clear_preview()  # preview tiles were taken with the old objective
         self.objective_box.setEnabled(False)
         self.progress_label.setText(f"Changing objective to {objective.name}…")
 
@@ -667,6 +790,44 @@ class ScanWindow(QMainWindow):
 
         self.device.submit(self.backend.change_objective, objective, on_done=done, on_error=failed)
 
+    # --------------------------------------------------------------- recipes --
+    def _recipe_to_custom(self, *_args) -> None:
+        if not self._applying_recipe:
+            self.recipe_box.setCurrentIndex(0)
+
+    def _apply_recipe(self, _index: int = 0) -> None:
+        name = self.recipe_box.currentText()
+        if name == "Custom":
+            return
+        recipe = self.config_data.recipe(name)
+        experiment = self.controller.experiment
+        if experiment is not None and recipe.objective_id != experiment.objective_id:
+            self.inform(
+                "Objective is fixed",
+                f"This experiment uses {self.config_data.objective(experiment.objective_id).name}; "
+                f"recipe '{name}' needs {self.config_data.objective(recipe.objective_id).name}. "
+                "Channels and Z mode were not changed.",
+            )
+            self.recipe_box.setCurrentIndex(0)
+            return
+        self._applying_recipe = True
+        try:
+            current = {c.channel_id: c for c in self.channel_table.settings()}
+            defaults = {c.id: c for c in self.config_data.channels}
+            self.channel_table.set_settings(tuple(
+                current.get(cid) or ChannelSetting(cid, defaults[cid].default_exposure_ms,
+                                                   defaults[cid].default_power_percent)
+                for cid in recipe.channels
+            ))
+            self.z_mode_box.setCurrentIndex(self.z_mode_box.findData(recipe.z_mode))
+            self.objective_box.setCurrentIndex(self.objective_box.findData(recipe.objective_id))
+            if recipe.objective_id != self.backend.current_objective_id:
+                self._objective_selected(self.objective_box.currentIndex())
+        finally:
+            self._applying_recipe = False
+        self.recipe_box.setCurrentText(name)
+        self._refresh()
+
     def _z_mode_changed(self, *_args) -> None:
         stack = self.z_mode_box.currentData() == "stack"
         for widget in self.z_stack_widgets:
@@ -675,14 +836,20 @@ class ScanWindow(QMainWindow):
         self._refresh()
 
     def _capture_z_begin(self) -> None:
-        self.z_bottom.setValue(self.stage_position.z_um)
-        self.z_begin_captured = True
-        self._refresh()
+        def capture(p) -> None:
+            self.z_bottom.setValue(p.z_um)
+            self.z_begin_captured = True
+            self._refresh()
+
+        self.with_fresh_position(capture)
 
     def _capture_z_end(self) -> None:
-        self.z_top.setValue(self.stage_position.z_um)
-        self.z_end_captured = True
-        self._refresh()
+        def capture(p) -> None:
+            self.z_top.setValue(p.z_um)
+            self.z_end_captured = True
+            self._refresh()
+
+        self.with_fresh_position(capture)
 
     def _reset_z_stack_capture(self) -> None:
         self.z_begin_captured = self.z_end_captured = False
@@ -708,6 +875,51 @@ class ScanWindow(QMainWindow):
         form.addRow(buttons)
         if dialog.exec():
             self.shift_roi_set(dx.value(), dy.value())
+
+    def _save_roi_set(self) -> None:
+        if not self.region_list.items and not self.focus_list.items:
+            self.inform("Nothing to save", "Draw at least one region or add a focus point first.")
+            return
+        default = Path(self.output_edit.text()).expanduser() / f"{self.sample_edit.text().strip() or 'sample'}_roi.json"
+        path, _ = QFileDialog.getSaveFileName(self, "Save ROI and focus-point set", str(default), "ROI set (*.json)")
+        if path:
+            self.save_roi_set(path)
+
+    def save_roi_set(self, path: Path | str) -> bool:
+        try:
+            save_roi_set(path, tuple(self.region_list.items), tuple(self.focus_list.items))
+        except OSError as exc:
+            self.warn("Could not save ROI set", str(exc))
+            return False
+        self.overview_hint.setText(f"ROI set saved • {path}")
+        return True
+
+    def _load_roi_set(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load ROI and focus-point set", self.output_edit.text(), "ROI set (*.json);;All files (*)"
+        )
+        if path:
+            self.load_roi_set(path)
+
+    def load_roi_set(self, path: Path | str) -> bool:
+        if self.controller.busy or self.controller.experiment is not None:
+            return False  # regions are fixed by cycle 1
+        try:
+            regions, focus_points = load_roi_set(path)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            self.warn("Could not load ROI set", str(exc))
+            return False
+        if (self.region_list.items or self.focus_list.items) and not self.confirm(
+            "Replace current ROI set?",
+            "Loading this file replaces the current regions and focus points. Continue?",
+        ):
+            return False
+        self.stop_refocus()
+        self.region_list.set_items(regions)
+        self.focus_list.set_items(focus_points)
+        self.overview.fit_items(regions, focus_points)
+        self.overview_hint.setText(f"ROI set loaded • {path}")
+        return True
 
     def shift_roi_set(self, dx_um: float, dy_um: float) -> None:
         """Translate regions and focus points together (re-registration, XY only)."""
@@ -858,6 +1070,114 @@ class ScanWindow(QMainWindow):
 
         self.with_fresh_position(accept)
 
+    # -------------------------------------------------------- spiral preview --
+    def _toggle_spiral_preview(self, on: bool) -> None:
+        if on:
+            self.start_spiral_preview()
+        else:
+            self.stop_spiral_preview()
+
+    def start_spiral_preview(self) -> bool:
+        if self.controller.busy:
+            self.preview_button.setChecked(False)
+            return False
+        objective_id = self.backend.current_objective_id
+        origin = (self.stage_position.x_um, self.stage_position.y_um)
+        limits = self.config_data.stage_limits
+        positions = [
+            p
+            for p in spiral_preview_positions(
+                self.config_data,
+                objective_id,
+                tuple(self.region_list.items),
+                origin,
+                overlap_x_percent=self.overlap_x.value(),
+                overlap_y_percent=self.overlap_y.value(),
+            )
+            if limits.contains_xy(*p)
+        ]
+        if not positions:
+            self.warn("No preview positions", "The preview area has no positions inside the stage limits.")
+            self.preview_button.setChecked(False)
+            return False
+        self.live_button.setChecked(False)
+        self._push_live_settings()
+        self._preview_generation = getattr(self, "_preview_generation", 0) + 1
+        self._preview_positions = positions
+        self._preview_index = 0
+        self._preview_range: tuple[float, float] | None = None
+        self._preview_fov = self.config_data.fov_um(objective_id)
+        self._preview_active = True
+        self.overview.clear_preview()
+        self.tabs.setCurrentIndex(0)
+        if not self.preview_button.isChecked():
+            self.preview_button.blockSignals(True)
+            self.preview_button.setChecked(True)
+            self.preview_button.blockSignals(False)
+        self._preview_next(self._preview_generation)
+        return True
+
+    @property
+    def preview_running(self) -> bool:
+        return getattr(self, "_preview_active", False)
+
+    def stop_spiral_preview(self, message: str | None = None) -> None:
+        if not hasattr(self, "_preview_positions"):
+            return
+        self._preview_generation = getattr(self, "_preview_generation", 0) + 1  # drops the next job
+        if not self.preview_running:
+            return  # nothing running: keep the current hint
+        self._preview_active = False
+        self.preview_button.blockSignals(True)
+        self.preview_button.setChecked(False)
+        self.preview_button.blockSignals(False)
+        done = self.overview.preview_tile_count
+        self.overview_hint.setText(
+            message or f"Spiral preview stopped after {done} of {len(self._preview_positions)} tiles"
+        )
+
+    def _preview_next(self, generation: int) -> None:
+        if generation != self._preview_generation:
+            return
+        if self._preview_index >= len(self._preview_positions):
+            self.stop_spiral_preview(
+                f"Spiral preview complete • {len(self._preview_positions)} tiles • current Z only"
+            )
+            return
+        x, y = self._preview_positions[self._preview_index]
+        backend, device = self.backend, self.device
+
+        def visit():
+            if generation != self._preview_generation:
+                return None  # stopped while queued: no move, no exposure
+            backend.move_xy(x, y)
+            frame = device.acquire_frame()
+            step = max(1, int(np.ceil(max(frame.shape) / PREVIEW_TILE_PX)))
+            return (x, y), np.ascontiguousarray(frame[::step, ::step])
+
+        def failed(exc: Exception) -> None:
+            if generation == self._preview_generation:
+                self.stop_spiral_preview(f"Spiral preview stopped: {exc}")
+                self.warn("Spiral preview stopped", str(exc))
+
+        self.device.submit(visit, on_done=lambda result: self._preview_tile_done(generation, result), on_error=failed)
+
+    def _preview_tile_done(self, generation: int, result) -> None:
+        if result is None or generation != self._preview_generation:
+            return
+        center, frame = result
+        if self._preview_range is None:
+            low, high = np.percentile(frame, (1.0, 99.7))
+            self._preview_range = (float(low), float(max(high, low + 1)))
+        channel = self.config_data.channel(self.live_channel_box.currentData())
+        self.overview.add_preview_tile(frame, center, self._preview_fov, self._preview_range, channel.color)
+        self._preview_index += 1
+        self.overview_hint.setText(
+            f"{channel.name} spiral preview • tile {self._preview_index} of "
+            f"{len(self._preview_positions)} • current Z only"
+        )
+        self._preview_next(generation)
+
     # -------------------------------------------------- refocus & alignment --
     def _toggle_refocus(self) -> None:
         if self.refocus_index is not None:
@@ -964,6 +1284,7 @@ class ScanWindow(QMainWindow):
             self.live_button.setChecked(False)
             return
         if on:
+            self.stop_spiral_preview()
             self._push_live_settings()
             self.tabs.setCurrentWidget(self.frame_view)
         self.device.set_live(on)
@@ -973,8 +1294,9 @@ class ScanWindow(QMainWindow):
         self.warn("Live stopped", message)
 
     def _hand_backend_to_engine(self) -> bool:
-        """Stop live and finish queued device jobs before the engine drives the backend."""
+        """Stop live/preview and finish queued device jobs before the engine drives the backend."""
 
+        self.stop_spiral_preview()
         self.live_button.setChecked(False)
         if not self.device.stop_and_drain(timeout=30):
             self.warn("Microscope busy", "A stage or camera command is still running. Try again.")
@@ -1211,7 +1533,7 @@ def main(argv: list[str] | None = None) -> None:
     except (OSError, ValueError, json.JSONDecodeError, HardwareError) as exc:
         QMessageBox.critical(None, "Startup error", str(exc))
         raise SystemExit(1) from exc
-    window = ScanWindow(config, backend, use_ndv=not args.no_ndv)
+    window = ScanWindow(config, backend, use_ndv=not args.no_ndv, config_path=args.config)
     window.show()
     app.exec()
 

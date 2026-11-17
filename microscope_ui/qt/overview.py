@@ -123,6 +123,7 @@ class OverviewCanvas(QGraphicsView):
         self._mosaic_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self._scene.addItem(self._mosaic_item)
         self._dynamic: list = []
+        self._preview_items: list[QGraphicsPixmapItem] = []
         self._focus_points: list[FocusPoint] = []
         self._draft_items: list = []
         self._polygon: list[tuple[float, float]] = []
@@ -198,6 +199,40 @@ class OverviewCanvas(QGraphicsView):
         self._mosaic_item.setPixmap(QPixmap.fromImage(image.copy()))
         self._mosaic_item.setPos(bounds.x_min_um, bounds.y_min_um)
         self._mosaic_item.setScale(bounds.width_um / rgb.shape[1])
+
+    def add_preview_tile(
+        self,
+        frame: np.ndarray,
+        center: tuple[float, float],
+        fov_um: tuple[float, float],
+        display_range: tuple[float, float],
+        color: str,
+    ) -> None:
+        """Paint one spiral-preview frame (oriented, +col = +X, +row = +Y) at its stage position."""
+
+        low, high = display_range
+        scaled = np.clip((frame.astype(np.float32) - low) / max(high - low, 1.0), 0.0, 1.0)
+        tint = QColor(color)
+        rgb = scaled[:, :, None] * np.array([tint.red(), tint.green(), tint.blue()], np.float32)
+        rgb = np.ascontiguousarray(rgb.astype(np.uint8))
+        image = QImage(rgb.data, rgb.shape[1], rgb.shape[0], rgb.shape[1] * 3, QImage.Format.Format_RGB888)
+        item = QGraphicsPixmapItem(QPixmap.fromImage(image.copy()))
+        item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        fw, fh = fov_um
+        item.setPos(center[0] - fw / 2, center[1] - fh / 2)
+        item.setTransform(QTransform.fromScale(fw / rgb.shape[1], fh / rgb.shape[0]))
+        item.setZValue(-5)  # above the cycle mosaic, below regions and tiles
+        self._scene.addItem(item)
+        self._preview_items.append(item)
+
+    def clear_preview(self) -> None:
+        for item in self._preview_items:
+            self._scene.removeItem(item)
+        self._preview_items = []
+
+    @property
+    def preview_tile_count(self) -> int:
+        return len(self._preview_items)
 
     def fit(self, rect: QRectF | None = None) -> None:
         target = rect if rect is not None and rect.isValid() else self._scene.sceneRect()

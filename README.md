@@ -182,3 +182,7 @@ fetches only the arm64 test adapters (DemoCamera etc.), which is all this needs;
 an x86_64 `/Applications/Micro-Manager*` build cannot be loaded by arm64 Python.
 `tests/test_qt_view.py` needs `.[qt]` and runs headless (`QT_QPA_PLATFORM=offscreen`)
 with a plain image view; ndv/vispy needs a real OpenGL display.
+
+CI (`.github/workflows/tests.yml`) runs the suite on pushes to `main` and on pull
+requests: Ubuntu (Python 3.11, 3.13) and macOS (3.13), Qt offscreen. The
+Micro-Manager demo tests are skipped there.
