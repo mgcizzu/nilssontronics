@@ -33,7 +33,7 @@ See README.md for the architecture, data layout and configuration.
 ## Commands
 ```bash
 pip install -e ".[hardware,qt,test]"
-python3 -m pytest                              # 73 tests, no display needed
+python3 -m pytest                              # 80 tests, no display needed
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # pymmcore-plus (hardware section of config)
 python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv for plain image view)
@@ -44,8 +44,9 @@ python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv f
    overview canvas (draw rectangle/polygon, drag "Move ROI set", double-click stage move,
    focus-point click, mosaic underlay), focus points, live/snap via ndv, MMCore device
    docks. All setup device calls run on `DeviceWorker` (never the GUI thread), drained
-   before the engine starts. Missing vs Tk: guided "Refocus all", "Align selected F →
-   stage", spiral preview, recipes, flat-field UI, admin dialog.
+   before the engine starts. Guided "Refocus all" and "Align selected F → stage" read the
+   position through the worker queue. Missing vs Tk: spiral preview, recipes, flat-field
+   UI, admin dialog.
    Never use pymmcore-widgets StageWidget: it bypasses backend stage-limit checks.
 2. Agree output file naming/format with the downstream pipeline, then replace `.tstack`.
 3. Before any real-hardware run: calibrate turret positions, pixel sizes, camera

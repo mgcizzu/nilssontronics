@@ -231,9 +231,32 @@ class ScanWindow(QMainWindow):
         self.focus_list = ItemList(describe_focus)
         self.focus_list.add_button("Capture here", self._capture_focus_here)
         self.focus_list.add_button("Go to", self._goto_focus)
-        self.focus_list.add_button("Set Z here", self._set_focus_z_here)
+        self.set_z_button = self.focus_list.add_button("Set Z here", self._set_focus_z_here)
+        self.focus_list.remove_button.clicked.connect(lambda: self.stop_refocus("Refocus stopped"))
+        self.refocus_button = QPushButton("Refocus all")
+        self.refocus_button.setToolTip(
+            "Visit every focus point in order: focus in Live, then Accept Z to store it and move on"
+        )
+        self.refocus_button.clicked.connect(self._toggle_refocus)
+        self.align_button = QPushButton("Align selected F → stage")
+        self.align_button.setToolTip(
+            "Centre the selected point's landmark in Live, then press: the whole ROI set "
+            "moves so that point sits at the current stage XY (Z is kept)"
+        )
+        self.align_button.clicked.connect(self._align_selected_focus_to_stage)
+        cycle_row = QHBoxLayout()
+        cycle_row.addWidget(self.refocus_button)
+        cycle_row.addWidget(self.align_button)
+        self.refocus_label = QLabel()
+        self.refocus_label.setWordWrap(True)
+        self.refocus_label.setStyleSheet("color: #b5442c; font-weight: 600;")
+        self.refocus_label.hide()
         focus_layout.addWidget(self.focus_list)
+        focus_layout.addLayout(cycle_row)
+        focus_layout.addWidget(self.refocus_label)
         layout.addWidget(focus)
+        self.refocus_index: int | None = None
+        self._accept_pending = False
 
         # Z
         z_group = QGroupBox("Z")
@@ -347,7 +370,15 @@ class ScanWindow(QMainWindow):
         self.overview_hint.setStyleSheet("color: #888;")
         overview_layout.addLayout(toolbar)
         overview_layout.addWidget(self.overview, 1)
-        overview_layout.addWidget(self.overview_hint)
+        # Accept button under the canvas, so a refocus walk never needs the setup panel.
+        self.overview_accept_button = QPushButton("Accept Z ▶")
+        self.overview_accept_button.setStyleSheet("font-weight: 600;")
+        self.overview_accept_button.clicked.connect(self._set_focus_z_here)
+        self.overview_accept_button.hide()
+        hint_row = QHBoxLayout()
+        hint_row.addWidget(self.overview_hint, 1)
+        hint_row.addWidget(self.overview_accept_button)
+        overview_layout.addLayout(hint_row)
 
         self.overview.region_drawn.connect(self._region_drawn)
         self.overview.stage_move_requested.connect(
@@ -549,6 +580,8 @@ class ScanWindow(QMainWindow):
         if not self.mode_buttons[self.overview.mode].isEnabled():
             self.set_overview_mode("navigate")
         self.focus_list.set_locked(busy)
+        self.refocus_button.setEnabled(not busy)
+        self.align_button.setEnabled(not busy)
         self.start_button.setEnabled(not busy)
         self.pause_button.setEnabled(busy)
         self.abort_button.setEnabled(busy)
@@ -717,6 +750,9 @@ class ScanWindow(QMainWindow):
         self.overview_hint.setText(f"{region.shape.capitalize()} region added")
 
     def _overview_focus_clicked(self, x_um: float, y_um: float, index: int) -> None:
+        if self.refocus_index is not None and index >= 0:
+            self._refocus_goto(index)
+            return
         if index >= 0:
             self.focus_list.list.setCurrentRow(index)
             self._goto_focus()
@@ -759,9 +795,28 @@ class ScanWindow(QMainWindow):
         self._move_set_finished()
         self.overview_hint.setText("Move cancelled")
 
+    def with_fresh_position(self, callback) -> None:
+        """Run ``callback(position)`` after every queued stage move has finished.
+
+        The cached position can lag behind a jog that is still queued; reading it
+        through the worker queue guarantees the value the operator just focused at.
+        """
+
+        if self.controller.busy:
+            return
+        self.device.submit(
+            lambda: self.backend.position,
+            on_done=callback,
+            on_error=lambda exc: self.warn("Could not read the stage position", str(exc)),
+        )
+
     def _capture_focus_here(self) -> None:
-        p = self.stage_position
-        self.focus_list.append(FocusPoint(p.x_um, p.y_um, p.z_um))
+        def capture(p) -> None:
+            self.focus_list.append(FocusPoint(p.x_um, p.y_um, p.z_um))
+            self.focus_list.list.setCurrentRow(len(self.focus_list.items) - 1)
+            self.overview_hint.setText(f"Captured F{len(self.focus_list.items)} at Z {p.z_um:g} µm")
+
+        self.with_fresh_position(capture)
 
     def _goto_focus(self) -> None:
         index = self.focus_list.selected_index()
@@ -776,15 +831,95 @@ class ScanWindow(QMainWindow):
         self.device_move(go)
 
     def _set_focus_z_here(self) -> None:
-        """Manual refocus: store the live Z on the selected focus point."""
+        """Manual refocus: store the live Z on the selected point (Accept Z during Refocus all)."""
 
+        index = self.refocus_index if self.refocus_index is not None else self.focus_list.selected_index()
+        if index is None:
+            self.inform("Select a focus point", "Select a focus point in the list or on the overview first.")
+            return
+        if self._accept_pending:  # one accept per point, even on a double click
+            return
+        self._accept_pending = True
+
+        def accept(p) -> None:
+            self._accept_pending = False
+            if index >= len(self.focus_list.items):
+                return
+            items = list(self.focus_list.items)
+            items[index] = replace(items[index], z_um=p.z_um)
+            self.focus_list.set_items(items)
+            self.focus_list.list.setCurrentRow(index)
+            self.overview_hint.setText(f"F{index + 1} set to Z {p.z_um:g} µm")
+            if self.refocus_index == index:
+                if index + 1 < len(items):
+                    self._refocus_goto(index + 1)
+                else:
+                    self.stop_refocus(f"All {len(items)} focus points refocused for this cycle")
+
+        self.with_fresh_position(accept)
+
+    # -------------------------------------------------- refocus & alignment --
+    def _toggle_refocus(self) -> None:
+        if self.refocus_index is not None:
+            self.stop_refocus("Refocus stopped")
+            return
+        if self.controller.busy:
+            return
+        if not self.focus_list.items:
+            self.inform("No focus points", "Capture or load focus points first.")
+            return
+        self.refocus_button.setText("Stop refocus")
+        self.set_z_button.setText("Accept Z ▶")
+        self.set_overview_mode("focus")
+        self._refocus_goto(0)
+
+    def _refocus_goto(self, index: int) -> None:
+        self.refocus_index = index
+        self.focus_list.list.setCurrentRow(index)
+        self._goto_focus()
+        if not self.live_button.isChecked():
+            self.live_button.setChecked(True)
+        self.tabs.setCurrentIndex(0)
+        text = f"Refocus F{index + 1} of {len(self.focus_list.items)}: focus in Live, then Accept Z ▶"
+        self.refocus_label.setText(text)
+        self.refocus_label.show()
+        self.overview_accept_button.show()
+        self.overview_hint.setText(text)
+
+    def stop_refocus(self, message: str | None = None) -> None:
+        if self.refocus_index is None:
+            return
+        self.refocus_index = None
+        self.refocus_button.setText("Refocus all")
+        self.set_z_button.setText("Set Z here")
+        self.refocus_label.hide()
+        self.overview_accept_button.hide()
+        if message:
+            self.overview_hint.setText(message)
+
+    def _align_selected_focus_to_stage(self) -> None:
         index = self.focus_list.selected_index()
         if index is None:
+            self.inform(
+                "Select a focus point",
+                "Select a focus point, move the stage so the same landmark is centred in Live, "
+                "then press Align. The whole ROI set moves so that point sits at the current "
+                "stage position (Z is kept).",
+            )
             return
-        items = list(self.focus_list.items)
-        items[index] = replace(items[index], z_um=self.stage_position.z_um)
-        self.focus_list.set_items(items)
-        self.focus_list.list.setCurrentRow(index)
+
+        def align(p) -> None:
+            if index >= len(self.focus_list.items):
+                return
+            point = self.focus_list.items[index]
+            dx, dy = p.x_um - point.x_um, p.y_um - point.y_um
+            self.shift_roi_set(dx, dy)
+            self.focus_list.list.setCurrentRow(index)
+            self.overview_hint.setText(
+                f"ROI set moved by ΔX {dx:+.1f} ΔY {dy:+.1f} µm to align F{index + 1}"
+            )
+
+        self.with_fresh_position(align)
 
     # ----------------------------------------------------- stage / camera --
     def device_move(self, function, *args) -> bool:
@@ -852,6 +987,7 @@ class ScanWindow(QMainWindow):
             "New experiment", "Close the current experiment? Its data stays on disk."
         ):
             return
+        self.stop_refocus()
         self.controller.new_experiment()
         self._refresh()
 
@@ -875,6 +1011,7 @@ class ScanWindow(QMainWindow):
         return experiment
 
     def _load_experiment_into_view(self, experiment: Experiment) -> None:
+        self.stop_refocus()
         self._loading = True
         try:
             last = experiment.cycles[-1] if experiment.cycles else None
@@ -906,6 +1043,7 @@ class ScanWindow(QMainWindow):
 
     # -------------------------------------------------------------- running --
     def _start_cycle(self) -> None:
+        self.stop_refocus()
         self.live_button.setChecked(False)
         try:
             plan = self.build_plan()
@@ -955,6 +1093,7 @@ class ScanWindow(QMainWindow):
             "The original channels, exposures, powers and focus positions are reused.",
         ):
             return
+        self.stop_refocus()
         if not self._hand_backend_to_engine():
             return
         try:
@@ -1024,7 +1163,7 @@ class ScanWindow(QMainWindow):
             self.inform(
                 "Cycle complete",
                 f"Cycle {cycle} finished: {status.tiles_done:,} tiles.\n\nData:\n{folder}\n\n"
-                "Strip/restain, then shift the ROI set and refocus before the next cycle.",
+                "Strip/restain, then Align selected F → stage (or Move ROI set) and Refocus all before the next cycle.",
             )
         elif status.state == "aborted":
             self.progress_label.setText(f"Stopped • {status.tiles_done}/{status.tiles_total} tiles saved • resumable")
