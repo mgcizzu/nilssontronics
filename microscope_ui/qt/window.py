@@ -72,6 +72,7 @@ from .overview import OverviewCanvas, bounded_set_translation
 from .theme import THEME_MODES, ToggleSwitch, apply_theme, icon, set_dark_title_bar
 from .widgets import (
     ChannelTable,
+    FlowLayout,
     FrameView,
     ItemList,
     RectangleDialog,
@@ -83,6 +84,9 @@ from .widgets import (
 
 POSITION_REFRESH_MS = 1000
 CLOSE_TIMEOUT_S = 30.0
+# Layout: fits a 1280 px laptop at 125 % scaling (~1024 logical px).
+RAIL_WIDE, RAIL_COMPACT, RAIL_COMPACT_BELOW = 200, 56, 1360
+SETUP_MIN_WIDTH, REVIEW_MIN_WIDTH = 320, 220
 DEVICE_DRAIN_TIMEOUT_S = 30.0
 POLL_INTERVAL_MS = 150
 MOSAIC_REFRESH_S = 0.3
@@ -133,6 +137,10 @@ class ScanWindow(QMainWindow):
         self._build_ui(use_ndv)
         self._build_device_pages()
         self.apply_theme_mode(self.theme_mode())
+        # Follow Windows/macOS when the user switches dark/light while we run.
+        hints = QApplication.instance().styleHints()
+        if hasattr(hints, "colorSchemeChanged"):  # Qt >= 6.5
+            hints.colorSchemeChanged.connect(self._system_scheme_changed)
 
         self.device.frame_ready.connect(self.frame_view.show_frame)
         self.device.position_changed.connect(self._position_changed)
@@ -171,6 +179,7 @@ class ScanWindow(QMainWindow):
         splitter.addWidget(self._build_review_panel())
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([460, 720, 320])
+        self.splitter = splitter
         layout.addWidget(splitter, 1)
 
         self.devices_page = self._page("Devices")
@@ -200,15 +209,20 @@ class ScanWindow(QMainWindow):
         return page
 
     def _build_rail(self) -> QWidget:
-        rail = QWidget()
+        rail = _Rail()
         rail.setObjectName("rail")
-        rail.setFixedWidth(200)
+        # Minimum is always the compact width, so the rail never stops the window from
+        # shrinking; resizeEvent then switches to icons-only below RAIL_COMPACT_BELOW.
+        rail.setMinimumWidth(RAIL_COMPACT)
+        rail.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        self.rail = rail
         rail.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(rail)
         layout.setContentsMargins(0, 14, 0, 12)
         layout.setSpacing(2)
         title = QLabel("Scan Console")
         title.setObjectName("railTitle")
+        self.rail_title = title
         layout.addWidget(title)
         self.nav_group = QButtonGroup(self)
         self.nav_buttons: dict[str, QToolButton] = {}
@@ -225,6 +239,8 @@ class ScanWindow(QMainWindow):
                 continue
             button = QToolButton()
             button.setText(f"  {text}")
+            button.setToolTip(text)
+            button.setProperty("label", text)
             button.setCheckable(True)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -235,6 +251,31 @@ class ScanWindow(QMainWindow):
             layout.addWidget(button)
         self.nav_buttons["acquire"].setChecked(True)
         return rail
+
+    def set_rail_compact(self, compact: bool) -> None:
+        """Icons only (narrow windows) or icons with labels."""
+
+        if getattr(self, "_rail_compact", None) == compact:
+            return
+        self._rail_compact = compact
+        self.rail.preferred_width = RAIL_COMPACT if compact else RAIL_WIDE
+        self.rail.updateGeometry()
+        # Narrow windows: side panels at their minimum so the viewer keeps a usable width.
+        total = sum(self.splitter.sizes()) or 1
+        if compact:
+            self.splitter.setSizes([SETUP_MIN_WIDTH, max(1, total - SETUP_MIN_WIDTH - REVIEW_MIN_WIDTH), REVIEW_MIN_WIDTH])
+        else:
+            self.splitter.setSizes([round(total * 460 / 1500), round(total * 720 / 1500), round(total * 320 / 1500)])
+        self.rail_title.setVisible(not compact)
+        for button in self.nav_buttons.values():
+            button.setToolButtonStyle(
+                Qt.ToolButtonStyle.ToolButtonIconOnly if compact
+                else Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+            )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self.set_rail_compact(event.size().width() < RAIL_COMPACT_BELOW)
 
     def show_page(self, name: str) -> None:
         if name == "config":
@@ -277,6 +318,10 @@ class ScanWindow(QMainWindow):
         mode = str(self.settings.value("theme", "system"))
         return mode if mode in THEME_MODES else "system"
 
+    def _system_scheme_changed(self, *_args) -> None:
+        if self.theme_mode() == "system":
+            self.apply_theme_mode("system")
+
     def apply_theme_mode(self, mode: str, remember: bool = False) -> None:
         palette = apply_theme(QApplication.instance(), mode)
         self.palette_tokens = palette
@@ -303,11 +348,16 @@ class ScanWindow(QMainWindow):
         self.position_label.setProperty("secondary", True)
         self.experiment_label = QLabel()
         self.experiment_label.setProperty("secondary", True)
+        # The experiment text takes the free header space and may be cut on narrow
+        # windows (full text in its tooltip) instead of widening the window.
+        self.experiment_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.experiment_label.setMinimumWidth(40)
+        self.experiment_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        title.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         row.addWidget(title)
         row.addSpacing(10)
         row.addWidget(self.mode_label)
-        row.addStretch(1)
-        row.addWidget(self.experiment_label)
+        row.addWidget(self.experiment_label, 1)
         row.addSpacing(16)
         row.addWidget(self.position_label)
         return header
@@ -499,7 +549,7 @@ class ScanWindow(QMainWindow):
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(440)
+        scroll.setMinimumWidth(SETUP_MIN_WIDTH)
         return scroll
 
     def _build_viewer(self, use_ndv: bool) -> QWidget:
@@ -512,7 +562,8 @@ class ScanWindow(QMainWindow):
         overview_tab = QWidget()
         overview_layout = QVBoxLayout(overview_tab)
         overview_layout.setContentsMargins(0, 4, 0, 0)
-        toolbar = QHBoxLayout()
+        toolbar_widget = QWidget()
+        toolbar = FlowLayout(toolbar_widget)
         self.mode_group = QButtonGroup(self)
         self.mode_buttons: dict[str, QToolButton] = {}
         for mode, label, tip in OVERVIEW_MODES:
@@ -533,12 +584,12 @@ class ScanWindow(QMainWindow):
         self.mosaic_mode_box.setToolTip("Cycle mosaic display")
         self.mosaic_mode_box.currentIndexChanged.connect(lambda: self._render_mosaic(force=True))
         toolbar.addWidget(fit)
-        toolbar.addStretch(1)
         toolbar.addWidget(self.mosaic_mode_box)
         self.overview = OverviewCanvas(self.config_data.stage_limits)
         self.overview_hint = QLabel(OVERVIEW_HINTS["navigate"])
         self.overview_hint.setProperty("secondary", True)
-        overview_layout.addLayout(toolbar)
+        self.overview_hint.setWordWrap(True)  # long hints wrap instead of widening the window
+        overview_layout.addWidget(toolbar_widget)
         overview_layout.addWidget(self.overview, 1)
         # Accept button under the canvas, so a refocus walk never needs the setup panel.
         self.overview_accept_button = QPushButton("Accept Z ▶")
@@ -566,7 +617,10 @@ class ScanWindow(QMainWindow):
         self.tabs.addTab(self.frame_view, "Camera")
         layout.addWidget(self.tabs, 1)
 
-        controls = QHBoxLayout()
+        controls_widget = QWidget()
+        controls = FlowLayout(controls_widget, spacing=12)  # jog pad wraps below on narrow windows
+        camera_widget = QWidget()
+        camera_bar = FlowLayout(camera_widget)
         self.live_button = QPushButton("Live")
         self.live_button.setCheckable(True)
         self.live_button.toggled.connect(self._toggle_live)
@@ -584,13 +638,11 @@ class ScanWindow(QMainWindow):
             "(over the regions if any, else a 5×5 grid). Current Z only, no Z moves."
         )
         self.preview_button.toggled.connect(self._toggle_spiral_preview)
-        controls.addWidget(self.live_button)
-        controls.addWidget(self.snap_button)
-        controls.addWidget(self.live_channel_box)
-        controls.addWidget(self.preview_button)
-        controls.addStretch(1)
+        for widget in (self.live_button, self.snap_button, self.live_channel_box, self.preview_button):
+            camera_bar.addWidget(widget)
+        controls.addWidget(camera_widget)
         controls.addWidget(self.jog)
-        layout.addLayout(controls)
+        layout.addWidget(controls_widget)
         return wrapper
 
     def _build_review_panel(self) -> QWidget:
@@ -628,7 +680,7 @@ class ScanWindow(QMainWindow):
         layout.addWidget(self.progress)
         layout.addWidget(self.progress_label)
         layout.addStretch(1)
-        panel.setMinimumWidth(280)
+        panel.setMinimumWidth(REVIEW_MIN_WIDTH)
         return panel
 
     def _build_device_pages(self) -> None:
@@ -880,10 +932,12 @@ class ScanWindow(QMainWindow):
         experiment = self.controller.experiment
         if experiment is None:
             self.experiment_label.setText("No experiment — cycle 1 creates one")
+            self.experiment_label.setToolTip(self.experiment_label.text())
         else:
             self.experiment_label.setText(
                 f"{experiment.project} / {experiment.sample} • {len(experiment.cycles)} cycle(s)"
             )
+            self.experiment_label.setToolTip(self.experiment_label.text())
 
     # --------------------------------------------------------------- inputs --
     def _choose_output(self) -> None:
@@ -1681,6 +1735,17 @@ class ScanWindow(QMainWindow):
         if self.controller.engine is not None and not self.poll_timer.isActive():
             self.poll_timer.start()
         event.ignore()
+
+
+class _Rail(QWidget):
+    """Navigation rail: prefers its mode's width but may be squeezed to the compact width."""
+
+    preferred_width = RAIL_WIDE
+
+    def sizeHint(self):  # noqa: N802 - Qt API
+        hint = super().sizeHint()
+        hint.setWidth(self.preferred_width)
+        return hint
 
 
 def main(argv: list[str] | None = None) -> None:

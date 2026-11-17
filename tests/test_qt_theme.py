@@ -68,6 +68,34 @@ def test_options_are_toggle_switches_that_still_behave_as_checkboxes(window, qtb
     assert window.build_plan().options.flat_field
 
 
+def test_window_fits_a_laptop_screen(window, qtbot):
+    window.show()
+    window.resize(1024, 700)  # 1280 px at 125 % scaling
+    qtbot.waitUntil(lambda: window.width() == 1024, timeout=2000)
+    assert window.minimumSizeHint().width() <= 1024
+    qtbot.waitUntil(lambda: window.rail.width() == 56, timeout=2000)  # icons only
+    assert not window.rail_title.isVisible()
+    window.resize(1600, 900)
+    qtbot.waitUntil(lambda: window.rail.width() == 200, timeout=2000)
+    assert window.rail_title.isVisible()
+
+
+def test_system_theme_changes_are_followed_only_in_system_mode(window):
+    from unittest import mock
+
+    window.apply_theme_mode("system", remember=True)
+    with mock.patch("microscope_ui.qt.theme.system_prefers_dark", return_value=True):
+        window._system_scheme_changed()
+        assert current_palette().dark
+    with mock.patch("microscope_ui.qt.theme.system_prefers_dark", return_value=False):
+        window._system_scheme_changed()
+        assert not current_palette().dark
+    window.apply_theme_mode("dark", remember=True)  # a fixed choice wins over the system
+    with mock.patch("microscope_ui.qt.theme.system_prefers_dark", return_value=False):
+        window._system_scheme_changed()
+        assert current_palette().dark
+
+
 def test_stylesheet_has_no_unfilled_placeholders():
     css = stylesheet(DARK, {"chevron-down": "a.png", "chevron-up": "b.png", "check": "c.png"})
     assert "{" in css and "{p." not in css and "None" not in css

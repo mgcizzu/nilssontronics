@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Callable
 
 import numpy as np
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import QPoint, QRect, QSize, Qt, Signal
 from qtpy.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from qtpy.QtWidgets import (
     QAbstractItemView,
@@ -17,6 +17,7 @@ from qtpy.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QLayout,
     QLabel,
     QListWidget,
     QPushButton,
@@ -265,6 +266,76 @@ class FrameView(QWidget):
             return
         assert self._label is not None
         self._label.setPixmap(_pixmap_from_array(frame, self._label.size()))
+
+
+class FlowLayout(QLayout):
+    """Lays widgets out left to right and wraps to a new row when the width runs out.
+
+    Used for button rows so narrow windows get a second row instead of a hidden
+    overflow menu (and no platform-themed overflow icon).
+    """
+
+    def __init__(self, parent: QWidget | None = None, spacing: int = 6) -> None:
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(spacing)
+
+    def addItem(self, item) -> None:  # noqa: N802 - Qt API
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):  # noqa: N802
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):  # noqa: N802
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: N802
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._arrange(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect: QRect) -> None:  # noqa: N802
+        super().setGeometry(rect)
+        self._arrange(rect, apply=True)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        width = sum(i.sizeHint().width() for i in self._items) + self.spacing() * max(0, len(self._items) - 1)
+        height = max((i.sizeHint().height() for i in self._items), default=0)
+        return QSize(width, height)
+
+    def minimumSize(self) -> QSize:  # noqa: N802
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        return size
+
+    def _arrange(self, rect: QRect, apply: bool) -> int:
+        x, y, row_height = rect.x(), rect.y(), 0
+        for item in self._items:
+            if item.widget() is not None and item.widget().isHidden():
+                continue
+            hint = item.sizeHint()
+            # Never wider than the row; a nested flow then wraps inside its own box.
+            width = min(hint.width(), max(rect.width(), item.minimumSize().width()))
+            height = item.heightForWidth(width) if item.hasHeightForWidth() else hint.height()
+            height = max(height, hint.height() if width == hint.width() else 0)
+            if x > rect.x() and x + width > rect.right() + 1:
+                x = rect.x()
+                y += row_height + self.spacing()
+                row_height = 0
+            if apply:
+                item.setGeometry(QRect(QPoint(x, y), QSize(width, height)))
+            x += width + self.spacing()
+            row_height = max(row_height, height)
+        return y + row_height - rect.y()
 
 
 def _swatch(color: str, size: int = 10) -> QIcon:

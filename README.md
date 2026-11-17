@@ -14,7 +14,7 @@ Python 3.11+ with Tk and NumPy.
 pip install -e .                 # simulator only
 pip install -e ".[hardware]"     # + pymmcore-plus for a real microscope
 pip install -e ".[flatfield]"    # + BaSiC (basicpy) for flat-field estimation
-pip install -e ".[qt]"           # + Qt view (PyQt6, ndv, pymmcore-widgets)
+pip install -e ".[qt]"           # + Qt view (PySide6, ndv, pymmcore-widgets)
 
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # Micro-Manager (see below)
@@ -221,6 +221,9 @@ Micro-Manager demo tests are skipped there.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE). The Qt view's Windows 11 / Fluent styling is
-implemented in `microscope_ui/qt/theme.py` without third-party theme packages,
-so the project has no copyleft dependencies.
+MIT — see [LICENSE](LICENSE). Third-party dependencies keep their own licences.
+The Qt view uses **PySide6** (Qt for Python, LGPLv3), which an MIT application may
+use as an ordinary dependency; PyQt6 (GPLv3/commercial) is deliberately not used.
+The other runtime dependencies (numpy, tifffile, pymmcore-plus, pymmcore-widgets,
+ndv, superqt, qtpy) are BSD/MIT-style. The Windows 11 / Fluent styling lives in
+`microscope_ui/qt/theme.py` and needs no third-party theme package.

@@ -23,9 +23,10 @@ See README.md for the architecture, data layout and configuration.
 - **Optional features stay optional:** serpentine order, consistent stage approach,
   shutter closed during moves (default on), flat-field profiles (non-destructive).
 
-- **Licence: MIT.** No copyleft (GPL/AGPL) dependencies without Marco's OK. The Qt
-  view's Windows 11 / Fluent look is our own (`qt/theme.py`: tokens → stylesheet,
-  toggle switch, line icons); PyQt-Fluent-Widgets was rejected because it is GPL.
+- **Licence: MIT.** No GPL/AGPL dependencies without Marco's OK. Qt binding is
+  **PySide6 (LGPLv3)**, never PyQt6 (GPL); code imports Qt only via `qtpy`. The
+  Windows 11 / Fluent look is our own (`qt/theme.py`: tokens → stylesheet, toggle
+  switch, line icons); PyQt-Fluent-Widgets was rejected because it is GPL.
 
 ## Architecture rules
 - `app.py` (Tk view) talks only to `ScanController` (`controller.py`); it never
@@ -39,7 +40,7 @@ See README.md for the architecture, data layout and configuration.
 ## Commands
 ```bash
 pip install -e ".[hardware,qt,test]"
-python3 -m pytest                              # 124 tests, no display needed
+python3 -m pytest                              # 126 tests, no display needed
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # pymmcore-plus (hardware section of config)
 python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv for plain image view)
