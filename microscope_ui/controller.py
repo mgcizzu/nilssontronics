@@ -385,12 +385,21 @@ class ScanController:
             self.mosaic.close()
             self.mosaic = None
 
-    def close(self) -> None:
+    def close(self, timeout: float = 30.0) -> bool:
+        """Stop any acquisition, then release storage and hardware.
+
+        Returns False, and touches nothing, while the engine thread (and so its
+        SSD writer) is still running: closing storage under an in-flight write
+        would corrupt it. The caller should keep the program open and retry.
+        """
+
         if self.engine is not None and not self.engine.status().finished:
             self.engine.abort()
-            self.engine.join(10)
+        if self.engine is not None and not self.engine.join(timeout):
+            return False
         self._close_cycle_storage()
         self.backend.close()
+        return True
 
 
 def _now() -> str:

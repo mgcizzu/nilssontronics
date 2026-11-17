@@ -81,6 +81,7 @@ from .widgets import (
 )
 
 POSITION_REFRESH_MS = 1000
+CLOSE_TIMEOUT_S = 30.0
 POLL_INTERVAL_MS = 150
 MOSAIC_REFRESH_S = 0.3
 Z_MODES = (("Single plane (current Z)", "single"), ("Focus map", "focus_map"), ("Z-stack", "stack"))
@@ -1633,10 +1634,22 @@ class ScanWindow(QMainWindow):
         if self.controller.busy and not self.confirm("Quit", "A cycle is running. Abort it and quit?"):
             event.ignore()
             return
+        self.live_button.setChecked(False)
+        self.stop_spiral_preview()
+        self.device.stop_and_drain()
+        if not self.controller.close(timeout=CLOSE_TIMEOUT_S):
+            self.warn(
+                "Still saving",
+                "The acquisition is stopping but the SSD writer is still saving its current "
+                "frame. The program stays open so no data is lost; try again in a moment.",
+            )
+            if not self.poll_timer.isActive():
+                self.poll_timer.start()
+            event.ignore()
+            return
         self.position_timer.stop()
         self.poll_timer.stop()
         self.device.shutdown()
-        self.controller.close()
         event.accept()
 
 

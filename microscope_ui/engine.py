@@ -213,11 +213,16 @@ class AcquisitionEngine:
             self._set(message="Saving the cycle record")
             try:
                 self._on_finished(final)
-            except Exception as exc:  # the data is on disk; report the bookkeeping failure
+            except Exception as exc:
+                # The images are on disk but experiment.json still says "running":
+                # never show "complete". The cycle stays resumable; resume skips the
+                # saved tiles and records it again.
+                reason = f"The cycle record could not be saved: {exc}"
                 final = replace(
                     final,
-                    error=(final.error + "; " if final.error else "")
-                    + f"Could not save the cycle record: {exc}",
+                    state="failed",
+                    error=(final.error + "; " if final.error else "") + reason,
+                    message=f"{reason}. Saved tiles are kept — fix the problem, then resume.",
                 )
         with self._lock:
             self._status = final

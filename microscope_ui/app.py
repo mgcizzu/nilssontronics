@@ -979,7 +979,16 @@ class ScanConsole(tk.Tk):
             self.progress_job = None
         self._stop_spiral_preview(clear_overlay=True)
         self._set_live(False)
-        self.controller.close()
+        if not self.controller.close(timeout=30.0):
+            messagebox.showwarning(
+                "Still saving",
+                "The acquisition is stopping but the SSD writer is still saving its current "
+                "frame. The program stays open so no data is lost; try again in a moment.",
+                parent=self,
+            )
+            if self.progress_job is None and self.controller.engine is not None:
+                self._poll_scan()
+            return
         self.destroy()
 
     def _safe_move(self, action, *args) -> bool:

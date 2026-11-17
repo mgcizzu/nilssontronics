@@ -207,6 +207,16 @@ def test_live_restores_per_frame_shutter_after_a_cycle(qtbot, window):
     assert backend.dark_snaps == 0
 
 
+def test_window_stays_open_while_storage_cannot_be_closed(qtbot, window):
+    window.show()
+    with mock.patch.object(window.controller, "close", return_value=False):
+        assert not window.close()
+    assert window.isVisible()
+    assert window.messages[-1][1] == "Still saving"
+    with mock.patch.object(window.controller, "close", return_value=True):
+        assert window.close()
+
+
 def test_abort_then_resume(qtbot, window):
     window.backend.delay = 0.02
     window.region_list.append(ScanRegion(-1500, -1000, 3000, 2000))

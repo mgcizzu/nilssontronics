@@ -197,13 +197,24 @@ class Experiment:
                 f"Cycle {unfinished.number} is not complete; resume or finish it first"
             )
         self.cycles.append(record)
-        self.save()
+        try:
+            self.save()
+        except BaseException:
+            self.cycles.pop()  # memory never runs ahead of experiment.json
+            raise
         return record
 
     def update_cycle(self, number: int, **changes) -> CycleRecord:
-        record = replace(self.cycles[number - 1], **changes)
+        """Change a cycle record; the in-memory record changes only if the save succeeds."""
+
+        previous = self.cycles[number - 1]
+        record = replace(previous, **changes)
         self.cycles[number - 1] = record
-        self.save()
+        try:
+            self.save()
+        except BaseException:
+            self.cycles[number - 1] = previous
+            raise
         return record
 
     def resumable_cycle(self) -> CycleRecord | None:
