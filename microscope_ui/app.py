@@ -744,6 +744,10 @@ class ScanConsole(tk.Tk):
         self._stop_spiral_preview(clear_overlay=True)
         objective = self._selected_objective()
         previous = self.config_data.objective(self.backend.current_objective_id)
+        if self.controller.busy:
+            self.objective_var.set(previous.name)
+            self.progress_text_var.set("The objective cannot change while an acquisition runs")
+            return
         if objective.id == previous.id:
             return
         if objective.immersion != previous.immersion:
@@ -979,8 +983,16 @@ class ScanConsole(tk.Tk):
         self.destroy()
 
     def _safe_move(self, action, *args) -> bool:
-        """Run a stage command, reporting refused/failed moves instead of raising."""
+        """Run a stage command, reporting refused/failed moves instead of raising.
 
+        Refused while a cycle runs: the engine owns the stage, and a move during
+        an exposure would put the image at a different place than its tile record.
+        """
+
+        if self.controller.busy:
+            self.progress_text_var.set("The stage is in use by the running acquisition")
+            self.bell()
+            return False
         try:
             action(*args)
         except HardwareError as exc:
@@ -1045,6 +1057,8 @@ class ScanConsole(tk.Tk):
     def _acquire_frame(self) -> bool:
         """Snap one real frame with the preview channel's exposure and power."""
 
+        if self.controller.busy:
+            return False
         channel = self._live_channel()
         exposure = self._float_or(self.exposure_vars[channel.id], channel.default_exposure_ms)
         power = self._float_or(self.power_vars[channel.id], channel.default_power_percent)

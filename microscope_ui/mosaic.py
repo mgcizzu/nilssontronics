@@ -529,6 +529,22 @@ def read_tile(cycle_root: Path, tile_index: int) -> tuple[dict, dict[tuple[str, 
     return record, planes
 
 
+def middle_plane(record: dict, channel_id: str) -> int | None:
+    """Z index of the middle plane a finished tile has for ``channel_id`` (None if absent)."""
+
+    z_indices = sorted(int(p["z_index"]) for p in record.get("planes", ()) if p["channel"] == channel_id)
+    return z_indices[len(z_indices) // 2] if z_indices else None
+
+
+def read_plane(cycle_root: Path, record: dict, channel_id: str, z_index: int) -> np.ndarray:
+    """Read one plane of a finished tile (no other planes are loaded)."""
+
+    for plane in record["planes"]:
+        if plane["channel"] == channel_id and int(plane["z_index"]) == int(z_index):
+            return tifffile.imread(Path(cycle_root) / plane["file"])
+    raise KeyError(f"Tile {record.get('tile')} has no plane ({channel_id}, z={z_index})")
+
+
 def write_region_metadata(
     root: Path,
     tiles: Sequence[Tile],

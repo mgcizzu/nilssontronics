@@ -5,7 +5,7 @@ import shutil
 from collections.abc import Iterator
 
 from .focus import FocusSurface
-from .geometry import point_in_polygon, points_are_non_collinear, rectangle_intersects_polygon
+from .geometry import point_in_polygon, rectangle_intersects_polygon
 from .models import (
     TILE_ORDERS,
     AcquisitionEstimate,
@@ -259,14 +259,14 @@ def validate_plan(
     if plan.z.mode == "focus_map":
         if len(plan.focus_points) < 3:
             problems.append("Surface following needs at least three focus points.")
-        elif not points_are_non_collinear(
-            tuple((point.x_um, point.y_um) for point in plan.focus_points)
-        ):
-            problems.append("Surface-following focus points must not all lie on one line.")
-        elif tiles:
-            surface = focus_surface_for_plan(plan)
-            low, high = surface.z_range(tile.xy for tile in tiles)
-            if low < safe_min or high > safe_max:
+        else:
+            try:
+                surface = focus_surface_for_plan(plan)
+            except ValueError as exc:  # e.g. points (almost) on one line: actionable message
+                problems.append(str(exc))
+                surface = None
+            low, high = surface.z_range(tile.xy for tile in tiles) if surface and tiles else (0.0, 0.0)
+            if surface is not None and tiles and (low < safe_min or high > safe_max):
                 problems.append(
                     f"The focus surface reaches Z {low:.1f}–{high:.1f} µm, outside the "
                     f"safe range {safe_min:.0f}–{safe_max:.0f} µm for {objective.name}."
