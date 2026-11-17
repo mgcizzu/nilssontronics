@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from unittest import mock
 
 import pytest
@@ -11,6 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("qtpy")
 pytest.importorskip("pytestqt")
 
+from qtpy.QtCore import QTimer  # noqa: E402
+
 from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
 from microscope_ui.models import ScanRegion  # noqa: E402
@@ -18,10 +21,18 @@ from microscope_ui.mosaic import read_tile_stack  # noqa: E402
 from microscope_ui.qt.window import ScanWindow  # noqa: E402
 
 
+class SlowSimulator(SimulatedMicroscope):
+    delay = 0.0
+
+    def snap(self):
+        time.sleep(self.delay)
+        return super().snap()
+
+
 @pytest.fixture
 def window(qtbot, tmp_path):
     config = load_config()
-    backend = SimulatedMicroscope(config, frame_px=24)
+    backend = SlowSimulator(config, frame_px=24)
     backend.change_objective(config.objective("20x_air"))
     with mock.patch(
         "microscope_ui.planner.shutil.disk_usage", return_value=mock.Mock(free=10 * 1024**4)
@@ -73,26 +84,61 @@ def test_two_cycles_with_xy_shift(qtbot, window):
     assert set(planes) == {("dapi", 0), ("cy5", 0)}
 
 
-def test_snap_and_limit_checked_jog(window):
-    assert window._snap()
+def test_snap_runs_on_device_worker(qtbot, window):
+    with qtbot.waitSignal(window.device.frame_ready, timeout=5000) as blocker:
+        assert window._snap()
+    assert blocker.args[0].shape == (24, 24)
+
+
+def test_jog_is_limit_checked_and_reports_position(qtbot, window):
     limits = window.config_data.stage_limits
-    window.backend.move_xy(limits.x_max_um - 10, 0)
-    window.jog.xy_step.setValue(100)
+    window.device_move(window.backend.move_xy, limits.x_max_um - 10, 0)
+    qtbot.waitUntil(lambda: window.stage_position.x_um == pytest.approx(limits.x_max_um - 10))
+    assert f"X {limits.x_max_um - 10:.1f}" in window.position_label.text()
     window._jog(100, 0, 0)
-    assert window.messages and window.messages[-1][1] == "Stage move refused"
+    qtbot.waitUntil(lambda: bool(window.messages), timeout=5000)
+    assert window.messages[-1][1] == "Stage move refused"
+    assert window.device.stop_and_drain(5)
     assert window.backend.position.x_um == pytest.approx(limits.x_max_um - 10)
 
 
+def test_gui_stays_responsive_during_slow_live(qtbot, window):
+    window.backend.delay = 0.4  # long exposure
+    window.live_button.setChecked(True)
+    qtbot.waitUntil(lambda: window.device.live, timeout=2000)
+    time.sleep(0.05)  # let the worker enter a snap
+    fired = []
+    start = time.monotonic()
+    QTimer.singleShot(10, lambda: fired.append(time.monotonic() - start))
+    qtbot.waitUntil(lambda: bool(fired), timeout=2000)
+    assert fired[0] < 0.2, "GUI event loop blocked by a camera exposure"
+    with qtbot.waitSignal(window.device.frame_ready, timeout=3000):
+        pass
+    window.live_button.setChecked(False)
+    assert window.device.stop_and_drain(5)
+
+
+def test_live_stops_before_cycle_starts(qtbot, window):
+    window.backend.delay = 0.05
+    window.region_list.append(ScanRegion(-300, -200, 600, 400))
+    window.channel_table._checks["dapi"].setChecked(True)
+    window.live_button.setChecked(True)
+    qtbot.waitUntil(lambda: window.device.live, timeout=2000)
+    status = run_cycle(qtbot, window)
+    assert status.state == "complete"
+    assert not window.device.live and not window.live_button.isChecked()
+
+
 def test_abort_then_resume(qtbot, window):
-    window.backend.delay = 0.0
+    window.backend.delay = 0.02
     window.region_list.append(ScanRegion(-1500, -1000, 3000, 2000))
     window.channel_table._checks["dapi"].setChecked(True)
     window.start_button.click()
     assert window.controller.status() is not None, window.messages
+    qtbot.waitUntil(lambda: window.controller.status().tiles_done >= 1, timeout=10000)
     window.controller.abort()
     qtbot.waitUntil(lambda: not window.poll_timer.isActive(), timeout=30000)
-    if window.controller.status().state == "complete":
-        pytest.skip("cycle finished before abort took effect")
+    assert window.controller.status().state == "aborted"
     assert window.resume_button.isEnabled()
     window.resume_button.click()
     qtbot.waitUntil(lambda: not window.poll_timer.isActive(), timeout=30000)

@@ -7,11 +7,12 @@ mosaic. Still missing compared with the Tk view: drawing regions/polygons on
 an overview canvas, drag "Move ROI set", spiral preview, recipes, flat-field
 UI and the admin dialog.
 
-Like the Tk view it only calls :class:`ScanController` for acquisition; direct
-backend calls are limited to setup moves (jog, objective change, live/snap)
-while no cycle is running. pymmcore-widgets' StageWidget is deliberately not
-used: it would drive the core directly and skip the configured stage-limit
-checks in the backend.
+Like the Tk view it only calls :class:`ScanController` for acquisition. Setup
+calls (jog, objective change, go-to, live/snap) run on a :class:`DeviceWorker`
+thread, never on the GUI thread, and only while no cycle is running; the
+worker is drained before the engine takes over the backend. pymmcore-widgets'
+StageWidget is deliberately not used: it would drive the core directly and
+skip the configured stage-limit checks in the backend.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pathlib import Path
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDockWidget,
@@ -41,6 +43,7 @@ from qtpy.QtWidgets import (
     QScrollArea,
     QSplitter,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -58,11 +61,12 @@ from ..models import (
     ZSettings,
 )
 from ..mosaic import DiskBackedMosaic
+from .device_worker import DeviceWorker
+from .overview import OverviewCanvas, bounded_set_translation
 from .widgets import (
     ChannelTable,
     FrameView,
     ItemList,
-    MosaicView,
     RectangleDialog,
     StageJog,
     describe_focus,
@@ -70,11 +74,26 @@ from .widgets import (
     spin,
 )
 
-LIVE_INTERVAL_MS = 100
+POSITION_REFRESH_MS = 1000
 POLL_INTERVAL_MS = 150
 MOSAIC_REFRESH_S = 0.3
 Z_MODES = (("Single plane (current Z)", "single"), ("Focus map", "focus_map"), ("Z-stack", "stack"))
 LAUNCH_ERRORS = (ControllerError, HardwareError, OSError, ValueError)
+MOSAIC_UNDERLAY_PX = 1024
+OVERVIEW_MODES = (
+    ("navigate", "Navigate", "Drag to pan, wheel to zoom, double-click to move the stage"),
+    ("rectangle", "Rectangle", "Drag to draw a rectangular scan region"),
+    ("polygon", "Polygon", "Click corners, double-click or Enter to close"),
+    ("move_set", "Move ROI set", "Drag to translate all regions and focus points (XY only)"),
+    ("focus", "Focus points", "Click a point to go to it, elsewhere to move there"),
+)
+OVERVIEW_HINTS = {
+    "navigate": "Drag to pan • wheel to zoom • double-click moves the stage",
+    "rectangle": "Drag to draw a region • Esc cancels",
+    "polygon": "Click corners • double-click or Enter closes • Esc cancels",
+    "move_set": "Drag to move regions and focus points together • Esc restores",
+    "focus": "Click F-point to go there, elsewhere to move XY • focus in Live, then Capture here / Set Z here",
+}
 
 
 class ScanWindow(QMainWindow):
@@ -83,6 +102,7 @@ class ScanWindow(QMainWindow):
         self.config_data = config
         self.backend = backend if backend is not None else create_backend(config)
         self.controller = ScanController(config, self.backend)
+        self.device = DeviceWorker(self.backend, self)
         self.z_begin_captured = False
         self.z_end_captured = False
         self._last_mosaic_render = 0.0
@@ -93,9 +113,18 @@ class ScanWindow(QMainWindow):
         self._build_ui(use_ndv)
         self._build_device_docks()
 
-        self.live_timer = QTimer(self)
-        self.live_timer.setInterval(LIVE_INTERVAL_MS)
-        self.live_timer.timeout.connect(self._live_tick)
+        self.device.frame_ready.connect(self.frame_view.show_frame)
+        self.device.position_changed.connect(self._position_changed)
+        self.device.live_failed.connect(self._live_failed)
+        self.channel_table.changed.connect(self._push_live_settings)
+        self.live_channel_box.currentIndexChanged.connect(self._push_live_settings)
+        self._push_live_settings()
+
+        # Picks up joystick/manual stage moves while nothing else polls the stage.
+        self.position_timer = QTimer(self)
+        self.position_timer.setInterval(POSITION_REFRESH_MS)
+        self.position_timer.timeout.connect(self._refresh_position)
+        self.position_timer.start()
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(POLL_INTERVAL_MS)
         self.poll_timer.timeout.connect(self._poll_scan)
@@ -114,7 +143,7 @@ class ScanWindow(QMainWindow):
         splitter.addWidget(self._build_viewer(use_ndv))
         splitter.addWidget(self._build_review_panel())
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([380, 720, 320])
+        splitter.setSizes([460, 720, 320])
         root.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
@@ -174,7 +203,7 @@ class ScanWindow(QMainWindow):
         layout.addWidget(sample)
 
         # Optics
-        optics = QGroupBox("Objective & channels")
+        optics = QGroupBox("Objective && channels")
         optics_layout = QVBoxLayout(optics)
         self.objective_box = QComboBox()
         for objective in self.config_data.objectives:
@@ -235,7 +264,7 @@ class ScanWindow(QMainWindow):
         layout.addWidget(z_group)
 
         # Tiling & options
-        tiling = QGroupBox("Tiling & options")
+        tiling = QGroupBox("Tiling && options")
         t_form = QFormLayout(tiling)
         self.overlap_x = spin(self.config_data.overlap_x_percent, 0, 50, 0, "%")
         self.overlap_y = spin(self.config_data.overlap_y_percent, 0, 50, 0, "%")
@@ -277,7 +306,7 @@ class ScanWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(360)
+        scroll.setMinimumWidth(440)
         return scroll
 
     def _build_viewer(self, use_ndv: bool) -> QWidget:
@@ -286,16 +315,54 @@ class ScanWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         self.tabs = QTabWidget()
         self.frame_view = FrameView(use_ndv=use_ndv)
-        mosaic_tab = QWidget()
-        mosaic_layout = QVBoxLayout(mosaic_tab)
+
+        overview_tab = QWidget()
+        overview_layout = QVBoxLayout(overview_tab)
+        overview_layout.setContentsMargins(0, 4, 0, 0)
+        toolbar = QHBoxLayout()
+        self.mode_group = QButtonGroup(self)
+        self.mode_buttons: dict[str, QToolButton] = {}
+        for mode, label, tip in OVERVIEW_MODES:
+            button = QToolButton()
+            button.setText(label)
+            button.setToolTip(tip)
+            button.setCheckable(True)
+            button.clicked.connect(lambda _=False, m=mode: self.set_overview_mode(m))
+            self.mode_group.addButton(button)
+            self.mode_buttons[mode] = button
+            toolbar.addWidget(button)
+        self.mode_buttons["navigate"].setChecked(True)
+        fit = QToolButton()
+        fit.setText("Fit")
+        fit.clicked.connect(self._fit_overview)
         self.mosaic_mode_box = QComboBox()
         self.mosaic_mode_box.addItem(DiskBackedMosaic.COMPOSITE)
+        self.mosaic_mode_box.setToolTip("Cycle mosaic display")
         self.mosaic_mode_box.currentIndexChanged.connect(lambda: self._render_mosaic(force=True))
-        self.mosaic_view = MosaicView()
-        mosaic_layout.addWidget(self.mosaic_mode_box)
-        mosaic_layout.addWidget(self.mosaic_view, 1)
+        toolbar.addWidget(fit)
+        toolbar.addStretch(1)
+        toolbar.addWidget(self.mosaic_mode_box)
+        self.overview = OverviewCanvas(self.config_data.stage_limits)
+        self.overview_hint = QLabel(OVERVIEW_HINTS["navigate"])
+        self.overview_hint.setStyleSheet("color: #888;")
+        overview_layout.addLayout(toolbar)
+        overview_layout.addWidget(self.overview, 1)
+        overview_layout.addWidget(self.overview_hint)
+
+        self.overview.region_drawn.connect(self._region_drawn)
+        self.overview.stage_move_requested.connect(
+            lambda x, y: self.device_move(self.backend.move_xy, x, y)
+        )
+        self.overview.focus_clicked.connect(self._overview_focus_clicked)
+        self.overview.move_set_started.connect(self._move_set_started)
+        self.overview.move_set_dragged.connect(self._move_set_dragged)
+        self.overview.move_set_finished.connect(self._move_set_finished)
+        self.overview.draft_cancelled.connect(self._move_set_cancelled)
+        self.overview.hint.connect(self.overview_hint.setText)
+        self.focus_list.list.currentRowChanged.connect(lambda _row: self._update_overview())
+
+        self.tabs.addTab(overview_tab, "Overview")
         self.tabs.addTab(self.frame_view, "Camera")
-        self.tabs.addTab(mosaic_tab, "Cycle mosaic")
         layout.addWidget(self.tabs, 1)
 
         controls = QHBoxLayout()
@@ -424,6 +491,7 @@ class ScanWindow(QMainWindow):
         self._update_experiment_label()
         self._apply_locks()
         if self.controller.busy:
+            self._update_overview()
             return
         try:
             plan = self.build_plan()
@@ -432,7 +500,9 @@ class ScanWindow(QMainWindow):
         except (ValueError, KeyError) as exc:
             self.summary_label.setText(str(exc))
             self._set_safety([str(exc)])
+            self._update_overview(())
             return
+        self._update_overview(tiles)
         experiment = self.controller.experiment
         cycle = f"Cycle {experiment.next_cycle_number}" if experiment else "Cycle 1 (new experiment)"
         if plan.regions:
@@ -473,6 +543,11 @@ class ScanWindow(QMainWindow):
             widget.setEnabled(not busy and not locked)
         self.region_list.set_locked(busy or locked)
         self.shift_button.setEnabled(not busy and locked)
+        for mode, button in self.mode_buttons.items():
+            allowed = mode == "navigate" or (not busy and (mode not in ("rectangle", "polygon") or not locked))
+            button.setEnabled(allowed)
+        if not self.mode_buttons[self.overview.mode].isEnabled():
+            self.set_overview_mode("navigate")
         self.focus_list.set_locked(busy)
         self.start_button.setEnabled(not busy)
         self.pause_button.setEnabled(busy)
@@ -491,12 +566,22 @@ class ScanWindow(QMainWindow):
             if tile is not None:
                 self.position_label.setText(f"Tile {tile.index + 1}  X {tile.x_um:.1f}  Y {tile.y_um:.1f} µm")
             return
-        try:
-            p = self.backend.position
-        except HardwareError as exc:
-            self.position_label.setText(str(exc))
-            return
+        p = self.device.last_position
         self.position_label.setText(f"X {p.x_um:.1f}  Y {p.y_um:.1f}  Z {p.z_um:.2f} µm")
+
+    def _position_changed(self, _position) -> None:
+        self._update_position()
+        self._update_overview()
+
+    @property
+    def stage_position(self):
+        """Last stage position reported by the device worker (no device call)."""
+
+        return self.device.last_position
+
+    def _refresh_position(self) -> None:
+        if not self.controller.busy and self.device.idle:
+            self.device.submit(lambda: None)
 
     def _update_experiment_label(self) -> None:
         experiment = self.controller.experiment
@@ -532,16 +617,22 @@ class ScanWindow(QMainWindow):
         ):
             self._sync_objective_box()
             return
-        try:
-            self.backend.change_objective(objective)
-        except HardwareError as exc:
+        self.objective_box.setEnabled(False)
+        self.progress_label.setText(f"Changing objective to {objective.name}…")
+
+        def done(_result) -> None:
+            self.progress_label.setText(f"Objective: {objective.name}")
+            if not self.backend.simulated:
+                self.inform("Refocus", "Z is at the objective-change clearance. Refocus in Live.")
+            self._reset_z_stack_capture()
+            self._refresh()
+
+        def failed(exc: Exception) -> None:
             self.warn("Objective change failed", str(exc))
             self._sync_objective_box()
-            return
-        if not self.backend.simulated:
-            self.inform("Refocus", "Z is at the objective-change clearance. Refocus in Live.")
-        self._reset_z_stack_capture()
-        self._refresh()
+            self._refresh()
+
+        self.device.submit(self.backend.change_objective, objective, on_done=done, on_error=failed)
 
     def _z_mode_changed(self, *_args) -> None:
         stack = self.z_mode_box.currentData() == "stack"
@@ -551,12 +642,12 @@ class ScanWindow(QMainWindow):
         self._refresh()
 
     def _capture_z_begin(self) -> None:
-        self.z_bottom.setValue(self.backend.position.z_um)
+        self.z_bottom.setValue(self.stage_position.z_um)
         self.z_begin_captured = True
         self._refresh()
 
     def _capture_z_end(self) -> None:
-        self.z_top.setValue(self.backend.position.z_um)
+        self.z_top.setValue(self.stage_position.z_um)
         self.z_end_captured = True
         self._refresh()
 
@@ -564,7 +655,7 @@ class ScanWindow(QMainWindow):
         self.z_begin_captured = self.z_end_captured = False
 
     def _add_region(self) -> None:
-        p = self.backend.position
+        p = self.stage_position
         dialog = RectangleDialog((p.x_um, p.y_um), self)
         if dialog.exec():
             self.region_list.append(dialog.region())
@@ -588,15 +679,88 @@ class ScanWindow(QMainWindow):
     def shift_roi_set(self, dx_um: float, dy_um: float) -> None:
         """Translate regions and focus points together (re-registration, XY only)."""
 
-        self.region_list.set_items(
-            [replace(r, x_um=r.x_um + dx_um, y_um=r.y_um + dy_um,
-                     polygon_points_um=tuple((x + dx_um, y + dy_um) for x, y in r.polygon_points_um))
-             for r in self.region_list.items]
-        )
+        self.region_list.set_items([r.translated(dx_um, dy_um) for r in self.region_list.items])
         self.focus_list.set_items([f.translated_xy(dx_um, dy_um) for f in self.focus_list.items])
 
+    # -------------------------------------------------------------- overview --
+    def set_overview_mode(self, mode: str) -> None:
+        button = self.mode_buttons[mode]
+        if not button.isEnabled():
+            mode, button = "navigate", self.mode_buttons["navigate"]
+        button.setChecked(True)
+        self.overview.set_mode(mode)
+        self.overview_hint.setText(OVERVIEW_HINTS[mode])
+
+    def _fit_overview(self) -> None:
+        self.overview.fit_items(self.region_list.items, self.focus_list.items)
+
+    def _update_overview(self, tiles=None) -> None:
+        if tiles is not None:
+            self._overview_tiles = tiles
+        tiles = getattr(self, "_overview_tiles", ())
+        objective_id = self.backend.current_objective_id
+        p = self.stage_position
+        self.overview.set_content(
+            self.region_list.items,
+            self.focus_list.items,
+            tiles,
+            self.config_data.fov_um(objective_id),
+            (p.x_um, p.y_um),
+            self.focus_list.selected_index(),
+        )
+
+    def _region_drawn(self, region) -> None:
+        if self.controller.busy or self.controller.experiment is not None:
+            self.overview_hint.setText("Regions are fixed by cycle 1 — use Move ROI set")
+            return
+        self.region_list.append(region)
+        self.overview_hint.setText(f"{region.shape.capitalize()} region added")
+
+    def _overview_focus_clicked(self, x_um: float, y_um: float, index: int) -> None:
+        if index >= 0:
+            self.focus_list.list.setCurrentRow(index)
+            self._goto_focus()
+            self.overview_hint.setText(f"Going to F{index + 1} — refocus in Live, then Set Z here")
+        else:
+            self.focus_list.list.setCurrentRow(-1)
+            self.device_move(self.backend.move_xy, x_um, y_um)
+            self.overview_hint.setText("Moving — focus in Live, then Capture here")
+        if not self.live_button.isChecked():
+            self.live_button.setChecked(True)
+        self.tabs.setCurrentIndex(0)  # stay on the overview while live runs
+
+    def _move_set_started(self) -> None:
+        self._move_origin = (tuple(self.region_list.items), tuple(self.focus_list.items))
+        self._loading = True  # skip estimates while dragging
+
+    def _move_set_dragged(self, dx_um: float, dy_um: float) -> None:
+        origin = getattr(self, "_move_origin", None)
+        if origin is None:
+            return
+        regions, focus_points = origin
+        dx_um, dy_um = bounded_set_translation(
+            regions, focus_points, self.config_data.stage_limits, dx_um, dy_um
+        )
+        self.region_list.set_items([r.translated(dx_um, dy_um) for r in regions])
+        self.focus_list.set_items([f.translated_xy(dx_um, dy_um) for f in focus_points])
+        self._update_overview()
+        self.overview_hint.setText(f"ROI set ΔX {dx_um:+.1f}  ΔY {dy_um:+.1f} µm")
+
+    def _move_set_finished(self) -> None:
+        self._move_origin = None
+        self._loading = False
+        self._refresh()
+
+    def _move_set_cancelled(self) -> None:
+        origin = getattr(self, "_move_origin", None)
+        if origin is not None:
+            self.region_list.set_items(origin[0])
+            self.focus_list.set_items(origin[1])
+        self._move_set_finished()
+        self.overview_hint.setText("Move cancelled")
+
     def _capture_focus_here(self) -> None:
-        p = self.backend.position
+        p = self.stage_position
         self.focus_list.append(FocusPoint(p.x_um, p.y_um, p.z_um))
 
     def _goto_focus(self) -> None:
@@ -604,10 +768,12 @@ class ScanWindow(QMainWindow):
         if index is None:
             return
         point = self.focus_list.items[index]
-        self._safe_move(self.backend.move_xy, point.x_um, point.y_um) and self._safe_move(
-            self.backend.move_z, point.z_um
-        )
-        self._refresh()
+
+        def go() -> None:
+            self.backend.move_xy(point.x_um, point.y_um)
+            self.backend.move_z(point.z_um)
+
+        self.device_move(go)
 
     def _set_focus_z_here(self) -> None:
         """Manual refocus: store the live Z on the selected focus point."""
@@ -616,60 +782,69 @@ class ScanWindow(QMainWindow):
         if index is None:
             return
         items = list(self.focus_list.items)
-        items[index] = replace(items[index], z_um=self.backend.position.z_um)
+        items[index] = replace(items[index], z_um=self.stage_position.z_um)
         self.focus_list.set_items(items)
         self.focus_list.list.setCurrentRow(index)
 
     # ----------------------------------------------------- stage / camera --
-    def _safe_move(self, action, *args) -> bool:
+    def device_move(self, function, *args) -> bool:
+        """Queue a stage move on the device worker; limit errors come back as a warning."""
+
         if self.controller.busy:
             return False
-        try:
-            action(*args)
-        except HardwareError as exc:
-            self.warn("Stage move refused", str(exc))
-            return False
+        self.device.submit(
+            function, *args, on_error=lambda exc: self.warn("Stage move refused", str(exc))
+        )
         return True
 
     def _jog(self, dx: float, dy: float, dz: float) -> None:
-        p = self.backend.position
-        if dz:
-            self._safe_move(self.backend.move_z, p.z_um + dz)
-        else:
-            self._safe_move(self.backend.move_xy, p.x_um + dx, p.y_um + dy)
-        self._update_position()
+        backend = self.backend
 
-    def _live_channel(self):
-        return self.config_data.channel(self.live_channel_box.currentData())
+        def jog() -> None:  # relative to the position at execution time, not at click time
+            p = backend.position
+            if dz:
+                backend.move_z(p.z_um + dz)
+            else:
+                backend.move_xy(p.x_um + dx, p.y_um + dy)
+
+        self.device_move(jog)
+
+    def _push_live_settings(self, *_args) -> None:
+        channel = self.config_data.channel(self.live_channel_box.currentData())
+        settings = {c.channel_id: c for c in self.channel_table.settings()}
+        exposure = settings[channel.id].exposure_ms if channel.id in settings else channel.default_exposure_ms
+        power = settings[channel.id].power_percent if channel.id in settings else channel.default_power_percent
+        self.device.set_live_settings(channel, exposure, power)
 
     def _snap(self) -> bool:
         if self.controller.busy:
             return False
-        channel = self._live_channel()
-        settings = {c.channel_id: c for c in self.channel_table.settings()}
-        exposure = settings[channel.id].exposure_ms if channel.id in settings else channel.default_exposure_ms
-        power = settings[channel.id].power_percent if channel.id in settings else channel.default_power_percent
-        try:
-            self.backend.set_channel(channel, exposure, power)
-            frame = self.backend.snap()
-        except HardwareError as exc:
-            self.live_button.setChecked(False)
-            self.warn("Snap failed", str(exc))
-            return False
-        self.frame_view.show_frame(frame)
+        self._push_live_settings()
         self.tabs.setCurrentWidget(self.frame_view)
+        self.device.snap(on_error=lambda exc: self.warn("Snap failed", str(exc)))
         return True
 
     def _toggle_live(self, on: bool) -> None:
-        if on:
-            self.live_timer.start()
-        else:
-            self.live_timer.stop()
-
-    def _live_tick(self) -> None:
-        if self.controller.busy or not self._snap():
+        if on and self.controller.busy:
             self.live_button.setChecked(False)
-        self._update_position()
+            return
+        if on:
+            self._push_live_settings()
+            self.tabs.setCurrentWidget(self.frame_view)
+        self.device.set_live(on)
+
+    def _live_failed(self, message: str) -> None:
+        self.live_button.setChecked(False)
+        self.warn("Live stopped", message)
+
+    def _hand_backend_to_engine(self) -> bool:
+        """Stop live and finish queued device jobs before the engine drives the backend."""
+
+        self.live_button.setChecked(False)
+        if not self.device.stop_and_drain(timeout=30):
+            self.warn("Microscope busy", "A stage or camera command is still running. Try again.")
+            return False
+        return True
 
     # ----------------------------------------------------------- experiment --
     def _new_experiment(self) -> None:
@@ -759,6 +934,8 @@ class ScanWindow(QMainWindow):
         mode = "simulated scan" if self.backend.simulated else "scan on the microscope"
         if not self.confirm("Ready to scan", f"{text}\n\nStart the {mode}?"):
             return
+        if not self._hand_backend_to_engine():
+            return
         try:
             self.controller.start_cycle(plan)
         except LAUNCH_ERRORS as exc:
@@ -778,6 +955,8 @@ class ScanWindow(QMainWindow):
             "The original channels, exposures, powers and focus positions are reused.",
         ):
             return
+        if not self._hand_backend_to_engine():
+            return
         try:
             self.controller.resume_cycle()
         except LAUNCH_ERRORS as exc:
@@ -791,7 +970,7 @@ class ScanWindow(QMainWindow):
         self.mosaic_mode_box.clear()
         self.mosaic_mode_box.addItems(mosaic.display_modes if mosaic else [DiskBackedMosaic.COMPOSITE])
         self.mosaic_mode_box.blockSignals(False)
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(0)
         self.progress.setValue(0)
         self.progress_label.setText("Starting acquisition…")
         self._apply_locks()
@@ -829,12 +1008,11 @@ class ScanWindow(QMainWindow):
         if mosaic is None or mosaic.closed or (not force and now - self._last_mosaic_render < MOSAIC_REFRESH_S):
             return
         self._last_mosaic_render = now
-        size = self.mosaic_view.size()
         aspect = mosaic.bounds.width_um / max(mosaic.bounds.height_um, 1e-9)
-        width = max(64, min(size.width(), int(size.height() * aspect)))
+        width = MOSAIC_UNDERLAY_PX if aspect >= 1 else max(64, int(MOSAIC_UNDERLAY_PX * aspect))
         height = max(64, int(width / aspect))
         rgb = mosaic.render_viewport_rgb(mosaic.bounds, width, height, self.mosaic_mode_box.currentText())
-        self.mosaic_view.show_rgb(rgb)
+        self.overview.set_mosaic(rgb, mosaic.bounds)
 
     def _cycle_finished(self, status) -> None:
         experiment = self.controller.experiment
@@ -872,8 +1050,9 @@ class ScanWindow(QMainWindow):
         if self.controller.busy and not self.confirm("Quit", "A cycle is running. Abort it and quit?"):
             event.ignore()
             return
-        self.live_timer.stop()
+        self.position_timer.stop()
         self.poll_timer.stop()
+        self.device.shutdown()
         self.controller.close()
         event.accept()
 

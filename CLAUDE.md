@@ -33,7 +33,7 @@ See README.md for the architecture, data layout and configuration.
 ## Commands
 ```bash
 pip install -e ".[hardware,qt,test]"
-python3 -m pytest                              # 63 tests, no display needed
+python3 -m pytest                              # 73 tests, no display needed
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # pymmcore-plus (hardware section of config)
 python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv for plain image view)
@@ -42,9 +42,11 @@ python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv f
 ## Open items (in order)
 1. Push `feature/cyclic-engine` and open the PR against `main` (needs GitHub auth on this Mac).
 2. Qt port (`microscope_ui/qt/`), keeping controller/engine as is. Done: cycle workflow,
-   numeric regions, focus points, XY shift, live/snap via ndv, mosaic tab, MMCore device
-   docks. Missing vs Tk: draw regions/polygons on an overview canvas, drag "Move ROI set",
-   spiral preview, recipes, flat-field UI, admin dialog. Live snaps on the GUI thread.
+   overview canvas (draw rectangle/polygon, drag "Move ROI set", double-click stage move,
+   focus-point click, mosaic underlay), focus points, live/snap via ndv, MMCore device
+   docks. All setup device calls run on `DeviceWorker` (never the GUI thread), drained
+   before the engine starts. Missing vs Tk: guided "Refocus all", "Align selected F →
+   stage", spiral preview, recipes, flat-field UI, admin dialog.
    Never use pymmcore-widgets StageWidget: it bypasses backend stage-limit checks.
 3. Agree output file naming/format with the downstream pipeline, then replace `.tstack`.
 4. Before any real-hardware run: calibrate turret positions, pixel sizes, camera

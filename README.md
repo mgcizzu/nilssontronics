@@ -115,7 +115,8 @@ a fixed-size map regardless of scan area; the current tile shows a running MIP.
 
 ```
 app.py            Tk view
-qt/               Qt view (in progress): ndv live view, pymmcore-widgets device docks
+qt/               Qt view (in progress): overview canvas, ndv live view on a device-worker
+                  thread, pymmcore-widgets device docks
 controller.py     ScanController: experiments, preflight, start/pause/abort/resume
 engine.py         AcquisitionEngine: one cycle on a worker thread
 acquisition.py    BoundedAsyncWriter: camera → SSD queue

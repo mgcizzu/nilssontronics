@@ -71,6 +71,8 @@ class ChannelTable(QTableWidget):
             self._exposure[channel.id] = exposure
             self._power[channel.id] = power
         self.resizeColumnsToContents()
+        for column in (1, 2):
+            self.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.setMinimumHeight(self.verticalHeader().length() + self.horizontalHeader().height() + 4)
 
     def settings(self) -> tuple[ChannelSetting, ...]:
@@ -257,19 +259,6 @@ class FrameView(QWidget):
             return
         assert self._label is not None
         self._label.setPixmap(_pixmap_from_array(frame, self._label.size()))
-
-
-class MosaicView(QLabel):
-    """Shows the cycle's disk-backed mosaic preview (RGB, already contrast-mapped)."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("No cycle running", parent)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.setStyleSheet("background: #111; color: #888;")
-
-    def show_rgb(self, rgb: np.ndarray) -> None:
-        self.setPixmap(_pixmap_from_array(rgb, self.size()))
 
 
 def _pixmap_from_array(array: np.ndarray, size) -> QPixmap:
