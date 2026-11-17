@@ -123,6 +123,8 @@ class ScanConsole(tk.Tk):
         self.consistent_approach_var = tk.BooleanVar(value=False)
         self.shutter_per_frame_var = tk.BooleanVar(value=True)
         self.flat_field_var = tk.BooleanVar(value=False)
+        self.distortion_var = tk.BooleanVar(value=False)
+        self.keep_uncorrected_var = tk.BooleanVar(value=True)
         self.experiment_var = tk.StringVar(value="No experiment — the first scan creates one")
         self.offset_var = tk.StringVar(value="")
 
@@ -427,6 +429,8 @@ class ScanConsole(tk.Tk):
             ("Close shutter during moves", self.shutter_per_frame_var),
             ("Consistent stage approach (backlash)", self.consistent_approach_var),
             ("Flat-field profile after each cycle", self.flat_field_var),
+            ("Correct lens distortion (calibrated; fixed by cycle 1)", self.distortion_var),
+            ("Keep uncorrected frames too", self.keep_uncorrected_var),
         ):
             ttk.Checkbutton(
                 options, text=text, variable=variable, command=self._input_changed
@@ -1876,6 +1880,8 @@ class ScanConsole(tk.Tk):
             consistent_approach=self.consistent_approach_var.get(),
             shutter_per_frame=self.shutter_per_frame_var.get(),
             flat_field=self.flat_field_var.get(),
+            distortion_correction=self.distortion_var.get(),
+            keep_uncorrected=self.keep_uncorrected_var.get(),
             focus_method=self.focus_method_var.get(),
         )
         return AcquisitionPlan(
@@ -2090,6 +2096,8 @@ class ScanConsole(tk.Tk):
             self.shutter_per_frame_var.set(options.shutter_per_frame)
             self.consistent_approach_var.set(options.consistent_approach)
             self.flat_field_var.set(options.flat_field)
+            self.keep_uncorrected_var.set(options.keep_uncorrected)
+        self.distortion_var.set(experiment.options.distortion_correction)
         self.objective_var.set(objective.name)
         if self.backend.current_objective_id != objective.id:
             self._objective_changed()

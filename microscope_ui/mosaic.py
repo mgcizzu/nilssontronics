@@ -12,6 +12,8 @@ pipeline (github.com/Moldia/ISS2025, ``mode='tif_autosaved'``)::
     tiles.jsonl                    append-only index of finished tiles (resume journal)
     disk_preview/<ch>.u16          fixed-size memory-mapped preview per channel
     flatfield/                     optional flat-field profiles (never applied to raw data)
+    uncorrected/                   optional: camera frames before distortion correction
+                                   (same file names; only with distortion correction on)
 
 Naming rules (what the pipeline parses):
 
@@ -55,6 +57,7 @@ from .models import Channel, ChannelSetting, Objective, ScanRegion, Tile
 PIPELINE_MODE = "tif_autosaved"
 PART_SUFFIX = ".part"
 METADATA_DIR = "Metadata"
+UNCORRECTED_DIR = "uncorrected"
 APPLICATION = "nilssontronics"
 
 
@@ -125,6 +128,8 @@ class CycleMetadata:
     z_step_um: float | None = None
     project: str = ""
     sample: str = ""
+    # Fingerprint of the distortion correction applied to the planes (None = camera frames).
+    distortion_correction: str | None = None
 
 
 @dataclass(frozen=True)
@@ -198,7 +203,7 @@ class DiskBackedMosaic:
         self.closed = False
         self.preview_dir = self.root / "disk_preview"
         self.preview_dir.mkdir(parents=True, exist_ok=True)
-        for stale in self.root.glob(f"*{PART_SUFFIX}"):
+        for stale in (*self.root.glob(f"*{PART_SUFFIX}"), *self.root.glob(f"{UNCORRECTED_DIR}/*{PART_SUFFIX}")):
             stale.unlink()  # planes of a tile that never finished
         self._channel_index = {channel.id: index for index, channel in enumerate(channels)}
         self._names = pipeline_regions(tiles)
@@ -337,7 +342,11 @@ class DiskBackedMosaic:
         z_index: int,
         frame: np.ndarray,
         z_um: float | None = None,
+        uncorrected: np.ndarray | None = None,
     ) -> None:
+        """Save one plane; ``uncorrected`` (camera frame before distortion correction)
+        is stored under ``uncorrected/`` with the same name when given."""
+
         if self._current_tile is None:
             raise RuntimeError("Begin a tile before writing planes")
         if channel_id not in self._channel_colors:
@@ -355,9 +364,15 @@ class DiskBackedMosaic:
         final_path = self.root / filename
         part_path = final_path.with_name(filename + PART_SUFFIX)
         _write_plane_tiff(part_path, frame, fsync=self.fsync)
-        self._current_planes.append(
-            {"channel": channel_id, "z_index": z_index, "z_um": z_um, "file": filename}
-        )
+        plane = {"channel": channel_id, "z_index": z_index, "z_um": z_um, "file": filename}
+        if uncorrected is not None:
+            original = f"{UNCORRECTED_DIR}/{filename}"
+            (self.root / UNCORRECTED_DIR).mkdir(exist_ok=True)
+            _write_plane_tiff(
+                self.root / (original + PART_SUFFIX), np.ascontiguousarray(uncorrected), fsync=self.fsync
+            )
+            plane["uncorrected_file"] = original
+        self._current_planes.append(plane)
         self._paint_plane(channel_id, frame)
 
     def _paint_plane(self, channel_id: str, frame: np.ndarray) -> None:
@@ -381,8 +396,13 @@ class DiskBackedMosaic:
             final_path = self.root / plane["file"]
             final_path.with_name(plane["file"] + PART_SUFFIX).replace(final_path)
             paths.append(final_path)
+            if "uncorrected_file" in plane:
+                original = self.root / plane["uncorrected_file"]
+                original.with_name(original.name + PART_SUFFIX).replace(original)
         if self.fsync:
             _fsync_directory(self.root)
+            if any("uncorrected_file" in plane for plane in self._current_planes):
+                _fsync_directory(self.root / UNCORRECTED_DIR)
 
         record = {
             "tile": tile["tile"],
@@ -415,6 +435,8 @@ class DiskBackedMosaic:
 
         for plane in self._current_planes:
             (self.root / (plane["file"] + PART_SUFFIX)).unlink(missing_ok=True)
+            if "uncorrected_file" in plane:
+                (self.root / (plane["uncorrected_file"] + PART_SUFFIX)).unlink(missing_ok=True)
         self._current_tile = None
         self._current_planes = []
         self._current_mip = {}
@@ -623,13 +645,15 @@ def write_region_metadata(
             Immersion=objective.immersion,
             RefractiveIndex=f"{objective.immersion_refractive_index:g}",
         )
-        ET.SubElement(
+        acquisition = ET.SubElement(
             image, "Attachment", Name="Acquisition", Application=APPLICATION,
             Cycle=str(metadata.cycle), Project=metadata.project, Sample=metadata.sample,
             PixelSizeUm=f"{pixel_um:.6f}", ZPlanes=str(metadata.z_planes),
             FileNaming="<region>--Stage<tile>--Z<plane>--C<channel>.tif",
             PipelineMode=PIPELINE_MODE,
         )
+        if metadata.distortion_correction:
+            acquisition.set("DistortionCorrection", metadata.distortion_correction)
         ET.indent(data)
         path = folder / f"{region}.xml"
         temporary = path.with_name(path.name + PART_SUFFIX)

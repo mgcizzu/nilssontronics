@@ -21,7 +21,12 @@ See README.md for the architecture, data layout and configuration.
 - **Resume** works per cycle from `cycle_NN/tiles.jsonl`; a new cycle can't start
   while an earlier one is unfinished.
 - **Optional features stay optional:** serpentine order, consistent stage approach,
-  shutter closed during moves (default on), flat-field profiles (non-destructive).
+  shutter closed during moves (default on), flat-field profiles (non-destructive),
+  distortion correction (`distortion.py`, off by default).
+- **Distortion correction** exists for other labs' microscopes (Marco's don't need it;
+  Leica's LAS X does it on the fly). When on, corrected planes go to `cycle_NN/` (what
+  ISS_preprocessing reads), optionally with `uncorrected/` copies. Calibrated with a grid
+  slide per objective; the experiment keeps its own copy, fixed by cycle 1.
 
 ## Architecture rules
 - `app.py` (Tk view) talks only to `ScanController` (`controller.py`); it never
@@ -35,7 +40,7 @@ See README.md for the architecture, data layout and configuration.
 ## Commands
 ```bash
 pip install -e ".[hardware,qt,test]"
-python3 -m pytest                              # 119 tests, no display needed
+python3 -m pytest                              # no display needed
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # pymmcore-plus (hardware section of config)
 python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv for plain image view)
