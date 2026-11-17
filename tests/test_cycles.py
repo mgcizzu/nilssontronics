@@ -24,7 +24,7 @@ from microscope_ui.models import (
     ScanRegion,
     ZSettings,
 )
-from microscope_ui.mosaic import completed_tile_indices, read_tile_stack
+from microscope_ui.mosaic import completed_tile_indices, read_tile, tile_records
 
 
 class SlowSimulator(SimulatedMicroscope):
@@ -96,8 +96,8 @@ class CycleTests(unittest.TestCase):
         self.assertIn(("cy5", 80, 33), self.backend.channel_log)
         folder = self.controller.experiment.cycle_folder(record.number)
         z_values = set()
-        for path in sorted((folder / "tiles").glob("*.tstack")):
-            header, planes = read_tile_stack(path)
+        for tile_id in sorted(tile_records(folder)):
+            header, planes = read_tile(folder, tile_id)
             self.assertEqual(set(planes), {("dapi", 0), ("cy5", 0)})
             z_values.add(round(header["z_positions_um"][0], 3))
         self.assertGreater(len(z_values), 3, "Z must follow the surface, not stay constant")
@@ -109,8 +109,7 @@ class CycleTests(unittest.TestCase):
         self.assertEqual(status.state, "complete")
         z_moves = [value for kind, value, _ in self.backend.move_log if kind == "z"]
         self.assertTrue({-2.0, -1.0, 0.0, 1.0, 2.0}.issubset(set(z_moves)))
-        path = next((self.controller.experiment.cycle_folder(1) / "tiles").glob("*.tstack"))
-        _header, planes = read_tile_stack(path)
+        _header, planes = read_tile(self.controller.experiment.cycle_folder(1), 0)
         self.assertEqual(len(planes), 2 * 5)
 
     def test_shutter_is_closed_during_moves_in_per_tile_mode(self) -> None:
@@ -151,12 +150,12 @@ class CycleTests(unittest.TestCase):
         record, status = self.run_cycle(moved)
         self.assertEqual(status.state, "complete")
         self.assertEqual((record.offset_x_um, record.offset_y_um), (120, -45))
-        first = sorted((experiment.cycle_folder(1) / "tiles").glob("*.tstack"))
-        second = sorted((experiment.cycle_folder(2) / "tiles").glob("*.tstack"))
-        self.assertEqual([p.name for p in first], [p.name for p in second])
-        for a, b in zip(first, second):
-            ha, _ = read_tile_stack(a)
-            hb, _ = read_tile_stack(b)
+        first = tile_records(experiment.cycle_folder(1))
+        second = tile_records(experiment.cycle_folder(2))
+        self.assertEqual(sorted(first), sorted(second))
+        for tile_id in sorted(first):
+            ha, hb = first[tile_id], second[tile_id]
+            self.assertEqual((ha["region"], ha["stage"]), (hb["region"], hb["stage"]))
             self.assertEqual((ha["tile"], ha["row"], ha["col"]), (hb["tile"], hb["row"], hb["col"]))
             self.assertAlmostEqual(hb["x_um"] - ha["x_um"], 120)
             self.assertAlmostEqual(hb["y_um"] - ha["y_um"], -45)

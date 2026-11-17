@@ -1,19 +1,38 @@
 """Per-cycle tile storage and a bounded, disk-backed preview mosaic.
 
-Storage layout of one cycle folder::
+One cycle folder is directly usable as an input folder of the ISS_preprocessing
+pipeline (github.com/Moldia/ISS2025, ``mode='tif_autosaved'``)::
 
-    tiles/tile_00042.tstack   one finished tile (all channels and Z planes)
-    tiles.jsonl               append-only index of finished tiles (resume journal)
-    disk_preview/<ch>.u16     fixed-size memory-mapped preview per channel
-    disk_preview/metadata.json
+    R01--Stage0000--Z00--C00.tif   one 2-D plane per file (uint16, uncompressed)
+    R01--Stage0000--Z01--C00.tif
+    ...
+    Metadata/R01.xml               Leica-style XML per region: TileScanInfo
+                                   (TileIndex = Stage number, PosX/PosY in µm),
+                                   pixel size, objective, channels
+    tiles.jsonl                    append-only index of finished tiles (resume journal)
+    disk_preview/<ch>.u16          fixed-size memory-mapped preview per channel
+    flatfield/                     optional flat-field profiles (never applied to raw data)
 
-The ``.tstack`` container is an interim format (JSON header + raw planes)
-until the downstream pipeline's file naming and format are agreed; only
-:class:`DiskBackedMosaic` and :func:`read_tile_stack` know about it.
+Naming rules (what the pipeline parses):
 
-Durability: a tile is written to ``.tmp``, fsynced, atomically renamed and only
-then appended (and fsynced) to ``tiles.jsonl``. After a crash every tile listed
-in the index is complete on disk; anything else is re-acquired on resume.
+* ``R01`` – region: one connected group of tiles in the experiment's shared
+  grid (8-neighbourhood). Separate tissue sections become separate regions, so
+  each is stitched on its own. Numbered by first acquired tile; identical in
+  every cycle because the tile grid is fixed by cycle 1.
+* ``Stage0000`` – tile within the region, 0-based, in acquisition order. It is
+  also the ``TileIndex`` in ``Metadata/R01.xml``.
+* ``Z00`` – Z plane, zero-padded (the pipeline orders planes by file name).
+* ``C00`` – channel, 0-based in the cycle's acquisition order. The mapping to
+  channel names, exposures and powers is in the XML and in ``experiment.json``.
+
+Stage positions are written so that +PosX = +image column and +PosY = +image
+row, matching the oriented frames (``FlipX=FlipY=SwapXY=0``).
+
+Durability: each plane is written to ``<name>.tif.part`` (ignored by the
+pipeline), fsynced, and only when the whole tile is complete are its planes
+renamed to ``.tif`` and the tile appended (and fsynced) to ``tiles.jsonl``.
+After a crash every tile listed in the index is complete on disk; anything
+else is re-acquired on resume. Only this module knows the file format.
 """
 
 from __future__ import annotations
@@ -25,12 +44,87 @@ import math
 import mmap
 import os
 from pathlib import Path
+from typing import Iterable, Sequence
+import xml.etree.ElementTree as ET
 
 import numpy as np
+import tifffile
 
-from .models import Channel, ScanRegion, Tile
+from .models import Channel, ChannelSetting, Objective, ScanRegion, Tile
 
-TSTACK_MAGIC = b"TSTACK1\n"
+PIPELINE_MODE = "tif_autosaved"
+PART_SUFFIX = ".part"
+METADATA_DIR = "Metadata"
+APPLICATION = "nilssontronics"
+
+
+@dataclass(frozen=True)
+class TileName:
+    """Where a tile lives in the pipeline layout: region token and Stage number."""
+
+    region: str
+    stage: int
+
+
+def pipeline_regions(tiles: Iterable[Tile]) -> dict[int, TileName]:
+    """Map tile index → (region, stage) for the ISS_preprocessing file names.
+
+    Regions are the 8-connected groups of tiles on the shared grid, numbered by
+    their first acquired tile. Stage numbers are 0-based within each region, in
+    acquisition order.
+    """
+
+    ordered = sorted(tiles, key=lambda tile: tile.index)
+    by_cell = {(tile.row, tile.col): tile for tile in ordered}
+    assigned: set[int] = set()
+    groups: list[list[Tile]] = []
+    for seed in ordered:
+        if seed.index in assigned:
+            continue
+        assigned.add(seed.index)
+        group, stack = [], [seed]
+        while stack:
+            tile = stack.pop()
+            group.append(tile)
+            for d_row in (-1, 0, 1):
+                for d_col in (-1, 0, 1):
+                    neighbour = by_cell.get((tile.row + d_row, tile.col + d_col))
+                    if neighbour is not None and neighbour.index not in assigned:
+                        assigned.add(neighbour.index)
+                        stack.append(neighbour)
+        groups.append(sorted(group, key=lambda tile: tile.index))
+    width = max(2, len(str(len(groups))))
+    names: dict[int, TileName] = {}
+    for number, group in enumerate(groups, start=1):
+        for stage, tile in enumerate(group):
+            names[tile.index] = TileName(f"R{number:0{width}d}", stage)
+    return names
+
+
+def plane_filename(name: TileName, z_index: int, channel_index: int, z_digits: int = 2) -> str:
+    return (
+        f"{name.region}--Stage{name.stage:04d}--Z{z_index:0{z_digits}d}"
+        f"--C{channel_index:02d}.tif"
+    )
+
+
+def z_digits_for(z_planes: int) -> int:
+    return max(2, len(str(max(0, z_planes - 1))))
+
+
+@dataclass(frozen=True)
+class CycleMetadata:
+    """What the per-region XML records besides tile positions."""
+
+    cycle: int
+    objective: Objective
+    channel_settings: tuple[ChannelSetting, ...]
+    camera_width_px: int
+    camera_height_px: int
+    z_planes: int = 1
+    z_step_um: float | None = None
+    project: str = ""
+    sample: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,6 +183,8 @@ class DiskBackedMosaic:
         channels: tuple[Channel, ...],
         max_preview_side: int = 2048,
         fsync: bool = True,
+        tiles: Sequence[Tile] = (),
+        metadata: CycleMetadata | None = None,
     ) -> None:
         if bounds.width_um <= 0 or bounds.height_um <= 0:
             raise ValueError("Mosaic bounds must have positive area")
@@ -101,11 +197,13 @@ class DiskBackedMosaic:
         self.fsync = fsync
         self.closed = False
         self.preview_dir = self.root / "disk_preview"
-        self.tile_dir = self.root / "tiles"
         self.preview_dir.mkdir(parents=True, exist_ok=True)
-        self.tile_dir.mkdir(parents=True, exist_ok=True)
-        for stale in self.tile_dir.glob("*.tmp"):
-            stale.unlink()
+        for stale in self.root.glob(f"*{PART_SUFFIX}"):
+            stale.unlink()  # planes of a tile that never finished
+        self._channel_index = {channel.id: index for index, channel in enumerate(channels)}
+        self._names = pipeline_regions(tiles)
+        if tiles and metadata is not None:
+            write_region_metadata(self.root, tiles, self._names, channels, metadata)
 
         scale = min(
             max_preview_side / bounds.width_um,
@@ -132,9 +230,7 @@ class DiskBackedMosaic:
         index_path = self.root / "tiles.jsonl"
         self._index = index_path.open("a", encoding="utf-8")
         self._current_tile: dict | None = None
-        self._current_handle = None
-        self._current_temporary_path: Path | None = None
-        self._current_final_path: Path | None = None
+        self._current_planes: list[dict] = []
         self._current_mip: dict[str, np.ndarray] = {}
         self._current_rect: tuple[int, int, int, int] | None = None
         metadata = {
@@ -208,10 +304,9 @@ class DiskBackedMosaic:
     ) -> None:
         if self.closed:
             raise RuntimeError("Mosaic store is closed")
-        if self._current_handle is not None:
+        if self._current_tile is not None:
             raise RuntimeError("Finish the current tile before beginning another")
-        tile_path = self.tile_dir / f"tile_{tile_index:05d}.tstack"
-        temporary_path = tile_path.with_suffix(".tmp")
+        name = self._names.get(tile_index) or TileName("R01", tile_index)
         self._current_tile = {
             "tile": tile_index,
             "row": row,
@@ -222,15 +317,12 @@ class DiskBackedMosaic:
             "fov_height_um": fov_height_um,
             "z_planes": z_planes,
             "z_positions_um": list(z_positions_um),
+            "region": name.region,
+            "stage": name.stage,
+            "z_digits": z_digits_for(z_planes),
             "started_at": datetime.now().astimezone().isoformat(),
         }
-        self._current_temporary_path = temporary_path
-        self._current_final_path = tile_path
-        self._current_handle = temporary_path.open("wb")
-        self._current_handle.write(TSTACK_MAGIC)
-        self._current_handle.write(
-            (json.dumps(self._current_tile, separators=(",", ":")) + "\n").encode("utf-8")
-        )
+        self._current_planes = []
         self._current_mip = {}
         left, top = self._stage_to_preview(x_um - fov_width_um / 2, y_um - fov_height_um / 2)
         right, bottom = self._stage_to_preview(x_um + fov_width_um / 2, y_um + fov_height_um / 2)
@@ -245,25 +337,26 @@ class DiskBackedMosaic:
         frame: np.ndarray,
         z_um: float | None = None,
     ) -> None:
-        if self._current_handle is None or self._current_tile is None:
+        if self._current_tile is None:
             raise RuntimeError("Begin a tile before writing planes")
         if channel_id not in self._channel_colors:
             raise KeyError(f"Unknown mosaic channel: {channel_id}")
         frame = np.ascontiguousarray(frame)
-        plane_header = {
-            "channel": channel_id,
-            "z_index": z_index,
-            "z_um": z_um,
-            "height": int(frame.shape[0]),
-            "width": int(frame.shape[1]),
-            "dtype": str(frame.dtype),
-            "bytes": int(frame.nbytes),
-        }
-        self._current_handle.write(
-            (json.dumps(plane_header, separators=(",", ":")) + "\n").encode("utf-8")
+        if frame.ndim != 2:
+            raise ValueError(f"Expected a 2-D plane, got shape {frame.shape}")
+        tile = self._current_tile
+        filename = plane_filename(
+            TileName(tile["region"], tile["stage"]),
+            z_index,
+            self._channel_index[channel_id],
+            tile["z_digits"],
         )
-        self._current_handle.write(frame.tobytes())
-        self._current_handle.flush()
+        final_path = self.root / filename
+        part_path = final_path.with_name(filename + PART_SUFFIX)
+        _write_plane_tiff(part_path, frame, fsync=self.fsync)
+        self._current_planes.append(
+            {"channel": channel_id, "z_index": z_index, "z_um": z_um, "file": filename}
+        )
         self._paint_plane(channel_id, frame)
 
     def _paint_plane(self, channel_id: str, frame: np.ndarray) -> None:
@@ -279,23 +372,16 @@ class DiskBackedMosaic:
         self._update_display_range(channel_id, small)
 
     def finish_tile(self) -> Path:
-        if (
-            self._current_handle is None
-            or self._current_tile is None
-            or self._current_temporary_path is None
-            or self._current_final_path is None
-        ):
+        if self._current_tile is None:
             raise RuntimeError("There is no current tile to finish")
         tile = self._current_tile
-        tile_path = self._current_final_path
-        handle = self._current_handle
-        handle.flush()
+        paths = []
+        for plane in self._current_planes:
+            final_path = self.root / plane["file"]
+            final_path.with_name(plane["file"] + PART_SUFFIX).replace(final_path)
+            paths.append(final_path)
         if self.fsync:
-            os.fsync(handle.fileno())
-        handle.close()
-        self._current_temporary_path.replace(tile_path)
-        if self.fsync:
-            _fsync_directory(self.tile_dir)
+            _fsync_directory(self.root)
 
         record = {
             "tile": tile["tile"],
@@ -306,7 +392,9 @@ class DiskBackedMosaic:
             "z_planes": tile["z_planes"],
             "z_positions_um": tile["z_positions_um"],
             "channels": [channel.id for channel in self.channels],
-            "path": str(tile_path.relative_to(self.root)),
+            "region": tile["region"],
+            "stage": tile["stage"],
+            "planes": self._current_planes,
             "written_at": datetime.now().astimezone().isoformat(),
         }
         self._index.write(json.dumps(record, separators=(",", ":")) + "\n")
@@ -316,24 +404,18 @@ class DiskBackedMosaic:
         for preview_map in self._maps.values():
             preview_map.flush()
         self._current_tile = None
-        self._current_handle = None
-        self._current_temporary_path = None
-        self._current_final_path = None
+        self._current_planes = []
         self._current_mip = {}
         self._current_rect = None
-        return tile_path
+        return tuple(paths)
 
     def abandon_tile(self) -> None:
         """Drop an unfinished tile (abort); it will be re-acquired on resume."""
 
-        if self._current_handle is not None:
-            self._current_handle.close()
-            if self._current_temporary_path is not None and self._current_temporary_path.exists():
-                self._current_temporary_path.unlink()
+        for plane in self._current_planes:
+            (self.root / (plane["file"] + PART_SUFFIX)).unlink(missing_ok=True)
         self._current_tile = None
-        self._current_handle = None
-        self._current_temporary_path = None
-        self._current_final_path = None
+        self._current_planes = []
         self._current_mip = {}
         self._current_rect = None
 
@@ -405,41 +487,147 @@ class DiskBackedMosaic:
         self.closed = True
 
 
-def completed_tile_indices(cycle_root: Path) -> set[int]:
-    """Tiles recorded as complete in a cycle's journal (tolerates a torn last line)."""
+def tile_records(cycle_root: Path) -> dict[int, dict]:
+    """Journal records of finished tiles whose plane files all exist (last record wins).
+
+    Tolerates a torn last line from a crash during an append.
+    """
 
     index_path = Path(cycle_root) / "tiles.jsonl"
-    done: set[int] = set()
+    records: dict[int, dict] = {}
     if not index_path.exists():
-        return done
+        return records
     for line in index_path.read_text(encoding="utf-8").splitlines():
         try:
             record = json.loads(line)
-        except json.JSONDecodeError:
+            planes = record["planes"]
+            tile = int(record["tile"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             continue
-        path = Path(cycle_root) / record.get("path", "")
-        if path.is_file():
-            done.add(int(record["tile"]))
-    return done
+        if planes and all((Path(cycle_root) / plane["file"]).is_file() for plane in planes):
+            records[tile] = record
+    return records
 
 
-def read_tile_stack(path: Path) -> tuple[dict, dict[tuple[str, int], np.ndarray]]:
-    """Read a ``.tstack`` file into its header and ``{(channel, z_index): frame}``."""
+def completed_tile_indices(cycle_root: Path) -> set[int]:
+    """Tiles recorded as complete in a cycle's journal."""
 
-    planes: dict[tuple[str, int], np.ndarray] = {}
-    with Path(path).open("rb") as handle:
-        if handle.readline() != TSTACK_MAGIC:
-            raise ValueError(f"{path} is not a tile stack")
-        header = json.loads(handle.readline())
-        while True:
-            line = handle.readline()
-            if not line:
-                break
-            plane = json.loads(line)
-            data = handle.read(plane["bytes"])
-            frame = np.frombuffer(data, dtype=plane["dtype"]).reshape(plane["height"], plane["width"])
-            planes[(plane["channel"], plane["z_index"])] = frame
-    return header, planes
+    return set(tile_records(cycle_root))
+
+
+def read_tile(cycle_root: Path, tile_index: int) -> tuple[dict, dict[tuple[str, int], np.ndarray]]:
+    """A finished tile's journal record and its planes as ``{(channel_id, z_index): frame}``."""
+
+    record = tile_records(cycle_root).get(int(tile_index))
+    if record is None:
+        raise KeyError(f"Tile {tile_index} is not complete in {cycle_root}")
+    planes = {
+        (plane["channel"], int(plane["z_index"])): tifffile.imread(Path(cycle_root) / plane["file"])
+        for plane in record["planes"]
+    }
+    return record, planes
+
+
+def write_region_metadata(
+    root: Path,
+    tiles: Sequence[Tile],
+    names: dict[int, TileName],
+    channels: tuple[Channel, ...],
+    metadata: CycleMetadata,
+) -> list[Path]:
+    """Write ``Metadata/<region>.xml`` (Leica-style) for every region of the cycle.
+
+    The pipeline reads, per region: ``TileScanInfo/Tile`` (TileIndex, FieldX/Y,
+    PosX/Y), the X/Y ``DimensionDescription`` (pixel size = Length / elements,
+    unit µm) and ``Instrument/Objective@Magnification``. Everything else is
+    provenance for people.
+    """
+
+    folder = Path(root) / METADATA_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    pixel_um = metadata.objective.pixel_size_um
+    settings = {item.channel_id: item for item in metadata.channel_settings}
+    regions: dict[str, list[Tile]] = {}
+    for tile in tiles:
+        regions.setdefault(names[tile.index].region, []).append(tile)
+    written = []
+    for region, region_tiles in sorted(regions.items()):
+        region_tiles.sort(key=lambda tile: names[tile.index].stage)
+        data = ET.Element("Data")
+        image = ET.SubElement(data, "Image", Name=region)
+        description = ET.SubElement(image, "ImageDescription")
+        channel_list = ET.SubElement(description, "Channels")
+        for index, channel in enumerate(channels):
+            setting = settings.get(channel.id)
+            attributes = {
+                "ChannelTag": str(index),
+                "Name": channel.name,
+                "Id": channel.id,
+                "EmissionWavelengthNm": f"{channel.emission_wavelength_nm:g}",
+                "Color": channel.color,
+            }
+            if setting is not None:
+                attributes["ExposureTimeMs"] = f"{setting.exposure_ms:g}"
+                attributes["PowerPercent"] = f"{setting.power_percent:g}"
+            ET.SubElement(channel_list, "ChannelDescription", attributes)
+        dimensions = ET.SubElement(description, "Dimensions")
+        for dim_id, count in (("1", metadata.camera_width_px), ("2", metadata.camera_height_px)):
+            ET.SubElement(
+                dimensions, "DimensionDescription", DimID=dim_id,
+                NumberOfElements=str(count), Length=f"{count * pixel_um:.6f}", Unit="um",
+            )
+        if metadata.z_planes > 1 and metadata.z_step_um:
+            ET.SubElement(
+                dimensions, "DimensionDescription", DimID="3",
+                NumberOfElements=str(metadata.z_planes),
+                Length=f"{(metadata.z_planes - 1) * metadata.z_step_um:.6f}", Unit="um",
+            )
+        min_row = min(tile.row for tile in region_tiles)
+        min_col = min(tile.col for tile in region_tiles)
+        scan = ET.SubElement(
+            image, "Attachment", Name="TileScanInfo", Application=APPLICATION,
+            FlipX="0", FlipY="0", SwapXY="0",
+        )
+        for tile in region_tiles:
+            ET.SubElement(
+                scan, "Tile",
+                TileIndex=str(names[tile.index].stage),
+                FieldX=str(tile.col - min_col), FieldY=str(tile.row - min_row),
+                PosX=f"{tile.x_um:.4f}", PosY=f"{tile.y_um:.4f}",
+                ExperimentTile=str(tile.index),
+            )
+        objective = metadata.objective
+        instrument = ET.SubElement(image, "Instrument")
+        ET.SubElement(
+            instrument, "Objective",
+            Name=objective.name, Id=objective.id,
+            Magnification=f"{objective.magnification:g}",
+            NumericalAperture=f"{objective.numerical_aperture:g}",
+            Immersion=objective.immersion,
+            RefractiveIndex=f"{objective.immersion_refractive_index:g}",
+        )
+        ET.SubElement(
+            image, "Attachment", Name="Acquisition", Application=APPLICATION,
+            Cycle=str(metadata.cycle), Project=metadata.project, Sample=metadata.sample,
+            PixelSizeUm=f"{pixel_um:.6f}", ZPlanes=str(metadata.z_planes),
+            FileNaming="<region>--Stage<tile>--Z<plane>--C<channel>.tif",
+            PipelineMode=PIPELINE_MODE,
+        )
+        ET.indent(data)
+        path = folder / f"{region}.xml"
+        temporary = path.with_name(path.name + PART_SUFFIX)
+        ET.ElementTree(data).write(temporary, encoding="utf-8", xml_declaration=True)
+        temporary.replace(path)
+        written.append(path)
+    return written
+
+
+def _write_plane_tiff(path: Path, frame: np.ndarray, fsync: bool) -> None:
+    with path.open("wb") as handle:
+        tifffile.imwrite(handle, frame, photometric="minisblack", metadata=None)
+        handle.flush()
+        if fsync:
+            os.fsync(handle.fileno())
 
 
 def _resize_nearest(frame: np.ndarray, height: int, width: int) -> np.ndarray:

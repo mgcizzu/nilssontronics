@@ -7,7 +7,7 @@ name = "microscope-scan-console"
 version = "0.1.0"
 description = "A workflow-focused desktop front end for microscope acquisition"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.24"]
+dependencies = ["numpy>=1.24", "tifffile>=2023.7.10"]
 
 [project.optional-dependencies]
 hardware = ["pymmcore-plus>=0.13"]

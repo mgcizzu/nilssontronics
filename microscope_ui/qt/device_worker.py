@@ -64,7 +64,7 @@ class DeviceWorker(QObject):
         self._put(_Job(function, args, on_done, on_error))
 
     def snap(self, on_error: Callable[[Exception], None] | None = None) -> None:
-        self._put(_Job(self._acquire_frame, (), self.frame_ready.emit, on_error))
+        self._put(_Job(self.acquire_frame, (), self.frame_ready.emit, on_error))
 
     def set_live_settings(self, channel: Channel, exposure_ms: float, power_percent: float) -> None:
         with self._lock:
@@ -150,7 +150,9 @@ class DeviceWorker(QObject):
                 self._deliver.emit(job.on_done, result)
         self._emit_position()
 
-    def _acquire_frame(self):
+    def acquire_frame(self):
+        """Snap one frame with the live settings. Worker thread only (call it from a job)."""
+
         with self._lock:
             settings = self._live_settings
         if settings is None:
@@ -164,7 +166,7 @@ class DeviceWorker(QObject):
 
     def _live_frame(self) -> None:
         try:
-            frame = self._acquire_frame()
+            frame = self.acquire_frame()
         except HardwareError as exc:
             with self._lock:
                 self._live = False

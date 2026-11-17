@@ -28,7 +28,7 @@ from microscope_ui.backend_mmcore import MMCoreBackend
 from microscope_ui.config import load_config
 from microscope_ui.controller import ScanController
 from microscope_ui.models import AcquisitionPlan, ChannelSetting, ScanRegion, ZSettings
-from microscope_ui.mosaic import read_tile_stack
+from microscope_ui.mosaic import read_tile, tile_records
 
 
 def _mm_path() -> str | None:
@@ -142,9 +142,9 @@ class MMCoreDemoTests(unittest.TestCase):
                 status = controller.status()
                 self.assertEqual(status.state, "complete", status)
                 self.assertEqual(status.tiles_done, status.tiles_total)
-                tiles = sorted((controller.experiment.cycle_folder(record.number) / "tiles").glob("*.tstack"))
-                self.assertEqual(len(tiles), status.tiles_total)
-                _header, planes = read_tile_stack(tiles[0])
+                folder = controller.experiment.cycle_folder(record.number)
+                self.assertEqual(len(tile_records(folder)), status.tiles_total)
+                _header, planes = read_tile(folder, 0)
                 self.assertEqual(set(planes), {("dapi", 0), ("af488", 0)})
             finally:
                 controller.close()

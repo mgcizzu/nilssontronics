@@ -114,7 +114,9 @@ class BoundedAsyncWriterTests(unittest.TestCase):
                 writer.shutdown(drain=False)
                 mosaic.close()
 
-            self.assertTrue((root / "tiles/tile_00001.tstack").exists())
+            # No tile list given: one region, Stage number = tile index.
+            self.assertTrue((root / "R01--Stage0001--Z00--C00.tif").exists())
+            self.assertTrue((root / "R01--Stage0001--Z01--C00.tif").exists())
             records = [
                 json.loads(line)
                 for line in (root / "tiles.jsonl").read_text(encoding="utf-8").splitlines()
