@@ -32,18 +32,23 @@ See README.md for the architecture, data layout and configuration.
 
 ## Commands
 ```bash
-pip install -e ".[hardware,test]"
-python3 -m pytest                              # 56 tests, no display needed
+pip install -e ".[hardware,qt,test]"
+python3 -m pytest                              # 63 tests, no display needed
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # pymmcore-plus (hardware section of config)
+python3 -m microscope_ui.qt                    # Qt view (same flags; --no-ndv for plain image view)
 ```
 
 ## Open items (in order)
-1. Push `feature/cyclic-engine` and open the PR against `main`.
-2. Run the app and tests with Marco's own Python (3.11+ with Tk).
-3. Validate `MMCoreBackend` against `MMConfig_demo.cfg` (`mmcore install`); so far
-   it is only tested against a fake core in `tests/test_cycles.py`.
-4. Qt port (pymmcore-widgets + ndv) of the view, keeping controller/engine as is.
-5. Agree output file naming/format with the downstream pipeline, then replace `.tstack`.
-6. Before any real-hardware run: calibrate turret positions, pixel sizes, camera
+1. Push `feature/cyclic-engine` and open the PR against `main` (needs GitHub auth on this Mac).
+2. Qt port (`microscope_ui/qt/`), keeping controller/engine as is. Done: cycle workflow,
+   numeric regions, focus points, XY shift, live/snap via ndv, mosaic tab, MMCore device
+   docks. Missing vs Tk: draw regions/polygons on an overview canvas, drag "Move ROI set",
+   spiral preview, recipes, flat-field UI, admin dialog. Live snaps on the GUI thread.
+   Never use pymmcore-widgets StageWidget: it bypasses backend stage-limit checks.
+3. Agree output file naming/format with the downstream pipeline, then replace `.tstack`.
+4. Before any real-hardware run: calibrate turret positions, pixel sizes, camera
    orientation, stage limits and safe Z ranges at the microscope.
+
+Done 2026-11-17: tests + app run on Marco's Python (miniforge 3.13, `.venv`);
+`MMCoreBackend` validated against `MMConfig_demo.cfg` (`tests/test_mmcore_demo.py`).

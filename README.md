@@ -14,10 +14,12 @@ Python 3.11+ with Tk and NumPy.
 pip install -e .                 # simulator only
 pip install -e ".[hardware]"     # + pymmcore-plus for a real microscope
 pip install -e ".[flatfield]"    # + BaSiC (basicpy) for flat-field estimation
+pip install -e ".[qt]"           # + Qt view (PyQt6, ndv, pymmcore-widgets)
 
 python3 -m microscope_ui                       # simulator
 python3 -m microscope_ui --backend mmcore      # Micro-Manager (see below)
 python3 -m microscope_ui --config my_scope.json
+python3 -m microscope_ui.qt                    # Qt view (work in progress), same flags
 ```
 
 ## Cyclic imaging workflow
@@ -112,7 +114,8 @@ a fixed-size map regardless of scan area; the current tile shows a running MIP.
 ## Architecture
 
 ```
-app.py            Tk view only (Qt planned next)
+app.py            Tk view
+qt/               Qt view (in progress): ndv live view, pymmcore-widgets device docks
 controller.py     ScanController: experiments, preflight, start/pause/abort/resume
 engine.py         AcquisitionEngine: one cycle on a worker thread
 acquisition.py    BoundedAsyncWriter: camera → SSD queue
@@ -170,3 +173,11 @@ exposure/power, recipe references, …).
 ```bash
 python3 -m pytest           # or: python3 -m unittest discover -s tests
 ```
+
+`tests/test_mmcore_demo.py` runs `MMCoreBackend` against a real `CMMCorePlus`
+loaded with `MMConfig_demo.cfg`; it is skipped unless Micro-Manager is found
+(`mmcore install`, or `MICROMANAGER_PATH`). On Apple silicon, `mmcore install`
+fetches only the arm64 test adapters (DemoCamera etc.), which is all this needs;
+an x86_64 `/Applications/Micro-Manager*` build cannot be loaded by arm64 Python.
+`tests/test_qt_view.py` needs `.[qt]` and runs headless (`QT_QPA_PLATFORM=offscreen`)
+with a plain image view; ndv/vispy needs a real OpenGL display.
