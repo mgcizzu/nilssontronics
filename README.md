@@ -147,8 +147,8 @@ a fixed-size map regardless of scan area; the current tile shows a running MIP.
 
 ```
 app.py            Tk view
-qt/               Qt view (in progress): overview canvas, ndv live view on a device-worker
-                  thread, pymmcore-widgets device docks
+qt/               Qt view: Fluent-style (dark/light) navigation rail, overview canvas, ndv
+                  live view on a device-worker thread, pymmcore-widgets device panels
 controller.py     ScanController: experiments, preflight, start/pause/abort/resume
 engine.py         AcquisitionEngine: one cycle on a worker thread
 acquisition.py    BoundedAsyncWriter: camera → SSD queue
@@ -218,3 +218,9 @@ with a plain image view; ndv/vispy needs a real OpenGL display.
 CI (`.github/workflows/tests.yml`) runs the suite on pushes to `main` and on pull
 requests: Ubuntu (Python 3.11, 3.13) and macOS (3.13), Qt offscreen. The
 Micro-Manager demo tests are skipped there.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). The Qt view's Windows 11 / Fluent styling is
+implemented in `microscope_ui/qt/theme.py` without third-party theme packages,
+so the project has no copyleft dependencies.

@@ -25,13 +25,11 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import QSettings, Qt, QTimer
 from qtpy.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QCheckBox,
     QComboBox,
-    QDockWidget,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -43,8 +41,11 @@ from qtpy.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QTabWidget,
+    QTextBrowser,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -68,6 +69,7 @@ from ..planner import spiral_preview_positions
 from ..roi_io import load_roi_set, save_roi_set
 from .device_worker import DeviceWorker
 from .overview import OverviewCanvas, bounded_set_translation
+from .theme import THEME_MODES, ToggleSwitch, apply_theme, icon, set_dark_title_bar
 from .widgets import (
     ChannelTable,
     FrameView,
@@ -111,8 +113,11 @@ class ScanWindow(QMainWindow):
         backend=None,
         use_ndv: bool = True,
         config_path: Path | str = DEFAULT_CONFIG_PATH,
+        settings: QSettings | None = None,
     ) -> None:
         super().__init__()
+        # Per-user view preferences (theme); tests pass their own file.
+        self.settings = settings if settings is not None else QSettings("nilssontronics", "scan-console")
         self.config_data = config
         self.config_path = Path(config_path)
         self.backend = backend if backend is not None else create_backend(config)
@@ -126,9 +131,8 @@ class ScanWindow(QMainWindow):
         self.setWindowTitle(f"Microscope Scan Console — {self.backend.name}")
         self.resize(1400, 860)
         self._build_ui(use_ndv)
-        microscope_menu = self.menuBar().addMenu("Microscope")
-        microscope_menu.addAction("Configuration…", self.show_configuration)
-        self._build_device_docks()
+        self._build_device_pages()
+        self.apply_theme_mode(self.theme_mode())
 
         self.device.frame_ready.connect(self.frame_view.show_frame)
         self.device.position_changed.connect(self._position_changed)
@@ -153,31 +157,154 @@ class ScanWindow(QMainWindow):
     # ------------------------------------------------------------------ UI --
     def _build_ui(self, use_ndv: bool) -> None:
         central = QWidget()
-        root = QVBoxLayout(central)
-        root.addWidget(self._build_header())
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.pages = QStackedWidget()
+
+        acquire = self._page()
+        layout = acquire.layout()
+        layout.addWidget(self._build_header())
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_setup_panel())
         splitter.addWidget(self._build_viewer(use_ndv))
         splitter.addWidget(self._build_review_panel())
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([460, 720, 320])
-        root.addWidget(splitter, 1)
+        layout.addWidget(splitter, 1)
+
+        self.devices_page = self._page("Devices")
+        self.config_page = self._page("Configuration")
+        self.config_text = QTextBrowser()
+        self.config_text.setOpenExternalLinks(False)
+        self.config_page.layout().addWidget(self.config_text, 1)
+        self.settings_page = self._build_settings_page()
+
+        self.page_names = ("acquire", "devices", "config", "settings")
+        for page in (acquire, self.devices_page, self.config_page, self.settings_page):
+            self.pages.addWidget(page)
+        outer.addWidget(self._build_rail())
+        outer.addWidget(self.pages, 1)
         self.setCentralWidget(central)
+
+    def _page(self, title: str | None = None) -> QWidget:
+        page = QWidget()
+        page.setObjectName("page")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 14, 20, 14)
+        layout.setSpacing(8)
+        if title:
+            heading = QLabel(title)
+            heading.setObjectName("pageTitle")
+            layout.addWidget(heading)
+        return page
+
+    def _build_rail(self) -> QWidget:
+        rail = QWidget()
+        rail.setObjectName("rail")
+        rail.setFixedWidth(200)
+        rail.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        layout = QVBoxLayout(rail)
+        layout.setContentsMargins(0, 14, 0, 12)
+        layout.setSpacing(2)
+        title = QLabel("Scan Console")
+        title.setObjectName("railTitle")
+        layout.addWidget(title)
+        self.nav_group = QButtonGroup(self)
+        self.nav_buttons: dict[str, QToolButton] = {}
+        entries = (
+            ("acquire", "Acquire", "acquire"),
+            ("devices", "Devices", "devices"),
+            ("config", "Configuration", "config"),
+            (None, None, None),
+            ("settings", "Settings", "settings"),
+        )
+        for name, text, icon_name in entries:
+            if name is None:
+                layout.addStretch(1)
+                continue
+            button = QToolButton()
+            button.setText(f"  {text}")
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.setProperty("iconName", icon_name)
+            button.clicked.connect(lambda _=False, n=name: self.show_page(n))
+            self.nav_group.addButton(button)
+            self.nav_buttons[name] = button
+            layout.addWidget(button)
+        self.nav_buttons["acquire"].setChecked(True)
+        return rail
+
+    def show_page(self, name: str) -> None:
+        if name == "config":
+            self.config_text.setHtml(self.configuration_html())
+        self.nav_buttons[name].setChecked(True)
+        self.pages.setCurrentIndex(self.page_names.index(name))
+
+    def _build_settings_page(self) -> QWidget:
+        page = self._page("Settings")
+        appearance = QGroupBox("Appearance")
+        form = QFormLayout(appearance)
+        self.theme_box = QComboBox()
+        for mode in THEME_MODES:
+            self.theme_box.addItem({"system": "Use system setting", "light": "Light", "dark": "Dark"}[mode], mode)
+        self.theme_box.activated.connect(
+            lambda _i: self.apply_theme_mode(self.theme_box.currentData(), remember=True)
+        )
+        hint = QLabel("Colours follow Windows' dark/light mode and accent colour when set to the system.")
+        hint.setProperty("secondary", True)
+        hint.setWordWrap(True)
+        form.addRow("Theme", self.theme_box)
+        form.addRow(hint)
+        about = QGroupBox("About")
+        about_layout = QVBoxLayout(about)
+        text = QLabel(
+            "Microscope Scan Console — cyclic imaging front end for Micro-Manager.<br>"
+            "MIT licence."
+        )
+        text.setProperty("secondary", True)
+        about_layout.addWidget(text)
+        for card in (appearance, about):
+            card.setMaximumWidth(860)
+        page.layout().addWidget(appearance)
+        page.layout().addWidget(about)
+        page.layout().addStretch(1)
+        return page
+
+    # ---------------------------------------------------------------- theme --
+    def theme_mode(self) -> str:
+        mode = str(self.settings.value("theme", "system"))
+        return mode if mode in THEME_MODES else "system"
+
+    def apply_theme_mode(self, mode: str, remember: bool = False) -> None:
+        palette = apply_theme(QApplication.instance(), mode)
+        self.palette_tokens = palette
+        if remember:
+            self.settings.setValue("theme", mode)
+            self.settings.sync()
+        self.theme_box.setCurrentIndex(self.theme_box.findData(mode))
+        for button in self.nav_buttons.values():
+            button.setIcon(icon(button.property("iconName"), palette.text))
+        self.channel_table.refresh_swatches()
+        set_dark_title_bar(self, palette.dark)
 
     def _build_header(self) -> QWidget:
         header = QWidget()
         row = QHBoxLayout(header)
-        row.setContentsMargins(4, 0, 4, 0)
-        title = QLabel(f"<b>{self.config_data.microscope_name}</b>")
-        mode = "SIMULATOR CONNECTED" if self.backend.simulated else f"{self.backend.name.upper()} CONNECTED"
+        row.setContentsMargins(0, 0, 0, 4)
+        title = QLabel(self.config_data.microscope_name)
+        title.setObjectName("pageTitle")
+        mode = "Simulator" if self.backend.simulated else f"{self.backend.name} connected"
         self.mode_label = QLabel(mode)
-        self.mode_label.setStyleSheet(
-            "padding: 2px 8px; border-radius: 4px; color: white; background: "
-            + ("#2f6f9f;" if self.backend.simulated else "#b5442c;")
-        )
+        self.mode_label.setObjectName("statusPill")
+        self.mode_label.setProperty("tone", "sim" if self.backend.simulated else "hw")
         self.position_label = QLabel()
+        self.position_label.setProperty("secondary", True)
         self.experiment_label = QLabel()
+        self.experiment_label.setProperty("secondary", True)
         row.addWidget(title)
+        row.addSpacing(10)
         row.addWidget(self.mode_label)
         row.addStretch(1)
         row.addWidget(self.experiment_label)
@@ -209,7 +336,9 @@ class ScanWindow(QMainWindow):
         self.sample_edit = QLineEdit("Sample 001")
         self.output_edit = QLineEdit(str(Path.cwd()))
         browse = QPushButton("…")
-        browse.setFixedWidth(30)
+        browse.setFixedWidth(36)
+        browse.setProperty("compact", True)
+        browse.setToolTip("Choose the output folder")
         browse.clicked.connect(self._choose_output)
         out_row = QHBoxLayout()
         out_row.addWidget(self.output_edit)
@@ -288,7 +417,7 @@ class ScanWindow(QMainWindow):
         cycle_row.addWidget(self.align_button)
         self.refocus_label = QLabel()
         self.refocus_label.setWordWrap(True)
-        self.refocus_label.setStyleSheet("color: #b5442c; font-weight: 600;")
+        self.refocus_label.setProperty("tone", "attention")
         self.refocus_label.hide()
         focus_layout.addWidget(self.focus_list)
         focus_layout.addLayout(cycle_row)
@@ -332,10 +461,10 @@ class ScanWindow(QMainWindow):
         self.overlap_y = spin(self.config_data.overlap_y_percent, 0, 50, 0, "%")
         self.tile_order_box = QComboBox()
         self.tile_order_box.addItems(["raster", "serpentine"])
-        self.consistent_approach = QCheckBox("Consistent stage approach")
-        self.shutter_per_frame = QCheckBox("Shutter closed during moves")
+        self.consistent_approach = ToggleSwitch("Consistent stage approach")
+        self.shutter_per_frame = ToggleSwitch("Shutter closed during moves")
         self.shutter_per_frame.setChecked(True)
-        self.flat_field = QCheckBox("Estimate flat-field profiles")
+        self.flat_field = ToggleSwitch("Estimate flat-field profiles")
         t_form.addRow("Overlap X", self.overlap_x)
         t_form.addRow("Overlap Y", self.overlap_y)
         t_form.addRow("Tile order", self.tile_order_box)
@@ -365,7 +494,9 @@ class ScanWindow(QMainWindow):
         ):
             signal.connect(self._refresh)
 
+        layout.setContentsMargins(0, 0, 8, 0)
         scroll = QScrollArea()
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setWidget(panel)
         scroll.setWidgetResizable(True)
         scroll.setMinimumWidth(440)
@@ -406,12 +537,12 @@ class ScanWindow(QMainWindow):
         toolbar.addWidget(self.mosaic_mode_box)
         self.overview = OverviewCanvas(self.config_data.stage_limits)
         self.overview_hint = QLabel(OVERVIEW_HINTS["navigate"])
-        self.overview_hint.setStyleSheet("color: #888;")
+        self.overview_hint.setProperty("secondary", True)
         overview_layout.addLayout(toolbar)
         overview_layout.addWidget(self.overview, 1)
         # Accept button under the canvas, so a refocus walk never needs the setup panel.
         self.overview_accept_button = QPushButton("Accept Z ▶")
-        self.overview_accept_button.setStyleSheet("font-weight: 600;")
+        self.overview_accept_button.setProperty("accent", True)
         self.overview_accept_button.clicked.connect(self._set_focus_z_here)
         self.overview_accept_button.hide()
         hint_row = QHBoxLayout()
@@ -477,7 +608,7 @@ class ScanWindow(QMainWindow):
 
         self.start_button = QPushButton("Start cycle")
         self.start_button.setMinimumHeight(40)
-        self.start_button.setStyleSheet("font-weight: 600;")
+        self.start_button.setProperty("accent", True)
         self.start_button.clicked.connect(self._start_cycle)
         self.pause_button = QPushButton("Pause")
         self.pause_button.clicked.connect(self._toggle_pause)
@@ -490,6 +621,8 @@ class ScanWindow(QMainWindow):
         self.progress.setRange(0, 1000)
         self.progress_label = QLabel()
         self.progress_label.setWordWrap(True)
+        self.progress_label.setProperty("secondary", True)
+        layout.setContentsMargins(8, 0, 0, 0)
         layout.addWidget(self.start_button)
         layout.addLayout(run_row)
         layout.addWidget(self.progress)
@@ -498,28 +631,38 @@ class ScanWindow(QMainWindow):
         panel.setMinimumWidth(280)
         return panel
 
-    def _build_device_docks(self) -> None:
-        """Micro-Manager device panels (pymmcore-widgets), only for the MMCore backend."""
+    def _build_device_pages(self) -> None:
+        """Micro-Manager device panels (pymmcore-widgets) on the Devices page, MMCore only."""
 
-        self.device_docks: list[QDockWidget] = []
+        self.device_panels: list[QWidget] = []
+        layout = self.devices_page.layout()
         core = getattr(self.backend, "core", None)
-        if core is None or self.backend.simulated:
+        widgets = None
+        if core is not None and not self.backend.simulated:
+            try:
+                from pymmcore_widgets import CoreLogWidget, PropertyBrowser
+
+                widgets = (
+                    ("Device properties (admin)", PropertyBrowser(mmcore=core)),
+                    ("Micro-Manager log", CoreLogWidget(mmcore=core)),
+                )
+            except ImportError:  # pragma: no cover
+                widgets = None
+        if not widgets:
+            note = QLabel(
+                "Device panels appear here when the Micro-Manager backend is connected "
+                "(start with --backend mmcore). The simulator has no devices to inspect."
+            )
+            note.setProperty("secondary", True)
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            layout.addStretch(1)
             return
-        try:
-            from pymmcore_widgets import CoreLogWidget, PropertyBrowser
-        except ImportError:  # pragma: no cover
-            return
-        menu = self.menuBar().addMenu("Devices")
-        for title, widget in (
-            ("Device properties (admin)", PropertyBrowser(mmcore=core)),
-            ("Micro-Manager log", CoreLogWidget(mmcore=core)),
-        ):
-            dock = QDockWidget(title, self)
-            dock.setWidget(widget)
-            dock.hide()
-            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-            menu.addAction(dock.toggleViewAction())
-            self.device_docks.append(dock)
+        for title, widget in widgets:
+            card = QGroupBox(title)
+            QVBoxLayout(card).addWidget(widget)
+            layout.addWidget(card, 1)
+            self.device_panels.append(widget)
 
     # --------------------------------------------------------- configuration --
     def configuration_html(self) -> str:
@@ -578,19 +721,7 @@ class ScanWindow(QMainWindow):
         )
 
     def show_configuration(self) -> None:
-        from qtpy.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Microscope configuration")
-        dialog.resize(620, 560)
-        layout = QVBoxLayout(dialog)
-        text = QTextBrowser()
-        text.setHtml(self.configuration_html())
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(text)
-        layout.addWidget(buttons)
-        dialog.exec()
+        self.show_page("config")
 
     # ------------------------------------------------------- dialogs (seam) --
     def confirm(self, title: str, text: str) -> bool:
@@ -673,11 +804,18 @@ class ScanWindow(QMainWindow):
 
     def _set_safety(self, problems: list[str]) -> None:
         if problems:
-            self.safety_label.setStyleSheet("color: #b5442c;")
+            self._set_tone(self.safety_label, "bad")
             self.safety_label.setText("● " + "<br>● ".join(problems[:5]))
         else:
-            self.safety_label.setStyleSheet("color: #2e7d32;")
+            self._set_tone(self.safety_label, "ok")
             self.safety_label.setText("✓ Plan passes configured safety checks")
+
+    @staticmethod
+    def _set_tone(label: QLabel, tone: str) -> None:
+        if label.property("tone") != tone:
+            label.setProperty("tone", tone)
+            label.style().unpolish(label)
+            label.style().polish(label)
 
     def _apply_locks(self) -> None:
         busy = self.controller.busy
@@ -711,8 +849,8 @@ class ScanWindow(QMainWindow):
             "Continue" if status is not None and status.state in ("pausing", "paused") else "Pause"
         )
         self.resume_button.setEnabled(not busy and self.controller.resume_info() is not None)
-        for dock in getattr(self, "device_docks", ()):
-            dock.widget().setEnabled(not busy)
+        for panel in getattr(self, "device_panels", ()):
+            panel.setEnabled(not busy)
 
     def _update_position(self) -> None:
         if self.controller.busy:

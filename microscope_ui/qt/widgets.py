@@ -6,7 +6,7 @@ from typing import Callable
 
 import numpy as np
 from qtpy.QtCore import Qt, Signal
-from qtpy.QtGui import QImage, QPixmap
+from qtpy.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -58,7 +58,7 @@ class ChannelTable(QTableWidget):
         self._power: dict[str, QDoubleSpinBox] = {}
         for row, channel in enumerate(channels):
             check = QCheckBox(channel.name)
-            check.setStyleSheet(f"QCheckBox {{ color: {channel.color}; font-weight: 600; }}")
+            check.setToolTip(f"{channel.name} • emission {channel.emission_wavelength_nm:g} nm")
             check.toggled.connect(self.changed)
             exposure = spin(channel.default_exposure_ms, 0.1, channel.max_exposure_ms, 1, "ms")
             power = spin(channel.default_power_percent, 0, channel.max_power_percent, 0, "%")
@@ -74,6 +74,12 @@ class ChannelTable(QTableWidget):
         for column in (1, 2):
             self.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.setMinimumHeight(self.verticalHeader().length() + self.horizontalHeader().height() + 4)
+
+    def refresh_swatches(self) -> None:
+        """Channel colour as a dot next to the name (readable on light and dark themes)."""
+
+        for channel in self._channels:
+            self._checks[channel.id].setIcon(_swatch(channel.color))
 
     def settings(self) -> tuple[ChannelSetting, ...]:
         return tuple(
@@ -246,7 +252,7 @@ class FrameView(QWidget):
             self._label = QLabel("No image")
             self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-            self._label.setStyleSheet("background: #111; color: #888;")
+            self._label.setStyleSheet("background: #111; color: #888; border-radius: 6px;")
             layout.addWidget(self._label)
 
     @property
@@ -259,6 +265,19 @@ class FrameView(QWidget):
             return
         assert self._label is not None
         self._label.setPixmap(_pixmap_from_array(frame, self._label.size()))
+
+
+def _swatch(color: str, size: int = 10) -> QIcon:
+    pixmap = QPixmap(size * 2, size * 2)
+    pixmap.setDevicePixelRatio(2)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(QColor(0, 0, 0, 60))
+    painter.setBrush(QColor(color))
+    painter.drawEllipse(1, 1, size - 2, size - 2)
+    painter.end()
+    return QIcon(pixmap)
 
 
 def _pixmap_from_array(array: np.ndarray, size) -> QPixmap:
