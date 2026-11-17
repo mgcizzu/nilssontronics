@@ -93,6 +93,38 @@ class DiskBackedMosaicTests(unittest.TestCase):
             self.assertGreater(reopened.display_range("dapi")[1], 0)
             reopened.close()
 
+    def test_resume_after_torn_append_keeps_later_records_readable(self) -> None:
+        channels = (self.config.channel("dapi"),)
+        bounds = MosaicBounds(-1000, 1000, -1000, 1000)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mosaic = DiskBackedMosaic(root, bounds, channels, max_preview_side=32)
+            mosaic.begin_tile(0, 0, 0, 100, 100, z_planes=1)
+            mosaic.write_plane("dapi", 0, np.ones((8, 8), np.uint16))
+            mosaic.finish_tile()
+            mosaic._index.write('{"tile": 1, "planes": [{"fi')  # crash mid-append
+            mosaic._index.flush()
+            mosaic.close()
+
+            # Resume: the torn tail is cut, so the next record starts on its own line.
+            resumed = DiskBackedMosaic(root, bounds, channels, max_preview_side=32)
+            resumed.begin_tile(1, 0, 0, 100, 100, z_planes=1)
+            resumed.write_plane("dapi", 0, np.ones((8, 8), np.uint16))
+            resumed.finish_tile()
+            resumed.close()
+
+            self.assertEqual(completed_tile_indices(root), {0, 1})
+            lines = (root / "tiles.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual([json.loads(line)["tile"] for line in lines], [0, 1])
+
+    def test_journal_without_any_complete_line_is_emptied(self) -> None:
+        channels = (self.config.channel("dapi"),)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tiles.jsonl").write_text('{"tile": 0, "pla', encoding="utf-8")
+            DiskBackedMosaic(root, MosaicBounds(0, 10, 0, 10), channels, max_preview_side=8).close()
+            self.assertEqual((root / "tiles.jsonl").read_text(encoding="utf-8"), "")
+
     def test_stale_part_files_are_removed_on_open(self) -> None:
         channels = (self.config.channel("dapi"),)
         with tempfile.TemporaryDirectory() as temp_dir:

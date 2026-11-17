@@ -190,6 +190,23 @@ def test_live_stops_before_cycle_starts(qtbot, window):
     assert not window.device.live and not window.live_button.isChecked()
 
 
+def test_live_restores_per_frame_shutter_after_a_cycle(qtbot, window):
+    window.region_list.append(ScanRegion(-300, -200, 600, 400))
+    window.channel_table._checks["dapi"].setChecked(True)
+    window.shutter_per_frame.setChecked(False)  # shutter open per tile, closed during moves
+    status = run_cycle(qtbot, window)
+    assert status.state == "complete"
+    backend = window.backend
+    # The cycle leaves auto-shutter off and the shutter closed ...
+    assert not backend.shutter_per_frame and not backend.shutter_open
+    assert backend.dark_snaps == 0
+    # ... so the next snap must turn per-frame shutter back on before exposing.
+    with qtbot.waitSignal(window.device.frame_ready, timeout=5000):
+        window._snap()
+    assert backend.shutter_per_frame
+    assert backend.dark_snaps == 0
+
+
 def test_abort_then_resume(qtbot, window):
     window.backend.delay = 0.02
     window.region_list.append(ScanRegion(-1500, -1000, 3000, 2000))
