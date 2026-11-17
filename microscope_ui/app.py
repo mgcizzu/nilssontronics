@@ -1643,9 +1643,10 @@ class ScanConsole(tk.Tk):
                 ry = rng.randint(10, 48)
                 color = "#7a8f8d" if index % 3 else "#637d79"
                 self.viewer.create_oval(cx - rx, cy - ry, cx + rx, cy + ry, fill=color, outline="", tags="scene")
-        elif not mosaic_rendered and not self.overview_mode:
-            # Real camera frames only: Live or Snap, never synthetic imagery.
-            if not self._draw_last_frame(width, height):
+        if not self.overview_mode and not self.controller.busy:
+            # Live/Snap: the real camera frame goes on top, an earlier cycle's mosaic
+            # is only background (refocusing between cycles needs the live image).
+            if not self._draw_last_frame(width, height) and not mosaic_rendered:
                 self.viewer.create_text(
                     width / 2, height / 2, text="Press Live or Snap to see the camera",
                     fill="#9aa5ad", tags="scene",

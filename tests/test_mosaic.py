@@ -117,6 +117,33 @@ class DiskBackedMosaicTests(unittest.TestCase):
             lines = (root / "tiles.jsonl").read_text(encoding="utf-8").splitlines()
             self.assertEqual([json.loads(line)["tile"] for line in lines], [0, 1])
 
+    def test_complete_last_record_without_newline_is_kept_on_resume(self) -> None:
+        channels = (self.config.channel("dapi"),)
+        bounds = MosaicBounds(-1000, 1000, -1000, 1000)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mosaic = DiskBackedMosaic(root, bounds, channels, max_preview_side=32)
+            for index in range(2):
+                mosaic.begin_tile(index, 0, 0, 100, 100, z_planes=1)
+                mosaic.write_plane("dapi", 0, np.ones((8, 8), np.uint16))
+                mosaic.finish_tile()
+            mosaic.close()
+            journal = root / "tiles.jsonl"
+            # Crash after the record's JSON but before its newline reached the disk.
+            journal.write_bytes(journal.read_bytes().rstrip(b"\n"))
+            # Resume decides what to skip from this journal: tile 1 counts as done ...
+            self.assertEqual(completed_tile_indices(root), {0, 1})
+
+            resumed = DiskBackedMosaic(root, bounds, channels, max_preview_side=32)
+            resumed.begin_tile(2, 0, 0, 100, 100, z_planes=1)
+            resumed.write_plane("dapi", 0, np.ones((8, 8), np.uint16))
+            resumed.finish_tile()
+            resumed.close()
+            # ... so it must still be there after the repair, next to the new tile.
+            self.assertEqual(completed_tile_indices(root), {0, 1, 2})
+            lines = journal.read_text(encoding="utf-8").splitlines()
+            self.assertEqual([json.loads(line)["tile"] for line in lines], [0, 1, 2])
+
     def test_journal_without_any_complete_line_is_emptied(self) -> None:
         channels = (self.config.channel("dapi"),)
         with tempfile.TemporaryDirectory() as temp_dir:

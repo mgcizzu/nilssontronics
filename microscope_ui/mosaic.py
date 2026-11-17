@@ -624,11 +624,15 @@ def write_region_metadata(
 
 
 def _repair_journal_tail(path: Path, fsync: bool = True) -> None:
-    """Cut a torn last line (crash during an append) before appending again.
+    """Make the journal end with a newline before appending again.
 
-    Without this the next record would be glued onto the partial line and be
-    unreadable too. The partial line itself never described a finished tile,
-    so dropping it loses nothing: that tile is re-acquired on resume.
+    A crash during an append can leave a last line without its newline; the
+    next record would be glued onto it and both would be unreadable.
+
+    * If that line is a complete record (``tile_records`` already counts it, so
+      resume skips that tile), keep it and add the missing newline.
+    * Otherwise it is a torn fragment that never described a finished tile:
+      cut it; that tile is re-acquired on resume.
     """
 
     if not path.exists():
@@ -652,10 +656,26 @@ def _repair_journal_tail(path: Path, fsync: bool = True) -> None:
             if newline != -1:
                 keep = position + newline + 1
                 break
-        handle.truncate(keep)
+        handle.seek(keep)
+        tail = handle.read()
+        if _is_complete_record(tail):
+            handle.seek(0, os.SEEK_END)
+            handle.write(b"\n")
+        else:
+            handle.truncate(keep)
         handle.flush()
         if fsync:
             os.fsync(handle.fileno())
+
+
+def _is_complete_record(line: bytes) -> bool:
+    """Same acceptance rule as :func:`tile_records` (minus the file-existence check)."""
+
+    try:
+        record = json.loads(line.decode("utf-8"))
+        return bool(record["planes"]) and isinstance(int(record["tile"]), int)
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return False
 
 
 def _write_plane_tiff(path: Path, frame: np.ndarray, fsync: bool) -> None:
