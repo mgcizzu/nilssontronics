@@ -257,6 +257,12 @@ class AcquisitionEngine:
     def _acquire(self) -> tuple[EngineState, str | None]:
         run = self._run
         backend = self._backend
+        actual_objective = backend.refresh_objective_id()
+        if actual_objective != run.objective_id:
+            raise HardwareError(
+                f"Acquisition requires objective {run.objective_id}, but the turret reports "
+                f"{actual_objective}"
+            )
         backend.set_shutter_per_frame(run.shutter_per_frame)
         fov_width_um, fov_height_um = self._config.fov_um(run.objective_id)
         approach = self._config.approach_offset_um if run.consistent_approach else 0.0
@@ -268,6 +274,12 @@ class AcquisitionEngine:
                 continue
             if not self._wait_if_paused():
                 return ("aborted", None)
+            actual_objective = backend.refresh_objective_id()
+            if actual_objective != run.objective_id:
+                raise HardwareError(
+                    f"Acquisition requires objective {run.objective_id}, but the turret reports "
+                    f"{actual_objective}"
+                )
             z_list = run.z_positions[tile.index]
             self._set(current_tile=tile, current_z_planes=len(z_list), message=f"Tile {tile.index + 1}")
 

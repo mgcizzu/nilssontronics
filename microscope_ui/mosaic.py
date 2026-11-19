@@ -354,6 +354,8 @@ class DiskBackedMosaic:
         frame = np.ascontiguousarray(frame)
         if frame.ndim != 2:
             raise ValueError(f"Expected a 2-D plane, got shape {frame.shape}")
+        if frame.dtype != np.uint16:
+            raise ValueError(f"Expected an unsigned 16-bit plane, got {frame.dtype}")
         tile = self._current_tile
         filename = plane_filename(
             TileName(tile["region"], tile["stage"]),

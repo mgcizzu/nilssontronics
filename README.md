@@ -228,22 +228,28 @@ Set `"backend": "mmcore"` (or pass `--backend mmcore`) and fill the
 
 | key | meaning |
 | --- | --- |
-| `mm_config_path` | Micro-Manager `.cfg` file |
-| `mm_adapter_path` | Micro-Manager install folder (optional; default discovery otherwise) |
+| `mm_config_path` | Micro-Manager `.cfg` file (relative paths are resolved beside the app JSON) |
+| `mm_adapter_path` | Micro-Manager install folder (optional; relative paths resolve beside the app JSON) |
 | `channel_group`, `channel_presets` | config group and one preset per channel id |
 | `objective_device`, `turret_position_offset` | turret state device; MM state = `turret_position + offset` |
 | `objective_change_z_um` | clearance Z used before rotating the turret |
-| `power_properties` | optional per channel: `{"device", "property", "scale", "offset"}` |
+| `power_properties` | per-channel adjustable power: `{"device", "property", "scale", "offset"}`; without one, power is fixed at the channel default by its MM preset |
 | `pixel_size_configs` | optional per objective: MM pixel-size preset to select |
 | `settle_timeout_ms` | device wait timeout |
 
 `camera.orientation` (`flip_x`, `flip_y`, `transpose`) maps camera pixels to
 stage axes; set it so that a stage move to +X moves image content to −column.
+`camera.width_px` and `height_px` describe the raw Micro-Manager frame before
+that orientation. The backend refuses a changed ROI, binning, colour/pixel
+format or anything other than the configured unsigned 16-bit frame instead of
+silently writing TIFFs whose dimensions disagree with the metadata.
 
-Safety rules in the backend: XY/Z targets outside the configured limits (and
+Safety rules in the backend: the physical turret is read back before Z moves
+and acquisitions; XY/Z targets outside the configured limits (and
 the objective's safe Z range) are **refused before any command is sent**,
 never clamped; objective changes move to the clearance Z first and leave Z
-there for a deliberate refocus; device faults are reported as plain messages.
+there for a deliberate refocus; shutter mode changes first establish a closed
+shutter; device faults are reported as plain messages.
 
 The shipped `hardware` values match Micro-Manager's demo configuration
 (`MMConfig_demo.cfg`). **No real-hardware run should start until turret

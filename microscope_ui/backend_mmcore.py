@@ -20,6 +20,7 @@ Frames are re-oriented with ``camera.orientation`` so +column = +stage X and
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -48,14 +49,38 @@ class MMCoreBackend:
         self._channel_group = self._hw.get("channel_group", "Channel")
         self._objective_device = self._hw.get("objective_device", "Objective")
         self._turret_offset = int(self._hw.get("turret_position_offset", -1))
-        self._presets: dict[str, str] = dict(self._hw.get("channel_presets", {}))
-        self._power: dict[str, dict] = dict(self._hw.get("power_properties", {}))
+        preset_config = self._hw.get("channel_presets", {})
+        power_config = self._hw.get("power_properties", {})
+        if not isinstance(preset_config, dict):
+            raise HardwareError("hardware.channel_presets must be an object")
+        if not isinstance(power_config, dict):
+            raise HardwareError("hardware.power_properties must be an object")
+        self._presets: dict[str, str] = dict(preset_config)
+        self._power: dict[str, dict] = dict(power_config)
         self._objective_id = self._read_objective_id()
         missing = [channel.id for channel in config.channels if channel.id not in self._presets]
         if missing:
             raise HardwareError(
                 "hardware.channel_presets has no Micro-Manager preset for: " + ", ".join(missing)
             )
+        channel_ids = {channel.id for channel in config.channels}
+        unknown_power = sorted(set(self._power) - channel_ids)
+        if unknown_power:
+            raise HardwareError(
+                "hardware.power_properties has unknown channels: " + ", ".join(unknown_power)
+            )
+        for channel_id, mapping in self._power.items():
+            if not isinstance(mapping, dict) or not mapping.get("device") or not mapping.get("property"):
+                raise HardwareError(
+                    f"hardware.power_properties.{channel_id} needs device and property"
+                )
+            try:
+                float(mapping.get("scale", 1.0))
+                float(mapping.get("offset", 0.0))
+            except (TypeError, ValueError) as exc:
+                raise HardwareError(
+                    f"hardware.power_properties.{channel_id} scale and offset must be numbers"
+                ) from exc
 
     # -- state ---------------------------------------------------------------
     @property
@@ -71,6 +96,15 @@ class MMCoreBackend:
     @property
     def current_objective_id(self) -> str:
         return self._objective_id
+
+    def refresh_objective_id(self) -> str:
+        """Read the physical turret and refresh the cached UI value."""
+
+        self._objective_id = self._read_objective_id()
+        return self._objective_id
+
+    def power_is_adjustable(self, channel_id: str) -> bool:
+        return channel_id in self._power
 
     def _read_objective_id(self) -> str:
         """Identify the objective in the light path from the turret, never by guessing.
@@ -109,7 +143,10 @@ class MMCoreBackend:
         return self.position
 
     def move_z(self, z_um: float) -> StagePosition:
-        check_z(self._config, self._objective_id, z_um)
+        # The turret can be changed from its own controls or Micro-Manager's
+        # property browser, so never apply a cached objective's safety range.
+        objective_id = self.refresh_objective_id()
+        check_z(self._config, objective_id, z_um)
         focus = self._core.getFocusDevice()
         self._call("move focus", self._core.setPosition, z_um)
         self._wait(focus)
@@ -126,10 +163,15 @@ class MMCoreBackend:
         self._call("rotate objective turret", self._core.setState, self._objective_device, state)
         self._wait(self._objective_device)
         self._call("wait for system", self._core.waitForSystem)
-        self._objective_id = objective.id
+        actual = self.refresh_objective_id()
+        if actual != objective.id:
+            raise HardwareError(
+                f"Objective change requested {objective.id}, but the turret reports {actual}"
+            )
         pixel_config = self._hw.get("pixel_size_configs", {}).get(objective.id)
         if pixel_config:
             self._call("select pixel size", self._core.setPixelSizeConfig, pixel_config)
+            self._call("wait for system", self._core.waitForSystem)
 
     # -- illumination & camera -----------------------------------------------
     def set_channel(self, channel: Channel, exposure_ms: float, power_percent: float) -> None:
@@ -137,12 +179,20 @@ class MMCoreBackend:
             raise HardwareError(f"{channel.name}: exposure {exposure_ms} ms is out of range")
         if not 0 <= power_percent <= channel.max_power_percent:
             raise HardwareError(f"{channel.name}: power {power_percent}% is out of range")
+        power = self._power.get(channel.id)
+        if power is None and not math.isclose(
+            power_percent, channel.default_power_percent, rel_tol=0.0, abs_tol=1e-6
+        ):
+            raise HardwareError(
+                f"{channel.name}: power is fixed by its Micro-Manager preset at the "
+                f"configured default {channel.default_power_percent:g}%; add "
+                f"hardware.power_properties.{channel.id} to make it adjustable"
+            )
         preset = self._presets[channel.id]
         self._call("select channel", self._core.setConfig, self._channel_group, preset)
         self._call("wait for channel", self._core.waitForConfig, self._channel_group, preset)
         self._call("set exposure", self._core.setExposure, float(exposure_ms))
-        power = self._power.get(channel.id)
-        if power:
+        if power is not None:
             value = power_percent * float(power.get("scale", 1.0)) + float(power.get("offset", 0.0))
             self._call(
                 f"set {channel.name} power",
@@ -154,8 +204,10 @@ class MMCoreBackend:
             self._wait(power["device"])
 
     def set_shutter_per_frame(self, enabled: bool) -> None:
-        if enabled:
-            self._call("close shutter", self._core.setShutterOpen, False)
+        # Establish a known dark state before either auto- or manually-controlled
+        # acquisition. In particular, the first XY move in manual mode must not
+        # inherit an open shutter from Micro-Manager or an earlier session.
+        self._call("close shutter", self._core.setShutterOpen, False)
         self._call("set auto-shutter", self._core.setAutoShutter, bool(enabled))
 
     def set_shutter_open(self, is_open: bool) -> None:
@@ -166,7 +218,24 @@ class MMCoreBackend:
     def snap(self) -> np.ndarray:
         self._call("snap image", self._core.snapImage)
         frame = self._call("read image", self._core.getImage)
-        return apply_orientation(np.asarray(frame), self._config.camera_orientation)
+        frame = apply_orientation(np.asarray(frame), self._config.camera_orientation)
+        expected_width, expected_height = self._config.oriented_camera_size_px
+        expected_shape = (expected_height, expected_width)
+        if frame.ndim != 2:
+            raise HardwareError(
+                f"Camera returned shape {frame.shape}; expected one 2-D monochrome plane"
+            )
+        if frame.shape != expected_shape:
+            raise HardwareError(
+                f"Camera returned {frame.shape[1]}×{frame.shape[0]} px after orientation; "
+                f"configuration expects {expected_width}×{expected_height} px. Check ROI, "
+                "binning, camera dimensions and transpose."
+            )
+        if frame.dtype.kind != "u" or frame.dtype.itemsize != 2:
+            raise HardwareError(
+                f"Camera returned {frame.dtype}; acquisition requires unsigned 16-bit frames"
+            )
+        return np.ascontiguousarray(frame, dtype=np.uint16)
 
     def close(self) -> None:
         try:

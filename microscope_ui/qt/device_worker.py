@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -34,6 +35,7 @@ class _Job:
 class DeviceWorker(QObject):
     frame_ready = Signal(object)  # np.ndarray
     position_changed = Signal(object)  # StagePosition
+    objective_changed = Signal(str)
     live_failed = Signal(str)
     _deliver = Signal(object, object)  # callback, value -> run on GUI thread
 
@@ -51,6 +53,8 @@ class DeviceWorker(QObject):
         self._illumination_ready = False
         self._stopped = False
         self.last_position: StagePosition = backend.position
+        self.last_objective_id: str = backend.current_objective_id
+        self._last_objective_poll = 0.0
         # Bound to this QObject (not a lambda): queued results are delivered on the GUI
         # thread and are dropped together with the worker when its window is deleted.
         # A free-function connection outlives the window under PySide6 and would run
@@ -207,6 +211,17 @@ class DeviceWorker(QObject):
         self._emit_position()
 
     def _emit_position(self) -> None:
+        now = time.monotonic()
+        if now - self._last_objective_poll >= 0.5:
+            self._last_objective_poll = now
+            try:
+                objective_id = self._backend.refresh_objective_id()
+            except HardwareError:
+                pass
+            else:
+                if objective_id != self.last_objective_id:
+                    self.last_objective_id = objective_id
+                    self.objective_changed.emit(objective_id)
         try:
             position = self._backend.position
         except HardwareError:

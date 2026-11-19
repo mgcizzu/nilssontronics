@@ -153,6 +153,7 @@ class ScanWindow(QMainWindow):
 
         self.device.frame_ready.connect(self._show_live_frame)
         self.device.position_changed.connect(self._position_changed)
+        self.device.objective_changed.connect(self._physical_objective_changed)
         self.device.live_failed.connect(self._live_failed)
         self.channel_table.changed.connect(self._push_live_settings)
         self.live_channel_box.currentIndexChanged.connect(self._push_live_settings)
@@ -355,7 +356,18 @@ class ScanWindow(QMainWindow):
         for objective in self.config_data.objectives:
             self.objective_box.addItem(objective.name, objective.id)
         self.objective_box.activated.connect(self._objective_selected)
-        self.channel_table = ChannelTable(self.config_data.channels)
+        adjustable_power_ids = (
+            None
+            if self.backend.simulated
+            else {
+                channel.id
+                for channel in self.config_data.channels
+                if self.backend.power_is_adjustable(channel.id)
+            }
+        )
+        self.channel_table = ChannelTable(
+            self.config_data.channels, adjustable_power_ids=adjustable_power_ids
+        )
         self.channel_table.changed.connect(self._recipe_to_custom)
         optics_layout.addWidget(self.objective_box)
         optics_layout.addWidget(self.channel_table)
@@ -994,6 +1006,18 @@ class ScanWindow(QMainWindow):
         index = self.objective_box.findData(self.backend.current_objective_id)
         if index >= 0:
             self.objective_box.setCurrentIndex(index)
+
+    def _physical_objective_changed(self, objective_id: str) -> None:
+        """Reflect a turret change made outside this window without commanding it again."""
+
+        index = self.objective_box.findData(objective_id)
+        if index >= 0 and self.objective_box.currentIndex() != index:
+            self.objective_box.setCurrentIndex(index)
+            self._reset_z_stack_capture()
+            self.progress_label.setText(
+                f"Turret changed externally: {self.config_data.objective(objective_id).name}"
+            )
+            self._refresh()
 
     def _objective_selected(self, _index: int) -> None:
         self._recipe_to_custom()

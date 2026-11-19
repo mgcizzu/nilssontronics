@@ -161,6 +161,18 @@ class DiskBackedMosaicTests(unittest.TestCase):
             DiskBackedMosaic(root, MosaicBounds(0, 10, 0, 10), channels, max_preview_side=8).close()
             self.assertFalse(stale.exists())
 
+    def test_non_uint16_plane_is_rejected_before_writing(self) -> None:
+        channels = (self.config.channel("dapi"),)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mosaic = DiskBackedMosaic(
+                root, MosaicBounds(0, 10, 0, 10), channels, max_preview_side=8
+            )
+            mosaic.begin_tile(0, 5, 5, 10, 10, z_planes=1)
+            with self.assertRaisesRegex(ValueError, "unsigned 16-bit"):
+                mosaic.write_plane("dapi", 0, np.ones((8, 8), np.uint8))
+            mosaic.close()
+
 
 if __name__ == "__main__":
     unittest.main()

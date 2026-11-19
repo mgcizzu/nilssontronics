@@ -153,10 +153,19 @@ class MicroscopeConfig:
 
     def fov_um(self, objective_id: str) -> tuple[float, float]:
         objective = self.objective(objective_id)
+        width_px, height_px = self.oriented_camera_size_px
         return (
-            self.camera_width_px * objective.pixel_size_um,
-            self.camera_height_px * objective.pixel_size_um,
+            width_px * objective.pixel_size_um,
+            height_px * objective.pixel_size_um,
         )
+
+    @property
+    def oriented_camera_size_px(self) -> tuple[int, int]:
+        """Frame width/height after the configured stage-axis orientation."""
+
+        if self.camera_orientation.transpose:
+            return (self.camera_height_px, self.camera_width_px)
+        return (self.camera_width_px, self.camera_height_px)
 
     def safe_z_range(self, objective_id: str) -> tuple[float, float]:
         objective = self.objective(objective_id)

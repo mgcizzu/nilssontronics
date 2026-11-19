@@ -42,6 +42,16 @@ class SlowSimulator(SimulatedMicroscope):
         super().set_channel(channel, exposure_ms, power_percent)
 
 
+class ExternallyChangedObjectiveSimulator(SlowSimulator):
+    """Expose a stale cached objective until the hardware refresh boundary is used."""
+
+    physical_objective_id = "63x_oil"
+
+    def refresh_objective_id(self) -> str:
+        self._objective_id = self.physical_objective_id
+        return self._objective_id
+
+
 class CycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -230,6 +240,21 @@ class CycleTests(unittest.TestCase):
         self.backend._position = replace(self.backend.position, z_um=99999)
         self.assertTrue(any("Current Z" in p for p in self.controller.preflight(plan, check_disk=False)))
 
+    def test_engine_rechecks_the_physical_objective_before_any_motion(self) -> None:
+        backend = ExternallyChangedObjectiveSimulator(self.config, frame_px=16)
+        backend._objective_id = "20x_air"  # stale state makes controller preflight pass
+        controller = ScanController(self.config, backend)
+        try:
+            controller.start_cycle(self.plan())
+            self.assertTrue(controller.wait(10))
+            status = controller.status()
+            self.assertEqual(status.state, "failed")
+            self.assertIn("turret reports 63x_oil", status.error)
+            self.assertEqual(backend.move_log, [])
+            self.assertEqual(backend.snap_count, 0)
+        finally:
+            controller.close()
+
     def test_flat_field_profiles_are_written_after_the_cycle(self) -> None:
         record, status = self.run_cycle(self.plan(options=AcquisitionOptions(flat_field=True)))
         self.assertIn("flat-field", status.message)
@@ -248,6 +273,7 @@ class FakeCore:
         self.z = 0.0
         self.state = 2  # turret position 3 with offset -1 → 20x_air
         self.auto_shutter = True
+        self.shutter_open = False
         self.fail_snap = False
 
     def __getattr__(self, name):
@@ -289,6 +315,10 @@ class FakeCore:
         self.calls.append(("setAutoShutter", value))
         self.auto_shutter = value
 
+    def setShutterOpen(self, value):
+        self.calls.append(("setShutterOpen", value))
+        self.shutter_open = value
+
     def snapImage(self):
         if self.fail_snap:
             raise RuntimeError("Camera timeout")
@@ -300,7 +330,12 @@ class FakeCore:
 class MMCoreBackendTests(unittest.TestCase):
     def make(self, **hardware):
         config = load_config()
-        config = replace(config, hardware={**config.hardware, **hardware})
+        config = replace(
+            config,
+            camera_width_px=4,
+            camera_height_px=3,
+            hardware={**config.hardware, **hardware},
+        )
         core = FakeCore()
         return config, core, MMCoreBackend(config, core=core)
 
@@ -315,6 +350,15 @@ class MMCoreBackendTests(unittest.TestCase):
         with self.assertRaises(StageLimitError):
             backend.move_z(config.objective("20x_air").safe_z_max_um + 1)
         self.assertFalse([c for c in core.calls if c[0] in ("setXYPosition", "setPosition")])
+
+    def test_z_move_refreshes_a_manually_changed_turret_before_checking_limits(self) -> None:
+        config, core, backend = self.make()
+        self.assertEqual(backend.current_objective_id, "20x_air")
+        core.state = config.objective("63x_oil").turret_position - 1
+        with self.assertRaises(StageLimitError):
+            backend.move_z(1500.0)  # valid for cached 20x, unsafe for physical 63x
+        self.assertEqual(backend.current_objective_id, "63x_oil")
+        self.assertNotIn(("setPosition", 1500.0), core.calls)
 
     def test_objective_change_goes_to_clearance_before_rotating(self) -> None:
         config, core, backend = self.make(objective_change_z_um=-4000)
@@ -336,11 +380,53 @@ class MMCoreBackendTests(unittest.TestCase):
         with self.assertRaises(HardwareError):
             backend.set_channel(config.channel("dapi"), 40, 99)
 
+    def test_unmapped_power_is_fixed_at_the_configured_preset_default(self) -> None:
+        config, core, backend = self.make()
+        channel = config.channel("dapi")
+        backend.set_channel(channel, 40, channel.default_power_percent)
+        self.assertFalse([call for call in core.calls if call[0] == "setProperty"])
+        core.calls.clear()
+        with self.assertRaises(HardwareError):
+            backend.set_channel(channel, 40, channel.default_power_percent + 1)
+        self.assertFalse(core.calls, "invalid power must be rejected before changing hardware")
+
+    def test_manual_shutter_mode_first_establishes_a_closed_shutter(self) -> None:
+        _config, core, backend = self.make()
+        core.shutter_open = True
+        backend.set_shutter_per_frame(False)
+        self.assertEqual(
+            core.calls[:2],
+            [("setShutterOpen", False), ("setAutoShutter", False)],
+        )
+        self.assertFalse(core.shutter_open)
+
     def test_frames_are_oriented_to_stage_axes(self) -> None:
         _config, _core, backend = self.make()
         backend._config = replace(backend._config, camera_orientation=CameraOrientation(flip_x=True))
         frame = backend.snap()
         self.assertEqual(frame[0].tolist(), [3, 2, 1, 0])
+
+    def test_transposed_frame_uses_oriented_configured_dimensions(self) -> None:
+        _config, _core, backend = self.make()
+        backend._config = replace(
+            backend._config,
+            camera_orientation=CameraOrientation(transpose=True),
+        )
+        frame = backend.snap()
+        self.assertEqual(frame.shape, (4, 3))
+
+    def test_frame_shape_and_dtype_must_match_the_uint16_contract(self) -> None:
+        _config, core, backend = self.make()
+        backend._config = replace(backend._config, camera_width_px=5)
+        with self.assertRaises(HardwareError) as shape_error:
+            backend.snap()
+        self.assertIn("configuration expects", str(shape_error.exception))
+
+        backend._config = replace(backend._config, camera_width_px=4)
+        core.getImage = lambda: np.zeros((3, 4), dtype=np.uint8)
+        with self.assertRaises(HardwareError) as dtype_error:
+            backend.snap()
+        self.assertIn("unsigned 16-bit", str(dtype_error.exception))
 
     def test_device_errors_become_hardware_errors(self) -> None:
         _config, core, backend = self.make()

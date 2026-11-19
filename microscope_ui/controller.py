@@ -169,6 +169,19 @@ class ScanController:
         problems += validate_plan(self.config, plan, tiles, check_disk=check_disk)
         if self.backend.current_objective_id != plan.objective_id:
             problems.append("The selected objective is not in the light path.")
+        for setting in plan.channels:
+            try:
+                channel = self.config.channel(setting.channel_id)
+            except KeyError:
+                continue  # validate_plan already reports the unknown channel
+            if (
+                not self.backend.power_is_adjustable(setting.channel_id)
+                and abs(setting.power_percent - channel.default_power_percent) > 1e-6
+            ):
+                problems.append(
+                    f"{channel.name} power is fixed by its Micro-Manager preset at "
+                    f"{channel.default_power_percent:g}%."
+                )
         if plan.z.mode == "single":
             low, high = self.config.safe_z_range(plan.objective_id)
             z = self.backend.position.z_um
@@ -260,7 +273,7 @@ class ScanController:
         if unknown:
             warnings.append(f"Channels not in this configuration (ignored): {', '.join(unknown)}")
         size = (correction.frame_width_px, correction.frame_height_px)
-        camera = (self.config.camera_width_px, self.config.camera_height_px)
+        camera = self.config.oriented_camera_size_px
         if size != camera:
             warnings.append(
                 f"Made for {size[0]}×{size[1]} px frames; the configured camera is {camera[0]}×{camera[1]} px. "
@@ -464,8 +477,8 @@ class ScanController:
                 cycle=record.number,
                 objective=self.config.objective(experiment.objective_id),
                 channel_settings=tuple(record.channels),
-                camera_width_px=self.config.camera_width_px,
-                camera_height_px=self.config.camera_height_px,
+                camera_width_px=self.config.oriented_camera_size_px[0],
+                camera_height_px=self.config.oriented_camera_size_px[1],
                 z_planes=z_planes,
                 z_step_um=record.z.step_um if record.z.mode == "stack" else None,
                 project=experiment.project,

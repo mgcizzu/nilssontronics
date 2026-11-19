@@ -59,7 +59,14 @@ class MMCoreDemoTests(unittest.TestCase):
         objectives = tuple(
             replace(o, safe_z_min_um=-280, safe_z_max_um=200) for o in base.objectives
         )
-        cls.config = replace(base, hardware=hardware, stage_limits=limits, objectives=objectives)
+        cls.config = replace(
+            base,
+            camera_width_px=64,
+            camera_height_px=64,
+            hardware=hardware,
+            stage_limits=limits,
+            objectives=objectives,
+        )
 
     def setUp(self) -> None:
         self.core = CMMCorePlus(mm_path=MM_PATH)
@@ -101,7 +108,7 @@ class MMCoreDemoTests(unittest.TestCase):
 
     def test_channels_shutter_and_snap(self) -> None:
         channel = self.config.channel("af488")
-        self.backend.set_channel(channel, 25.0, 10.0)
+        self.backend.set_channel(channel, 25.0, channel.default_power_percent)
         self.assertEqual(self.core.getCurrentConfig("Channel"), "FITC")
         self.assertAlmostEqual(self.core.getExposure(), 25.0)
         self.backend.set_shutter_per_frame(True)
@@ -132,7 +139,10 @@ class MMCoreDemoTests(unittest.TestCase):
                     sample="MMConfig_demo",
                     output_root=Path(temp),
                     objective_id="20x_air",
-                    channels=(ChannelSetting("dapi", 10, 5), ChannelSetting("af488", 10, 5)),
+                    channels=(
+                        ChannelSetting("dapi", 10, self.config.channel("dapi").default_power_percent),
+                        ChannelSetting("af488", 10, self.config.channel("af488").default_power_percent),
+                    ),
                     regions=(ScanRegion(0, 0, 1200, 800),),
                     focus_points=(),
                     z=ZSettings(mode="single"),

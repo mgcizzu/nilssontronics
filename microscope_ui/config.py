@@ -27,7 +27,7 @@ class ConfigError(ValueError):
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> MicroscopeConfig:
-    config_path = Path(path)
+    config_path = Path(path).expanduser().resolve()
     data = json.loads(config_path.read_text(encoding="utf-8"))
     try:
         config = _parse(data)
@@ -35,7 +35,15 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> MicroscopeConfig:
         directory = Path(calibration.get("directory", "calibration")).expanduser()
         if not directory.is_absolute():
             directory = config_path.parent / directory
-        config = replace(config, calibration_dir=directory)
+        hardware = dict(config.hardware)
+        for key in ("mm_config_path", "mm_adapter_path"):
+            value = hardware.get(key)
+            if value:
+                hardware_path = Path(value).expanduser()
+                if not hardware_path.is_absolute():
+                    hardware_path = config_path.parent / hardware_path
+                hardware[key] = str(hardware_path.resolve())
+        config = replace(config, calibration_dir=directory, hardware=hardware)
     except (KeyError, TypeError) as exc:
         raise ConfigError(f"Configuration is missing or has a malformed field: {exc}") from exc
     problems = validate_config(config)
@@ -95,8 +103,8 @@ def validate_config(config: MicroscopeConfig) -> list[str]:
 
     if config.camera_width_px <= 0 or config.camera_height_px <= 0:
         problems.append("camera width_px and height_px must be positive")
-    if config.bytes_per_pixel not in (1, 2, 4):
-        problems.append("bytes_per_pixel must be 1, 2 or 4")
+    if config.bytes_per_pixel != 2:
+        problems.append("bytes_per_pixel must be 2 (the saved-plane contract is uint16)")
     for axis in ("x", "y", "z"):
         low = getattr(limits, f"{axis}_min_um")
         high = getattr(limits, f"{axis}_max_um")

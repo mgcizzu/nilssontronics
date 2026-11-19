@@ -19,6 +19,7 @@ from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
 from microscope_ui.models import ScanRegion  # noqa: E402
 from microscope_ui.mosaic import read_tile  # noqa: E402
+from microscope_ui.qt.widgets import ChannelTable  # noqa: E402
 from microscope_ui.qt.window import ScanWindow  # noqa: E402
 
 
@@ -43,6 +44,15 @@ class FakeWheelEvent:
 
     def ignore(self) -> None:
         self.accepted = False
+
+
+def test_unmapped_hardware_power_is_fixed_in_the_channel_table(qtbot):
+    config = load_config()
+    table = ChannelTable(config.channels, adjustable_power_ids={"dapi"})
+    qtbot.addWidget(table)
+    assert table._power["dapi"].isEnabled()
+    assert not table._power["af488"].isEnabled()
+    assert "Fixed" in table._power["af488"].toolTip()
 
 
 @pytest.fixture

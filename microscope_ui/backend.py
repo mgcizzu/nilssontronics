@@ -45,6 +45,10 @@ class MicroscopeBackend(Protocol):
     @property
     def current_objective_id(self) -> str: ...
 
+    def refresh_objective_id(self) -> str: ...
+
+    def power_is_adjustable(self, channel_id: str) -> bool: ...
+
     def move_xy(self, x_um: float, y_um: float) -> StagePosition: ...
 
     def move_z(self, z_um: float) -> StagePosition: ...
@@ -142,6 +146,12 @@ class SimulatedMicroscope:
     def current_objective_id(self) -> str:
         return self._objective_id
 
+    def refresh_objective_id(self) -> str:
+        return self._objective_id
+
+    def power_is_adjustable(self, channel_id: str) -> bool:
+        return True
+
     @property
     def current_channel(self) -> Channel | None:
         return self._channel
@@ -185,8 +195,7 @@ class SimulatedMicroscope:
 
     def set_shutter_per_frame(self, enabled: bool) -> None:
         self.shutter_per_frame = enabled
-        if enabled:
-            self.shutter_open = False
+        self.shutter_open = False
 
     def set_shutter_open(self, is_open: bool) -> None:
         self.shutter_open = is_open

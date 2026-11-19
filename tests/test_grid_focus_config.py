@@ -11,6 +11,7 @@ from microscope_ui.focus import FocusSurface
 from microscope_ui.models import (
     AcquisitionOptions,
     AcquisitionPlan,
+    CameraOrientation,
     ChannelSetting,
     FocusPoint,
     ScanRegion,
@@ -201,6 +202,39 @@ class ConfigValidationTests(unittest.TestCase):
         )
         problems = validate_plan(config, plan, check_disk=False)
         self.assertTrue(any("approach_offset_um" in p for p in problems))
+
+    def test_relative_micromanager_paths_are_resolved_beside_the_json(self) -> None:
+        source = json.loads(Path("config/microscope.json").read_text(encoding="utf-8"))
+        source["hardware"]["mm_config_path"] = "micro-manager/scope.cfg"
+        source["hardware"]["mm_adapter_path"] = "micro-manager"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "scope.json"
+            path.write_text(json.dumps(source), encoding="utf-8")
+            config = load_config(path)
+        self.assertEqual(
+            config.hardware["mm_config_path"],
+            str((root / "micro-manager" / "scope.cfg").resolve()),
+        )
+        self.assertEqual(
+            config.hardware["mm_adapter_path"],
+            str((root / "micro-manager").resolve()),
+        )
+
+    def test_transpose_swaps_the_stage_axis_fov(self) -> None:
+        config = replace(
+            load_config(),
+            camera_width_px=100,
+            camera_height_px=40,
+            camera_orientation=CameraOrientation(transpose=True),
+        )
+        pixel_size = config.objective("20x_air").pixel_size_um
+        self.assertEqual(config.oriented_camera_size_px, (40, 100))
+        self.assertEqual(config.fov_um("20x_air"), (40 * pixel_size, 100 * pixel_size))
+
+    def test_non_uint16_output_configuration_is_rejected(self) -> None:
+        config = replace(load_config(), bytes_per_pixel=1)
+        self.assertTrue(any("uint16" in problem for problem in validate_config(config)))
 
 
 if __name__ == "__main__":

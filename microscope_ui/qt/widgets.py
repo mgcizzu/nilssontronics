@@ -75,7 +75,12 @@ class ChannelTable(QTableWidget):
 
     changed = Signal()
 
-    def __init__(self, channels: tuple[Channel, ...], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        channels: tuple[Channel, ...],
+        parent: QWidget | None = None,
+        adjustable_power_ids: set[str] | None = None,
+    ) -> None:
         super().__init__(len(channels), 3, parent)
         self._channels = channels
         self.setHorizontalHeaderLabels(["Channel", "Exposure", "Power"])
@@ -112,6 +117,12 @@ class ChannelTable(QTableWidget):
             exposure.setFixedWidth(82)
             power = spin(channel.default_power_percent, 0, channel.max_power_percent, 0, "%")
             power.setFixedWidth(60)
+            if adjustable_power_ids is not None and channel.id not in adjustable_power_ids:
+                power.setEnabled(False)
+                power.setToolTip(
+                    f"Fixed at {channel.default_power_percent:g}% by the Micro-Manager preset. "
+                    f"Add hardware.power_properties.{channel.id} to make it adjustable."
+                )
             exposure_cell = QWidget()
             exposure_cell.setMaximumWidth(120)
             exposure_layout = QHBoxLayout(exposure_cell)
