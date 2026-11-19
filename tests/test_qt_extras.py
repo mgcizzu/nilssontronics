@@ -76,6 +76,23 @@ def test_recipe_keeps_exposures_already_set(window):
     assert window.z_mode_box.currentData() == "focus_map"
 
 
+def test_exposure_slider_and_numeric_value_stay_synchronized(window):
+    channel = window.config_data.channel("dapi")
+    slider = window.channel_table._exposure_sliders["dapi"]
+    exposure = window.channel_table._exposure["dapi"]
+
+    slider.setValue(slider.maximum())
+    assert exposure.value() == pytest.approx(channel.max_exposure_ms)
+    slider.setValue(slider.minimum())
+    assert exposure.value() == pytest.approx(0.1)
+
+    exposure.setValue(123.0)
+    assert exposure.value() == 123.0  # precise entry is not quantized by the slider
+    slider_position = slider.value()
+    slider.setValue(slider_position + 1)
+    assert exposure.value() > 123.0
+
+
 def test_recipe_with_other_objective_is_refused_inside_experiment(qtbot, window):
     window.region_list.append(ScanRegion(-300, -200, 600, 400))
     window.channel_table._checks["dapi"].setChecked(True)
