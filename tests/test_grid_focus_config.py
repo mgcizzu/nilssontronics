@@ -134,6 +134,27 @@ class TileGridTests(unittest.TestCase):
         self.assertEqual(corrected_estimate.data_bytes, plain_estimate.data_bytes)
         self.assertEqual(kept_estimate.data_bytes, 2 * corrected_estimate.data_bytes)
 
+    def test_surface_stack_estimate_uses_its_full_plane_count(self) -> None:
+        points = (
+            FocusPoint(-1000, -1000, 0),
+            FocusPoint(1000, -1000, 1),
+            FocusPoint(0, 1000, 2),
+        )
+        single = AcquisitionPlan(
+            "P", "S", Path("."), "20x_air",
+            (ChannelSetting("dapi", 40, 20),),
+            (ScanRegion(-1000, -1000, 2000, 2000),),
+            focus_points=points,
+        )
+        surface_stack = replace(
+            single,
+            z=ZSettings("surface_stack", -2, 3, 1),
+        )
+        single_estimate = estimate_acquisition(self.config, single)
+        stack_estimate = estimate_acquisition(self.config, surface_stack)
+        self.assertEqual(stack_estimate.z_planes, 6)
+        self.assertEqual(stack_estimate.frames, single_estimate.frames * 6)
+
 
 class ZPlaneTests(unittest.TestCase):
     def test_model_and_optics_agree_on_plane_count(self) -> None:
@@ -149,6 +170,19 @@ class ZPlaneTests(unittest.TestCase):
     def test_default_z_settings_are_not_captured(self) -> None:
         z = ZSettings(mode="stack")
         self.assertEqual(z.plane_count, 0)
+
+    def test_surface_stack_positions_are_offsets_around_focus(self) -> None:
+        z = ZSettings(mode="surface_stack", bottom_um=-2.0, top_um=3.0, step_um=1.0)
+        self.assertEqual(z.plane_count, 6)
+        self.assertEqual(z.stack_positions(), (-2.0, -1.0, 0.0, 1.0, 2.0, 3.0))
+        asymmetric = ZSettings(
+            mode="surface_stack", bottom_um=-2.1, top_um=3.2, step_um=1.0
+        )
+        offsets = asymmetric.stack_positions()
+        self.assertIn(0.0, offsets)
+        self.assertAlmostEqual(offsets[0], -2.1)
+        self.assertAlmostEqual(offsets[-1], 3.2)
+        self.assertLessEqual(max(b - a for a, b in zip(offsets, offsets[1:])), 1.0)
 
 
 class FocusSurfaceTests(unittest.TestCase):
@@ -199,6 +233,26 @@ class FocusSurfaceTests(unittest.TestCase):
         )
         problems = validate_plan(config, plan, check_disk=False)
         self.assertTrue(any("focus point 3 z" in p.lower() or "surface" in p.lower() for p in problems))
+
+    def test_surface_stack_checks_the_complete_per_tile_z_range(self) -> None:
+        config = load_config()
+        plan = AcquisitionPlan(
+            "P", "S", Path("."), "20x_air", (ChannelSetting("dapi", 40, 20),),
+            (ScanRegion(-1000, -1000, 2000, 2000),),
+            z=ZSettings("surface_stack", -2, 3, 1),
+            focus_points=(
+                FocusPoint(-900, -900, 0),
+                FocusPoint(900, -900, 1),
+                FocusPoint(0, 900, 2),
+            ),
+        )
+        self.assertEqual(validate_plan(config, plan, check_disk=False), [])
+        unsafe = replace(
+            plan,
+            z=replace(plan.z, top_um=config.objective("20x_air").safe_z_max_um + 1),
+        )
+        problems = validate_plan(config, unsafe, check_disk=False)
+        self.assertTrue(any("surface-relative stack" in problem for problem in problems))
 
 
 class ConfigValidationTests(unittest.TestCase):

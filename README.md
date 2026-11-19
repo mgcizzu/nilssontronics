@@ -65,6 +65,12 @@ A new cycle cannot start while an earlier one is unfinished.
   - *Plane fit*: least-squares plane, robust for noisy points on flat sections.
 
   Every tile's surface Z is checked against the safe range before scanning.
+- **Z-stack around surface** – a stack from the chosen distance below to the
+  chosen distance above each tile's interpolated focus-surface Z. The surface
+  plane is always included, and spacing never exceeds the selected step. This
+  follows tilted or warped sections without making every tile span the full
+  specimen-wide Z range. The complete per-tile stack is checked against the
+  objective's safe Z range before acquisition.
 
 ## Options (all optional)
 

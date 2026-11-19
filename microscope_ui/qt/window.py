@@ -57,6 +57,7 @@ from ..backend_mmcore import create_backend
 from ..config import DEFAULT_CONFIG_PATH, load_config
 from ..controller import ControllerError, ScanController
 from ..experiment import Experiment
+from ..focus import FocusSurface
 from ..models import (
     AcquisitionOptions,
     AcquisitionPlan,
@@ -88,7 +89,12 @@ CLOSE_TIMEOUT_S = 30.0
 DEVICE_DRAIN_TIMEOUT_S = 30.0
 POLL_INTERVAL_MS = 150
 MOSAIC_REFRESH_S = 0.3
-Z_MODES = (("Single plane (current Z)", "single"), ("Focus map", "focus_map"), ("Z-stack", "stack"))
+Z_MODES = (
+    ("Single plane (current Z)", "single"),
+    ("Focus map", "focus_map"),
+    ("Z-stack (absolute)", "stack"),
+    ("Z-stack around surface", "surface_stack"),
+)
 LAUNCH_ERRORS = (ControllerError, HardwareError, OSError, ValueError)
 MOSAIC_UNDERLAY_PX = 1024
 PREVIEW_TILE_PX = 256
@@ -140,7 +146,11 @@ class ScanWindow(QMainWindow):
             self.z_mode_box.currentIndexChanged,
             self.z_bottom.valueChanged,
             self.z_top.valueChanged,
+            self.z_below.valueChanged,
+            self.z_above.valueChanged,
             self.z_step.valueChanged,
+            self.focus_list.changed,
+            self.focus_method_box.currentIndexChanged,
         ):
             signal.connect(self._update_z_stack_view)
         microscope_menu = self.menuBar().addMenu("Microscope")
@@ -430,12 +440,17 @@ class ScanWindow(QMainWindow):
         # Z
         z_group = QGroupBox("Z")
         z_form = QFormLayout(z_group)
+        self.z_form = z_form
         self.z_mode_box = QComboBox()
         for label, value in Z_MODES:
             self.z_mode_box.addItem(label, value)
         self.z_mode_box.currentIndexChanged.connect(self._z_mode_changed)
         self.z_bottom = spin(0, -1e5, 1e5, 2, "µm")
         self.z_top = spin(0, -1e5, 1e5, 2, "µm")
+        self.z_below = spin(2, 0, 1e4, 2, "µm")
+        self.z_above = spin(2, 0, 1e4, 2, "µm")
+        self.z_below.setToolTip("Distance below the interpolated focus surface at every tile")
+        self.z_above.setToolTip("Distance above the interpolated focus surface at every tile")
         self.z_step = spin(1, 0.01, 1000, 2, "µm")
         self.z_begin_button = QPushButton("Capture Begin")
         self.z_end_button = QPushButton("Capture End")
@@ -451,8 +466,17 @@ class ScanWindow(QMainWindow):
         z_form.addRow(stack_buttons)
         z_form.addRow("Begin", self.z_bottom)
         z_form.addRow("End", self.z_top)
-        z_form.addRow("Step", self.z_step)
-        self.z_stack_widgets = (self.z_begin_button, self.z_end_button, self.z_bottom, self.z_top, self.z_step)
+        z_form.addRow("Below surface", self.z_below)
+        z_form.addRow("Above surface", self.z_above)
+        self.z_step_label = QLabel("Step")
+        z_form.addRow(self.z_step_label, self.z_step)
+        self.z_stack_widgets = (
+            self.z_begin_button,
+            self.z_end_button,
+            self.z_bottom,
+            self.z_top,
+        )
+        self.z_surface_stack_widgets = (self.z_below, self.z_above)
         acquisition_layout.addWidget(z_group)
 
         # Tiling & options
@@ -505,6 +529,8 @@ class ScanWindow(QMainWindow):
             self.focus_list.changed,
             self.z_bottom.valueChanged,
             self.z_top.valueChanged,
+            self.z_below.valueChanged,
+            self.z_above.valueChanged,
             self.z_step.valueChanged,
             self.overlap_x.valueChanged,
             self.overlap_y.valueChanged,
@@ -810,10 +836,15 @@ class ScanWindow(QMainWindow):
 
     # ----------------------------------------------------------------- plan --
     def build_plan(self) -> AcquisitionPlan:
+        z_mode = self.z_mode_box.currentData()
         z = ZSettings(
-            mode=self.z_mode_box.currentData(),
-            bottom_um=self.z_bottom.value(),
-            top_um=self.z_top.value(),
+            mode=z_mode,
+            bottom_um=(
+                -self.z_below.value()
+                if z_mode == "surface_stack"
+                else self.z_bottom.value()
+            ),
+            top_um=(self.z_above.value() if z_mode == "surface_stack" else self.z_top.value()),
             step_um=self.z_step.value(),
             begin_captured=self.z_begin_captured,
             end_captured=self.z_end_captured,
@@ -1105,10 +1136,21 @@ class ScanWindow(QMainWindow):
         self._refresh()
 
     def _z_mode_changed(self, *_args) -> None:
-        stack = self.z_mode_box.currentData() == "stack"
+        mode = self.z_mode_box.currentData()
+        stack = mode == "stack"
+        surface_stack = mode == "surface_stack"
         for widget in self.z_stack_widgets:
             widget.setVisible(stack)
-        self.focus_method_box.setEnabled(self.z_mode_box.currentData() == "focus_map")
+        for widget in self.z_surface_stack_widgets:
+            widget.setVisible(surface_stack)
+        for widget in self.z_stack_widgets + self.z_surface_stack_widgets:
+            field_label = self.z_form.labelForField(widget)
+            if field_label is not None:
+                field_label.setVisible(widget.isVisible())
+        uses_stack_step = stack or surface_stack
+        self.z_step.setVisible(uses_stack_step)
+        self.z_step_label.setVisible(uses_stack_step)
+        self.focus_method_box.setEnabled(mode in ("focus_map", "surface_stack"))
         self._update_z_stack_view()
         self._refresh()
 
@@ -1116,7 +1158,8 @@ class ScanWindow(QMainWindow):
         if not hasattr(self, "z_wheel"):
             return
         positions: tuple[float, ...] = ()
-        if self.z_mode_box.currentData() == "stack":
+        mode = self.z_mode_box.currentData()
+        if mode == "stack":
             positions = ZSettings(
                 mode="stack",
                 bottom_um=self.z_bottom.value(),
@@ -1125,6 +1168,22 @@ class ScanWindow(QMainWindow):
                 begin_captured=True,
                 end_captured=True,
             ).stack_positions()
+        elif mode == "surface_stack" and len(self.focus_list.items) >= 3:
+            try:
+                surface = FocusSurface(
+                    self.focus_list.items, self.focus_method_box.currentText()
+                )
+                p = self.stage_position
+                centre = surface.z_at(p.x_um, p.y_um)
+                offsets = ZSettings(
+                    mode="surface_stack",
+                    bottom_um=-self.z_below.value(),
+                    top_um=self.z_above.value(),
+                    step_um=self.z_step.value(),
+                ).stack_positions()
+                positions = tuple(centre + offset for offset in offsets)
+            except ValueError:
+                positions = ()
         self.z_wheel.set_stack(positions, self.device.last_position.z_um)
 
     def _capture_z_begin(self) -> None:
@@ -1704,6 +1763,13 @@ class ScanWindow(QMainWindow):
             if last is not None:
                 self.channel_table.set_settings(last.channels)
                 self.z_mode_box.setCurrentIndex(self.z_mode_box.findData(last.z.mode))
+                if last.z.mode == "surface_stack":
+                    self.z_below.setValue(max(0.0, -last.z.bottom_um))
+                    self.z_above.setValue(max(0.0, last.z.top_um))
+                else:
+                    self.z_bottom.setValue(last.z.bottom_um)
+                    self.z_top.setValue(last.z.top_um)
+                self.z_step.setValue(last.z.step_um)
                 options = last.options or experiment.options
                 self.focus_method_box.setCurrentText(options.focus_method)
                 self.shutter_per_frame.setChecked(options.shutter_per_frame)

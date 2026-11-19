@@ -17,7 +17,7 @@ from qtpy.QtWidgets import QScrollArea, QTabWidget  # noqa: E402
 
 from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
-from microscope_ui.models import ScanRegion  # noqa: E402
+from microscope_ui.models import FocusPoint, ScanRegion  # noqa: E402
 from microscope_ui.mosaic import read_tile  # noqa: E402
 from microscope_ui.qt.widgets import ChannelTable  # noqa: E402
 from microscope_ui.qt.window import ScanWindow  # noqa: E402
@@ -215,6 +215,27 @@ def test_z_stack_view_highlights_the_nearest_active_plane(qtbot, window):
     qtbot.waitUntil(lambda: window.z_wheel.active_plane_index == 3)
     assert window.z_wheel.plane_label.text() == "4 / 5"
     assert "1.00 µm" in window.z_wheel.position_label.text()
+
+
+def test_surface_stack_builds_offsets_around_focus_map(window):
+    window.focus_list.set_items(
+        [
+            FocusPoint(-1000, -1000, -1),
+            FocusPoint(1000, -1000, 1),
+            FocusPoint(0, 1000, 2),
+        ]
+    )
+    window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("surface_stack"))
+    window.z_below.setValue(2.0)
+    window.z_above.setValue(3.0)
+    window.z_step.setValue(1.0)
+    plan = window.build_plan()
+    assert plan.z.mode == "surface_stack"
+    assert (plan.z.bottom_um, plan.z.top_um, plan.z.plane_count) == (-2.0, 3.0, 6)
+    assert not window.z_below.isHidden() and not window.z_above.isHidden()
+    assert window.z_begin_button.isHidden()
+    assert window.focus_method_box.isEnabled()
+    assert window.z_wheel.plane_count == 6
 
 
 def test_finished_cycle_invalidates_captured_stack_bounds(qtbot, window):

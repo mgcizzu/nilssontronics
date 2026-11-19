@@ -7,11 +7,11 @@ from typing import Literal
 
 
 Immersion = Literal["air", "oil", "water", "silicone", "other"]
-ZMode = Literal["single", "stack", "focus_map"]
+ZMode = Literal["single", "stack", "focus_map", "surface_stack"]
 TileOrder = Literal["raster", "serpentine"]
 FocusMethod = Literal["linear", "plane"]
 
-Z_MODES: tuple[str, ...] = ("single", "stack", "focus_map")
+Z_MODES: tuple[str, ...] = ("single", "stack", "focus_map", "surface_stack")
 TILE_ORDERS: tuple[str, ...] = ("raster", "serpentine")
 FOCUS_METHODS: tuple[str, ...] = ("linear", "plane")
 
@@ -288,18 +288,34 @@ class ZSettings:
 
     @property
     def plane_count(self) -> int:
-        if self.mode != "stack":
+        if self.mode not in ("stack", "surface_stack"):
             return 1
-        if not self.begin_captured or not self.end_captured or self.step_um <= 0:
+        if self.mode == "stack" and (not self.begin_captured or not self.end_captured):
             return 0
+        if self.step_um <= 0:
+            return 0
+        if self.mode == "surface_stack":
+            if self.bottom_um > 0 or self.top_um < 0:
+                return 0
+            below = endpoint_inclusive_plane_count(abs(self.bottom_um), self.step_um)
+            above = endpoint_inclusive_plane_count(abs(self.top_um), self.step_um)
+            return below + above - 1  # the surface plane belongs to both halves
         return endpoint_inclusive_plane_count(self.top_um - self.bottom_um, self.step_um)
 
     def stack_positions(self) -> tuple[float, ...]:
-        """Absolute Z positions from Begin to End inclusive (stack mode only)."""
+        """Absolute positions, or surface-relative offsets, from bottom to top."""
 
         count = self.plane_count
-        if self.mode != "stack" or count == 0:
+        if self.mode not in ("stack", "surface_stack") or count == 0:
             return ()
+        if self.mode == "surface_stack":
+            below_count = endpoint_inclusive_plane_count(abs(self.bottom_um), self.step_um)
+            above_count = endpoint_inclusive_plane_count(abs(self.top_um), self.step_um)
+            below_spacing = abs(self.bottom_um) / (below_count - 1) if below_count > 1 else 0.0
+            above_spacing = abs(self.top_um) / (above_count - 1) if above_count > 1 else 0.0
+            below = tuple(self.bottom_um + index * below_spacing for index in range(below_count))
+            above = tuple(index * above_spacing for index in range(1, above_count))
+            return below + above
         if count == 1:
             return (self.bottom_um,)
         spacing = (self.top_um - self.bottom_um) / (count - 1)

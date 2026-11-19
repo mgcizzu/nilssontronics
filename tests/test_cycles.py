@@ -122,6 +122,22 @@ class CycleTests(unittest.TestCase):
         _header, planes = read_tile(self.controller.experiment.cycle_folder(1), 0)
         self.assertEqual(len(planes), 2 * 5)
 
+    def test_surface_stack_is_centred_on_each_tiles_focus_surface(self) -> None:
+        z = ZSettings("surface_stack", -1, 1, 1)
+        record, status = self.run_cycle(self.plan(z=z))
+        self.assertEqual(status.state, "complete")
+        folder = self.controller.experiment.cycle_folder(record.number)
+        centres = set()
+        for tile_id, tile_record in tile_records(folder).items():
+            positions = tile_record["z_positions_um"]
+            self.assertEqual(len(positions), 3)
+            self.assertAlmostEqual(positions[1] - positions[0], 1.0)
+            self.assertAlmostEqual(positions[2] - positions[1], 1.0)
+            centres.add(round(positions[1], 3))
+        self.assertGreater(len(centres), 3)
+        saved = Experiment.load(self.controller.experiment.root).cycle(record.number)
+        self.assertEqual(saved.z, z)
+
     def test_shutter_is_closed_during_moves_in_per_tile_mode(self) -> None:
         options = AcquisitionOptions(shutter_per_frame=False)
         z = ZSettings("stack", 0, 2, 1, begin_captured=True, end_captured=True)

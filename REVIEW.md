@@ -104,9 +104,10 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
 
 ## D. Feature idea (not a bug)
 
-- [ ] **D1. Z-stack relative to the focus surface.** Stacks are absolute for every
+- [x] **D1. Z-stack relative to the focus surface.** Stacks are absolute for every
   tile, so on a tilted section they must span the whole tilt. A "stack around the
   surface" mode (±N µm around the focus-map Z of each tile) would shorten stacks a
   lot on large sections. Needs Marco's OK (changes the Z-mode set).
-  **Assessment:** useful feature proposal, not a defect. Deferred pending explicit
-  approval of the new acquisition mode.
+  **Implemented:** approved by Marco. The `surface_stack` mode captures a stack
+  below/above each tile's interpolated surface Z, always includes the surface
+  plane, and preflights the complete per-tile range against safe Z limits.

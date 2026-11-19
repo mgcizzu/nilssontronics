@@ -251,6 +251,13 @@ def validate_plan(
                 f"Z range must stay between {safe_min:.0f} and {safe_max:.0f} µm "
                 f"for {objective.name}."
             )
+    elif plan.z.mode == "surface_stack":
+        if plan.z.bottom_um > 0 or plan.z.top_um < 0:
+            problems.append(
+                "A surface Z-stack must start at or below the surface and end at or above it."
+            )
+        if plan.z.step_um <= 0:
+            problems.append("Surface Z-stack step must be greater than zero.")
 
     for index, point in enumerate(plan.focus_points, start=1):
         if not limits.contains_xy(point.x_um, point.y_um):
@@ -263,7 +270,7 @@ def validate_plan(
         if plan.regions and not any(point_in_polygon((point.x_um, point.y_um), region.vertices) for region in plan.regions):
             problems.append(f"Focus point {index} is outside the selected scan regions.")
 
-    if plan.z.mode == "focus_map":
+    if plan.z.mode in ("focus_map", "surface_stack"):
         if len(plan.focus_points) < 3:
             problems.append("Surface following needs at least three focus points.")
         else:
@@ -273,9 +280,17 @@ def validate_plan(
                 problems.append(str(exc))
                 surface = None
             low, high = surface.z_range(tile.xy for tile in tiles) if surface and tiles else (0.0, 0.0)
+            if plan.z.mode == "surface_stack":
+                low += plan.z.bottom_um
+                high += plan.z.top_um
             if surface is not None and tiles and (low < safe_min or high > safe_max):
+                subject = (
+                    "The surface-relative stack"
+                    if plan.z.mode == "surface_stack"
+                    else "The focus surface"
+                )
                 problems.append(
-                    f"The focus surface reaches Z {low:.1f}–{high:.1f} µm, outside the "
+                    f"{subject} reaches Z {low:.1f}–{high:.1f} µm, outside the "
                     f"safe range {safe_min:.0f}–{safe_max:.0f} µm for {objective.name}."
                 )
 

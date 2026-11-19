@@ -218,6 +218,15 @@ class ScanController:
         if z.mode == "focus_map":
             surface = FocusSurface(focus_points, focus_method)
             return {tile.index: (surface.z_at(tile.x_um, tile.y_um),) for tile in tiles}
+        if z.mode == "surface_stack":
+            surface = FocusSurface(focus_points, focus_method)
+            offsets = z.stack_positions()
+            return {
+                tile.index: tuple(
+                    surface.z_at(tile.x_um, tile.y_um) + offset for offset in offsets
+                )
+                for tile in tiles
+            }
         if single_z_um is None:
             raise ControllerError("Single-plane acquisition needs a Z position")
         return {tile.index: (single_z_um,) for tile in tiles}
@@ -555,7 +564,11 @@ class ScanController:
                 camera_width_px=self.config.oriented_camera_size_px[0],
                 camera_height_px=self.config.oriented_camera_size_px[1],
                 z_planes=z_planes,
-                z_step_um=record.z.step_um if record.z.mode == "stack" else None,
+                z_step_um=(
+                    record.z.step_um
+                    if record.z.mode in ("stack", "surface_stack")
+                    else None
+                ),
                 project=experiment.project,
                 sample=experiment.sample,
                 distortion_correction=corrector.correction.fingerprint if corrector else None,
