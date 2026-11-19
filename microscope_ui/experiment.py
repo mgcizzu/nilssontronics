@@ -21,11 +21,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 import json
-import os
 from pathlib import Path
 import re
 from typing import Literal
 
+from .durability import durable_fsync, durable_fsync_directory
 from .models import (
     AcquisitionOptions,
     ChannelSetting,
@@ -173,8 +173,9 @@ class Experiment:
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(self.to_dict(), handle, indent=2)
             handle.flush()
-            os.fsync(handle.fileno())
+            durable_fsync(handle.fileno())
         temporary.replace(path)
+        durable_fsync_directory(self.root)
         return path
 
     # -- cycles ----------------------------------------------------------------

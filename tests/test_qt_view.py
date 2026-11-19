@@ -217,6 +217,20 @@ def test_z_stack_view_highlights_the_nearest_active_plane(qtbot, window):
     assert "1.00 µm" in window.z_wheel.position_label.text()
 
 
+def test_finished_cycle_invalidates_captured_stack_bounds(qtbot, window):
+    window.region_list.set_items([ScanRegion(-300, -200, 600, 400)])
+    window.channel_table._checks["dapi"].setChecked(True)
+    window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("stack"))
+    window.z_bottom.setValue(-1.0)
+    window.z_top.setValue(1.0)
+    window.z_step.setValue(1.0)
+    window.z_begin_captured = window.z_end_captured = True
+    window.start_button.click()
+    qtbot.waitUntil(lambda: not window.poll_timer.isActive(), timeout=30000)
+    assert window.controller.status().state == "complete"
+    assert not window.z_begin_captured and not window.z_end_captured
+
+
 def test_gui_stays_responsive_during_slow_live(qtbot, window):
     window.backend.delay = 0.4  # long exposure
     window.live_button.setChecked(True)

@@ -95,6 +95,10 @@ class AcquisitionEngine:
         self._resume_signal = Condition(self._lock)
         self._abort = Event()
         self._pause_requested = False
+        # Hardware position readback is often noisy. The acquisition owns the
+        # stage while it runs, so the last successful command is the reliable
+        # source for deciding whether another Z move is necessary.
+        self._last_commanded_z: float | None = None
         skipped = sum(1 for tile in run.tiles if tile.index in run.skip_tiles)
         self._status = EngineStatus(
             state="idle",
@@ -241,8 +245,13 @@ class AcquisitionEngine:
                 return not self._abort.is_set()
         # Let the writer save the tile that was just queued before reporting
         # "paused", so every acquired tile is on disk while the operator waits.
-        self._writer.wait_until_idle()
+        while not self._writer.wait_until_idle(timeout=0.2):
+            if self._abort.is_set():
+                return False
         self._safe_close_shutter()
+        # Treat the stage as externally mutable while paused. The first frame
+        # after resume will re-establish the intended Z plane.
+        self._last_commanded_z = None
         with self._lock:
             if self._pause_requested and not self._abort.is_set():
                 self._status = replace(
@@ -284,8 +293,8 @@ class AcquisitionEngine:
             self._set(current_tile=tile, current_z_planes=len(z_list), message=f"Tile {tile.index + 1}")
 
             if approach > 0:
-                backend.move_xy(tile.x_um - approach, tile.y_um - approach)
-            backend.move_xy(tile.x_um, tile.y_um)
+                backend.move_xy_for_acquisition(tile.x_um - approach, tile.y_um - approach)
+            backend.move_xy_for_acquisition(tile.x_um, tile.y_um)
 
             for channel_number, setting in enumerate(run.channels):
                 channel = channel_lookup[setting.channel_id]
@@ -295,10 +304,11 @@ class AcquisitionEngine:
                 for z_index, z_um in enumerate(z_list):
                     if self._abort.is_set():
                         return ("aborted", None)
-                    if abs(backend.position.z_um - z_um) > 1e-6:
+                    if self._last_commanded_z is None or abs(self._last_commanded_z - z_um) > 1e-6:
                         if not run.shutter_per_frame:
                             backend.set_shutter_open(False)
-                        backend.move_z(z_um)
+                        backend.move_z_for_acquisition(run.objective_id, z_um)
+                        self._last_commanded_z = z_um
                         if not run.shutter_per_frame:
                             backend.set_shutter_open(True)
                     self._set(current_channel_id=channel.id, current_z_index=z_index)

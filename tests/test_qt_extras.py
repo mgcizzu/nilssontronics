@@ -66,6 +66,16 @@ def test_recipe_sets_objective_channels_and_z_mode(qtbot, window):
     assert window.recipe_box.currentText() == "Custom"
 
 
+def test_recipe_confirms_before_automatic_turret_move(window):
+    prompts = []
+    window.confirm = lambda title, text: prompts.append((title, text)) or False
+    choose_recipe(window, "Tissue survey")
+    assert prompts and prompts[-1][0] == "Change objective"
+    assert "safe clearance" in prompts[-1][1]
+    assert window.backend.current_objective_id == "20x_air"
+    assert window.objective_box.currentData() == "20x_air"
+
+
 def test_recipe_keeps_exposures_already_set(window):
     window.channel_table._checks["dapi"].setChecked(True)
     window.channel_table._exposure["dapi"].setValue(123.0)

@@ -360,6 +360,21 @@ class MMCoreBackendTests(unittest.TestCase):
         self.assertEqual(backend.current_objective_id, "63x_oil")
         self.assertNotIn(("setPosition", 1500.0), core.calls)
 
+    def test_acquisition_moves_skip_position_and_redundant_turret_reads(self) -> None:
+        _config, core, backend = self.make()
+        core.getXYPosition = mock.Mock(wraps=core.getXYPosition)
+        core.getPosition = mock.Mock(wraps=core.getPosition)
+        core.getState = mock.Mock(wraps=core.getState)
+        core.calls.clear()
+        backend.move_xy_for_acquisition(100.0, 200.0)
+        backend.move_z_for_acquisition("20x_air", 3.0)
+        names = [call[0] for call in core.calls]
+        self.assertIn("setXYPosition", names)
+        self.assertIn("setPosition", names)
+        core.getXYPosition.assert_not_called()
+        core.getPosition.assert_not_called()
+        core.getState.assert_not_called()
+
     def test_objective_change_goes_to_clearance_before_rotating(self) -> None:
         config, core, backend = self.make(objective_change_z_um=-4000)
         backend.change_objective(config.objective("63x_oil"))

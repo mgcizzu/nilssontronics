@@ -9,7 +9,7 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
 
 ## A. Fix before running on the microscope
 
-- [ ] **A1. Redundant Z move before every frame.**
+- [x] **A1. Redundant Z move before every frame.**
   `microscope_ui/engine.py:298` compares the *read-back* Z with the target to
   1e-6 µm. Real focus drives report Z with noise, so it never matches and the
   engine re-issues `move_z` for every plane, even in single-plane and focus-map
@@ -20,7 +20,7 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
   *Test:* simulator subclass with noisy `position.z_um`; assert one Z move per
   tile in single/focus-map mode.
 
-- [ ] **A2. Too many controller round trips per frame.**
+- [x] **A2. Too many controller round trips per frame.**
   Per plane: `backend.position` in the engine (XY + Z read), `move_z` →
   `refresh_objective_id()` (turret read) + `setPosition` + wait + `self.position`
   (XY + Z read again). `move_xy` also returns a fresh position. On serial stage
@@ -32,7 +32,7 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
   it can ask). Keep the turret re-read in `move_z` for interactive (device-worker) moves.
   *Test:* `FakeCore` call counter in `tests/test_cycles.py`.
 
-- [ ] **A3. Qt view reads hardware on the GUI thread.**
+- [x] **A3. Qt view reads hardware on the GUI thread.**
   `qt/window.py:857` (`_refresh`, runs on every input change) calls
   `controller.preflight()`, which in single-Z mode reads `self.backend.position`
   (`controller.py:187`) on the GUI thread — concurrently with the device worker
@@ -42,7 +42,7 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
   reads the real position.
   *Test:* backend whose `position` raises if called from the GUI thread.
 
-- [ ] **A4. Distortion correction throttles acquisition.**
+- [x] **A4. Distortion correction throttles acquisition.**
   `FrameCorrector.correct` runs on the single SSD-writer thread: ~0.28 s per
   2048×2048 frame in the review environment. The bounded queue fills, the camera
   waits (safe, but 3–10× slower) and the time estimate ignores it.
@@ -52,7 +52,7 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
   acquisition. Add the correction cost to `estimate_acquisition`.
   *Test:* benchmark-style test with a generous bound, plus estimate includes it.
 
-- [ ] **A5. Disk estimate ignores uncorrected copies.**
+- [x] **A5. Disk estimate ignores uncorrected copies.**
   With distortion correction on, `keep_uncorrected` defaults to `True` and doubles
   the data, but `estimate_acquisition` (`planner.py:121`) and the free-space check
   in `validate_plan` don't count it. A cycle can pass preflight and run out of disk.
@@ -61,14 +61,14 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
 
 ## B. Cycle-workflow traps
 
-- [ ] **B1. Z-stack Begin/End silently carried into later cycles.**
+- [x] **B1. Z-stack Begin/End silently carried into later cycles.**
   Only reset on objective change (`qt/window.py:1131` `_reset_z_stack_capture`).
   After strip/restain/remount, cycle 2 reuses cycle 1's absolute Z range; "Refocus
   all" doesn't touch it.
   *Fix:* reset Begin/End when a cycle finishes (and when an experiment is opened),
   or make preflight refuse a stack captured before the current cycle.
 
-- [ ] **B2. Opening an experiment can rotate the turret without confirmation.**
+- [x] **B2. Opening an experiment can rotate the turret without confirmation.**
   `_load_experiment_into_view` (`qt/window.py:1690`) calls `_objective_selected`,
   which only asks when the immersion medium differs. Otherwise "Open…" moves Z to
   the objective-change clearance and rotates the turret unprompted, then offers to
@@ -76,7 +76,7 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
   *Fix:* always confirm hardware moves triggered by Open/recipe, or just select
   the objective in the box and let preflight say "put objective X in the light path".
 
-- [ ] **B3. "Set Z here" / "Accept Z ▶" can get stuck.**
+- [x] **B3. "Set Z here" / "Accept Z ▶" can get stuck.**
   `_accept_pending` (`qt/window.py:1329`) is reset only in the success callback.
   If the position read fails, the flag stays `True` and the button does nothing
   for the rest of the session; Refocus all cannot continue.
@@ -85,19 +85,22 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
 
 ## C. Minor
 
-- [ ] **C1. Pause can't be aborted while the writer stalls.** `engine.py:244`
+- [x] **C1. Pause can't be aborted while the writer stalls.** `engine.py:244`
   waits for the writer without a timeout; Abort can't break it if the disk hangs.
   Wait in a loop with a timeout and check `self._abort`.
-- [ ] **C2. Resume skips most checks.** `controller.resume_cycle` doesn't re-check
+- [x] **C2. Resume skips most checks.** `controller.resume_cycle` doesn't re-check
   disk space or preset-fixed channel powers. Reuse the relevant parts of preflight.
-- [ ] **C3. `resume_info()` on every refresh.** `qt/window.py:927` → reads
+- [x] **C3. `resume_info()` on every refresh.** `qt/window.py:927` → reads
   `tiles.jsonl` and stats every plane file whenever settings change while a cycle
   is unfinished. Cache per experiment/cycle and invalidate when a cycle runs.
-- [ ] **C4. fsync on macOS isn't a full flush.** Use `fcntl.F_FULLFSYNC` on Darwin
+- [x] **C4. fsync on macOS isn't a full flush.** Use `fcntl.F_FULLFSYNC` on Darwin
   in `mosaic.py` / `experiment.py` (Windows/Linux are fine as is).
 - [ ] **C5. Tk view calls the backend on its GUI thread.** Fine for the simulator,
   blocks with real hardware; plus two views to keep in sync. Decide on retiring
   `app.py` after the Qt view has been tried at the microscope.
+  **Assessment:** valid architectural debt, but intentionally deferred. The team
+  has chosen Qt; remove the Tk implementation only after the Qt hardware trial,
+  rather than combining a large deletion with acquisition-safety changes.
 
 ## D. Feature idea (not a bug)
 
@@ -105,3 +108,5 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
   tile, so on a tilted section they must span the whole tilt. A "stack around the
   surface" mode (±N µm around the focus-map Z of each tile) would shorten stacks a
   lot on large sections. Needs Marco's OK (changes the Z-mode set).
+  **Assessment:** useful feature proposal, not a defect. Deferred pending explicit
+  approval of the new acquisition mode.

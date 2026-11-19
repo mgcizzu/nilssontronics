@@ -104,6 +104,36 @@ class TileGridTests(unittest.TestCase):
         z_time = stacked.tiles * 2 * 11 * self.config.timing.z_move_s
         self.assertGreater(stacked.duration_seconds - single.duration_seconds, z_time)
 
+    def test_distortion_estimate_includes_processing_and_uncorrected_copy(self) -> None:
+        base = AcquisitionPlan(
+            "P", "S", Path("."), "20x_air",
+            (ChannelSetting("dapi", 40, 20),),
+            (ScanRegion(0, 0, 3000, 3000),),
+        )
+        corrected = replace(
+            base,
+            options=AcquisitionOptions(
+                distortion_correction=True,
+                keep_uncorrected=False,
+            ),
+        )
+        kept = replace(
+            corrected,
+            options=replace(corrected.options, keep_uncorrected=True),
+        )
+        plain_estimate = estimate_acquisition(self.config, base)
+        corrected_estimate = estimate_acquisition(self.config, corrected)
+        kept_estimate = estimate_acquisition(self.config, kept)
+        expected_processing_s = (
+            corrected_estimate.frames * self.config.timing.distortion_correction_ms / 1000
+        )
+        self.assertAlmostEqual(
+            corrected_estimate.duration_seconds - plain_estimate.duration_seconds,
+            expected_processing_s,
+        )
+        self.assertEqual(corrected_estimate.data_bytes, plain_estimate.data_bytes)
+        self.assertEqual(kept_estimate.data_bytes, 2 * corrected_estimate.data_bytes)
+
 
 class ZPlaneTests(unittest.TestCase):
     def test_model_and_optics_agree_on_plane_count(self) -> None:

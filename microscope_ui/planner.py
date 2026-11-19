@@ -135,11 +135,18 @@ def estimate_acquisition(
         * config.camera_height_px
         * config.bytes_per_pixel
     )
+    if plan.options.distortion_correction and plan.options.keep_uncorrected:
+        data_bytes *= 2
 
     timing = config.timing
     exposure_s_per_plane_set = sum(channel.exposure_ms for channel in plan.channels) / 1000
     exposure_s = tile_count * z_planes * exposure_s_per_plane_set
     readout_s = frames * timing.camera_readout_ms / 1000
+    correction_s = (
+        frames * timing.distortion_correction_ms / 1000
+        if plan.options.distortion_correction
+        else 0.0
+    )
 
     travel_um = 0.0
     for previous, current in zip(tiles, tiles[1:]):
@@ -157,7 +164,7 @@ def estimate_acquisition(
         z_moves = 0
     z_s = z_moves * timing.z_move_s
     channel_s = tile_count * channel_count * timing.channel_switch_s if channel_count > 1 else 0.0
-    duration_seconds = exposure_s + readout_s + stage_s + z_s + channel_s + 2.0
+    duration_seconds = exposure_s + readout_s + correction_s + stage_s + z_s + channel_s + 2.0
 
     return AcquisitionEstimate(
         tiles=tile_count,
@@ -290,17 +297,29 @@ def validate_plan(
             )
 
     if check_disk:
-        try:
-            free_bytes = shutil.disk_usage(_existing_parent(plan.output_root)).free
-        except OSError:
-            problems.append("The output folder is not accessible.")
-        else:
-            estimate = estimate_acquisition(config, plan, tiles)
-            safety_margin = max(2 * 1024**3, int(estimate.data_bytes * 0.10))
-            if estimate.data_bytes + safety_margin > free_bytes:
-                problems.append("There is not enough free disk space for this scan.")
+        disk_problem = disk_space_problem(config, plan, tiles)
+        if disk_problem:
+            problems.append(disk_problem)
 
     return problems
+
+
+def disk_space_problem(
+    config: MicroscopeConfig,
+    plan: AcquisitionPlan,
+    tiles: list[Tile] | tuple[Tile, ...],
+) -> str | None:
+    """Return the storage preflight error for exactly the supplied tiles."""
+
+    try:
+        free_bytes = shutil.disk_usage(_existing_parent(plan.output_root)).free
+    except OSError:
+        return "The output folder is not accessible."
+    estimate = estimate_acquisition(config, plan, list(tiles))
+    safety_margin = max(2 * 1024**3, int(estimate.data_bytes * 0.10))
+    if estimate.data_bytes + safety_margin > free_bytes:
+        return "There is not enough free disk space for this scan."
+    return None
 
 
 def _existing_parent(path):

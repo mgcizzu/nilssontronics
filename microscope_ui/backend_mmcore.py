@@ -136,21 +136,31 @@ class MMCoreBackend:
 
     # -- motion --------------------------------------------------------------
     def move_xy(self, x_um: float, y_um: float) -> StagePosition:
+        self.move_xy_for_acquisition(x_um, y_um)
+        return self.position
+
+    def move_xy_for_acquisition(self, x_um: float, y_um: float) -> None:
+        """Move during a scan without an unnecessary position readback."""
+
         check_xy(self._config, x_um, y_um)
         stage = self._core.getXYStageDevice()
         self._call("move XY stage", self._core.setXYPosition, x_um, y_um)
         self._wait(stage)
-        return self.position
 
     def move_z(self, z_um: float) -> StagePosition:
         # The turret can be changed from its own controls or Micro-Manager's
         # property browser, so never apply a cached objective's safety range.
         objective_id = self.refresh_objective_id()
+        self.move_z_for_acquisition(objective_id, z_um)
+        return self.position
+
+    def move_z_for_acquisition(self, objective_id: str, z_um: float) -> None:
+        """Move during a scan after the engine has verified the physical turret."""
+
         check_z(self._config, objective_id, z_um)
         focus = self._core.getFocusDevice()
         self._call("move focus", self._core.setPosition, z_um)
         self._wait(focus)
-        return self.position
 
     def change_objective(self, objective: Objective) -> None:
         clearance = float(self._hw.get("objective_change_z_um", self._config.stage_limits.z_min_um))

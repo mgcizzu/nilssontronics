@@ -94,6 +94,7 @@ class Timing:
     z_move_s: float = 0.03
     channel_switch_s: float = 0.12
     camera_readout_ms: float = 25.0
+    distortion_correction_ms: float = 100.0
 
 
 @dataclass(frozen=True)

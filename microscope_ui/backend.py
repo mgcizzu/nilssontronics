@@ -53,6 +53,10 @@ class MicroscopeBackend(Protocol):
 
     def move_z(self, z_um: float) -> StagePosition: ...
 
+    def move_xy_for_acquisition(self, x_um: float, y_um: float) -> None: ...
+
+    def move_z_for_acquisition(self, objective_id: str, z_um: float) -> None: ...
+
     def change_objective(self, objective: Objective) -> None: ...
 
     def set_channel(self, channel: Channel, exposure_ms: float, power_percent: float) -> None: ...
@@ -174,6 +178,17 @@ class SimulatedMicroscope:
         self._position = StagePosition(self._position.x_um, self._position.y_um, z_um)
         self.move_log.append(("z", z_um, 0.0))
         return self._position
+
+    def move_xy_for_acquisition(self, x_um: float, y_um: float) -> None:
+        self.move_xy(x_um, y_um)
+
+    def move_z_for_acquisition(self, objective_id: str, z_um: float) -> None:
+        if objective_id != self._objective_id:
+            raise HardwareError(
+                f"Acquisition requires objective {objective_id}, but the simulator has "
+                f"{self._objective_id}"
+            )
+        self.move_z(z_um)
 
     def change_objective(self, objective: Objective) -> None:
         # The real adapter moves Z to a clearance height, rotates the turret and

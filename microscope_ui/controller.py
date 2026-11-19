@@ -31,7 +31,7 @@ from .flatfield import estimate_flat_fields
 from .focus import FocusSurface
 from .models import AcquisitionEstimate, AcquisitionPlan, MicroscopeConfig, Tile, ZSettings
 from .mosaic import CycleMetadata, DiskBackedMosaic, completed_tile_indices, mosaic_bounds_for_tiles
-from .planner import estimate_acquisition, tiles_for_plan, validate_plan
+from .planner import disk_space_problem, estimate_acquisition, tiles_for_plan, validate_plan
 
 
 class ControllerError(RuntimeError):
@@ -92,6 +92,12 @@ class ScanController:
         self.active_cycle: int | None = None
         self.active_tiles: tuple[Tile, ...] = ()
         self._experiment_lock = Lock()
+        self._resume_cache: tuple[CycleRecord, int, int] | None = None
+        self._resume_cache_valid = False
+
+    def _invalidate_resume_cache(self) -> None:
+        self._resume_cache = None
+        self._resume_cache_valid = False
 
     # -- state ---------------------------------------------------------------
     @property
@@ -161,7 +167,12 @@ class ScanController:
         tiles = self.tiles_for(plan)
         return tiles, estimate_acquisition(self.config, plan, tiles)
 
-    def preflight(self, plan: AcquisitionPlan, check_disk: bool = True) -> list[str]:
+    def preflight(
+        self,
+        plan: AcquisitionPlan,
+        check_disk: bool = True,
+        current_z_um: float | None = None,
+    ) -> list[str]:
         problems = self.compatibility_problems(plan)
         if any("ROI set changed" in item for item in problems):
             return problems
@@ -184,7 +195,7 @@ class ScanController:
                 )
         if plan.z.mode == "single":
             low, high = self.config.safe_z_range(plan.objective_id)
-            z = self.backend.position.z_um
+            z = self.backend.position.z_um if current_z_um is None else current_z_um
             if not low <= z <= high:
                 problems.append(
                     f"Current Z {z:.1f} µm is outside the safe range {low:g}–{high:g} µm."
@@ -343,6 +354,7 @@ class ScanController:
             raise ControllerError("Stop the running acquisition first")
         self._close_cycle_storage()
         self.experiment = None
+        self._invalidate_resume_cache()
 
     def open_experiment(self, path: Path | str) -> Experiment:
         if self.busy:
@@ -350,6 +362,7 @@ class ScanController:
         experiment = Experiment.load(path)
         self._close_cycle_storage()
         self.experiment = experiment
+        self._invalidate_resume_cache()
         return experiment
 
     def start_cycle(self, plan: AcquisitionPlan) -> CycleRecord:
@@ -402,6 +415,7 @@ class ScanController:
         )
         with self._experiment_lock:
             self.experiment.add_cycle(record)
+        self._invalidate_resume_cache()
         self._launch(record, skip=frozenset())
         return record
 
@@ -416,24 +430,85 @@ class ScanController:
         if self.backend.current_objective_id != self.experiment.objective_id:
             raise ControllerError("Put the experiment's objective in the light path first")
         problems = self.calibration_problems()
+        problems += self._resume_preflight(record)
         if problems:
             raise ControllerError("\n".join(problems))
         skip = frozenset(completed_tile_indices(self.experiment.cycle_folder(record.number)))
         with self._experiment_lock:
             record = self.experiment.update_cycle(record.number, status="running", error=None)
+        self._invalidate_resume_cache()
         self._launch(record, skip=skip)
         return record
+
+    def _resume_preflight(self, record: CycleRecord) -> list[str]:
+        """Checks that can become invalid between an interrupted run and resume."""
+
+        experiment = self.experiment
+        assert experiment is not None
+        problems: list[str] = []
+        for setting in record.channels:
+            try:
+                channel = self.config.channel(setting.channel_id)
+            except KeyError:
+                problems.append(f"Unknown channel: {setting.channel_id}.")
+                continue
+            if not 0 < setting.exposure_ms <= channel.max_exposure_ms:
+                problems.append(
+                    f"{channel.name} exposure must be between 0 and "
+                    f"{channel.max_exposure_ms:g} ms."
+                )
+            if not 0 <= setting.power_percent <= channel.max_power_percent:
+                problems.append(
+                    f"{channel.name} power must be between 0 and "
+                    f"{channel.max_power_percent:g}%."
+                )
+            if (
+                not self.backend.power_is_adjustable(setting.channel_id)
+                and abs(setting.power_percent - channel.default_power_percent) > 1e-6
+            ):
+                problems.append(
+                    f"{channel.name} power is fixed by its Micro-Manager preset at "
+                    f"{channel.default_power_percent:g}%."
+                )
+        completed = completed_tile_indices(experiment.cycle_folder(record.number))
+        remaining = tuple(
+            tile for tile in experiment.tiles_for_cycle(record.number) if tile.index not in completed
+        )
+        options = record.options or experiment.options
+        plan = AcquisitionPlan(
+            project=experiment.project,
+            sample=experiment.sample,
+            output_root=experiment.root,
+            objective_id=experiment.objective_id,
+            channels=record.channels,
+            regions=experiment.regions_with_offset(record.offset_x_um, record.offset_y_um),
+            focus_points=record.focus_points,
+            z=record.z,
+            overlap_x_percent=experiment.overlap_x_percent,
+            overlap_y_percent=experiment.overlap_y_percent,
+            options=options,
+        )
+        if remaining:
+            disk_problem = disk_space_problem(self.config, plan, remaining)
+            if disk_problem:
+                problems.append(disk_problem)
+        return problems
 
     def resume_info(self) -> tuple[CycleRecord, int, int] | None:
         """(cycle, tiles already complete, total tiles) for an unfinished cycle."""
 
-        if self.experiment is None:
+        if self.experiment is None or self.busy:
             return None
+        if self._resume_cache_valid:
+            return self._resume_cache
         record = self.experiment.resumable_cycle()
         if record is None:
+            self._resume_cache_valid = True
             return None
         done = completed_tile_indices(self.experiment.cycle_folder(record.number))
-        return record, len(done), len(self.experiment.tiles)
+        self._resume_cache = record, len(done), len(self.experiment.tiles)
+        self._resume_cache_valid = True
+        return self._resume_cache
 
     def _launch(self, record: CycleRecord, skip: frozenset[int]) -> None:
         experiment = self.experiment
@@ -539,6 +614,7 @@ class ScanController:
                 error=status.error,
                 tiles_completed=status.tiles_done,
             )
+        self._invalidate_resume_cache()
 
     # -- control ---------------------------------------------------------------
     def pause(self) -> None:

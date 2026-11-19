@@ -122,7 +122,13 @@ def validate_config(config: MicroscopeConfig) -> list[str]:
     timing = config.timing
     if timing.stage_speed_um_per_s <= 0:
         problems.append("timing.stage_speed_um_per_s must be positive")
-    for name in ("stage_settle_s", "z_move_s", "channel_switch_s", "camera_readout_ms"):
+    for name in (
+        "stage_settle_s",
+        "z_move_s",
+        "channel_switch_s",
+        "camera_readout_ms",
+        "distortion_correction_ms",
+    ):
         if getattr(timing, name) < 0:
             problems.append(f"timing.{name} cannot be negative")
 

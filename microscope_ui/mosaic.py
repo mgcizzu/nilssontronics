@@ -52,6 +52,8 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import tifffile
 
+from .durability import durable_fsync, durable_fsync_directory
+
 from .models import Channel, ChannelSetting, Objective, ScanRegion, Tile
 
 PIPELINE_MODE = "tif_autosaved"
@@ -423,7 +425,7 @@ class DiskBackedMosaic:
         self._index.write(json.dumps(record, separators=(",", ":")) + "\n")
         self._index.flush()
         if self.fsync:
-            os.fsync(self._index.fileno())
+            durable_fsync(self._index.fileno())
         for preview_map in self._maps.values():
             preview_map.flush()
         self._current_tile = None
@@ -707,7 +709,7 @@ def _repair_journal_tail(path: Path, fsync: bool = True) -> None:
             handle.truncate(keep)
         handle.flush()
         if fsync:
-            os.fsync(handle.fileno())
+            durable_fsync(handle.fileno())
 
 
 def _is_complete_record(line: bytes) -> bool:
@@ -725,7 +727,7 @@ def _write_plane_tiff(path: Path, frame: np.ndarray, fsync: bool) -> None:
         tifffile.imwrite(handle, frame, photometric="minisblack", metadata=None)
         handle.flush()
         if fsync:
-            os.fsync(handle.fileno())
+            durable_fsync(handle.fileno())
 
 
 def _resize_nearest(frame: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -735,16 +737,7 @@ def _resize_nearest(frame: np.ndarray, height: int, width: int) -> np.ndarray:
 
 
 def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
-        os.close(descriptor)
+    durable_fsync_directory(path)
 
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:

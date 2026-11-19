@@ -89,6 +89,23 @@ def test_double_accept_only_stores_one_point(qtbot, window):
     assert window.focus_list.items[1].z_um == pytest.approx(POINTS[1].z_um)  # untouched
 
 
+def test_failed_position_read_reenables_accept(qtbot, window):
+    window.refocus_index = 0
+    window.with_fresh_position = (
+        lambda _callback, on_error=None: on_error(RuntimeError("encoder offline"))
+    )
+    window._set_focus_z_here()
+    assert not window._accept_pending
+    assert window.messages[-1][0:2] == ("warn", "Could not read the stage position")
+
+
+def test_stopping_refocus_clears_pending_accept(window):
+    window.refocus_index = 0
+    window._accept_pending = True
+    window.stop_refocus()
+    assert not window._accept_pending
+
+
 def test_stop_and_overview_click_during_refocus(qtbot, window):
     window.show()
     qtbot.waitExposed(window)

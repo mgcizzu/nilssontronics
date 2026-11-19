@@ -206,7 +206,8 @@
     "stage_settle_s": 0.1,
     "z_move_s": 0.03,
     "channel_switch_s": 0.12,
-    "camera_readout_ms": 25
+    "camera_readout_ms": 25,
+    "distortion_correction_ms": 100
   },
   "simulator": {
     "frame_size_px": 256,

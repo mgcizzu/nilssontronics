@@ -117,6 +117,29 @@ def test_refuses_wrong_frame_size_and_missing_channel(config):
         corrector.correct("dapi", np.zeros((128, 128), np.uint16))
 
 
+def test_full_frame_correction_has_a_generous_performance_bound():
+    size = 1024
+    correction = D.DistortionCorrection(
+        objective_id="20x_air",
+        frame_width_px=size,
+        frame_height_px=size,
+        grid_pitch_um=50.0,
+        reference_channel="dapi",
+        channels={"dapi": D.ChannelModel(pixel_size_um=0.325, k1=0.02)},
+        nominal_pixel_size_um=0.325,
+    )
+    corrector = D.FrameCorrector(
+        correction, ("dapi",), size * 0.325, size * 0.325
+    )
+    frame = np.arange(size * size, dtype=np.uint16).reshape(size, size)
+    corrector.correct("dapi", frame)  # build the sampling map before timing
+    started = time.perf_counter()
+    corrected = corrector.correct("dapi", frame)
+    elapsed = time.perf_counter() - started
+    assert corrected.shape == frame.shape and corrected.dtype == frame.dtype
+    assert elapsed < 2.0
+
+
 def test_calibration_input_checks(config):
     images = grid_images(config, OPTICS, frame_px=256, channels=("dapi", "cy5"))
     moved = [images[0], replace(images[1], stage_xy_um=(30107.0, 13.0))]

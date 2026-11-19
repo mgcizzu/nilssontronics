@@ -43,6 +43,15 @@ class SlowSimulator(SimulatedMicroscope):
         return super().snap()
 
 
+class NoisyZSimulator(SimulatedMicroscope):
+    """A stage whose encoder readback never exactly matches its command."""
+
+    @property
+    def position(self):
+        position = super().position
+        return replace(position, z_um=position.z_um + 0.03)
+
+
 class ControllerCase(unittest.TestCase):
     def setUp(self) -> None:
         patcher = mock.patch(
@@ -66,6 +75,55 @@ class ControllerCase(unittest.TestCase):
         )
         values.update(changes)
         return AcquisitionPlan(**values)
+
+
+class AcquisitionMotionTests(unittest.TestCase):
+    def test_noisy_z_readback_does_not_repeat_moves_for_every_channel(self) -> None:
+        config = load_config()
+        backend = NoisyZSimulator(config, frame_px=12)
+        backend.change_objective(config.objective("20x_air"))
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch(
+            "microscope_ui.planner.shutil.disk_usage",
+            return_value=mock.Mock(free=10 * 1024**4),
+        ):
+            controller = ScanController(config, backend)
+            self.addCleanup(controller.close)
+            plan = AcquisitionPlan(
+                project="P",
+                sample="S",
+                output_root=Path(temp_dir),
+                objective_id="20x_air",
+                channels=(ChannelSetting("dapi", 10, 5), ChannelSetting("cy5", 10, 5)),
+                regions=(ScanRegion(-2500, -1000, 5000, 2000),),
+            )
+            controller.start_cycle(plan)
+            self.assertTrue(controller.wait(30))
+            self.assertEqual(controller.status().state, "complete")
+        z_moves = [move for move in backend.move_log if move[0] == "z"]
+        self.assertEqual(len(z_moves), 1)
+
+    def test_preflight_can_use_cached_z_without_reading_hardware(self) -> None:
+        config = load_config()
+        backend = SimulatedMicroscope(config, frame_px=12)
+        backend.change_objective(config.objective("20x_air"))
+        controller = ScanController(config, backend)
+        self.addCleanup(controller.close)
+        plan = AcquisitionPlan(
+            project="P",
+            sample="S",
+            output_root=Path(tempfile.gettempdir()),
+            objective_id="20x_air",
+            channels=(ChannelSetting("dapi", 10, 5),),
+            regions=(ScanRegion(-500, -500, 1000, 1000),),
+        )
+        with mock.patch.object(
+            SimulatedMicroscope,
+            "position",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("GUI-thread hardware read"),
+        ):
+            problems = controller.preflight(plan, check_disk=False, current_z_um=0.0)
+        self.assertEqual(problems, [])
 
 
 # -- 1. Tk stage controls during acquisition ----------------------------------
@@ -139,6 +197,89 @@ class WriterShutdownTests(unittest.TestCase):
         self.assertTrue(engine.join(10))
         self.assertTrue(writer.stopped)
         self.assertEqual(engine.status().state, "aborted")
+
+    def test_abort_breaks_out_of_pause_drain_when_writer_stalls(self) -> None:
+        config = load_config()
+        backend = SimulatedMicroscope(config, frame_px=8)
+        backend.change_objective(config.objective("20x_air"))
+        tiles = tuple(Tile(i, 0, i, i * 500.0, 0.0) for i in range(5))
+        sink = BlockingSink()
+        writer = BoundedAsyncWriter(sink, queue_capacity=2)
+        engine = AcquisitionEngine(
+            config,
+            backend,
+            writer,
+            CycleRun(
+                objective_id="20x_air",
+                tiles=tiles,
+                channels=(ChannelSetting("dapi", 10, 5),),
+                z_positions={tile.index: (0.0,) for tile in tiles},
+            ),
+            writer_stop_timeout_s=0.1,
+        )
+        engine.start()
+        self.assertTrue(sink.writing.wait(5))
+        engine.pause()
+        engine.abort()
+        deadline = time.time() + 3
+        while "SSD writer" not in engine.status().message and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertIn("SSD writer", engine.status().message)
+        sink.release.set()
+        self.assertTrue(engine.join(10))
+        self.assertEqual(engine.status().state, "aborted")
+
+
+class ResumePreflightTests(ControllerCase):
+    def _make_resumable(self):
+        self.backend.delay = 0.02
+        self.controller.start_cycle(self.plan())
+        time.sleep(0.08)
+        self.controller.abort()
+        self.assertTrue(self.controller.wait(10))
+        self.assertEqual(self.controller.status().state, "aborted")
+
+    def test_resume_rechecks_disk_space(self) -> None:
+        self._make_resumable()
+        with mock.patch(
+            "microscope_ui.planner.shutil.disk_usage", return_value=mock.Mock(free=1)
+        ):
+            with self.assertRaisesRegex(ControllerError, "free disk space"):
+                self.controller.resume_cycle()
+
+    def test_resume_rechecks_preset_fixed_power(self) -> None:
+        self._make_resumable()
+        self.backend.power_is_adjustable = lambda _channel_id: False
+        with self.assertRaisesRegex(ControllerError, "power is fixed"):
+            self.controller.resume_cycle()
+
+    def test_resume_info_is_cached_until_cycle_state_changes(self) -> None:
+        self._make_resumable()
+        with mock.patch(
+            "microscope_ui.controller.completed_tile_indices",
+            wraps=__import__(
+                "microscope_ui.controller", fromlist=["completed_tile_indices"]
+            ).completed_tile_indices,
+        ) as completed:
+            first = self.controller.resume_info()
+            second = self.controller.resume_info()
+        self.assertEqual(first, second)
+        self.assertEqual(completed.call_count, 1)
+
+
+class DurabilityTests(unittest.TestCase):
+    def test_macos_uses_full_fsync(self) -> None:
+        from microscope_ui import durability
+
+        with (
+            mock.patch.object(durability.sys, "platform", "darwin"),
+            mock.patch("fcntl.fcntl") as full_fsync,
+            mock.patch.object(durability.os, "fsync") as ordinary_fsync,
+        ):
+            durability.durable_fsync(17)
+        full_fsync.assert_called_once()
+        self.assertEqual(full_fsync.call_args.args[0], 17)
+        ordinary_fsync.assert_not_called()
 
 
 # -- 3. Calibration snapshot ------------------------------------------------------

@@ -854,7 +854,9 @@ class ScanWindow(QMainWindow):
         try:
             plan = self.build_plan()
             tiles, estimate = self.controller.estimate(plan)
-            problems = self.controller.preflight(plan)
+            problems = self.controller.preflight(
+                plan, current_z_um=self.device.last_position.z_um
+            )
         except (ValueError, KeyError) as exc:
             self.summary_label.setText(str(exc))
             self._set_safety([str(exc)])
@@ -1019,20 +1021,30 @@ class ScanWindow(QMainWindow):
             )
             self._refresh()
 
-    def _objective_selected(self, _index: int) -> None:
+    def _objective_selected(self, _index: int, *, confirm_automatic: bool = False) -> bool:
         self._recipe_to_custom()
         objective = self.config_data.objective(self.objective_box.currentData())
         previous = self.config_data.objective(self.backend.current_objective_id)
         if objective.id == previous.id:
-            return
-        if objective.immersion != previous.immersion and not self.confirm(
-            "Immersion change",
-            f"Changing from {previous.name} ({previous.immersion}) to {objective.name} "
-            f"({objective.immersion}). Apply/remove immersion medium now. Z moves to a safe "
-            "clearance before the turret rotates. Continue?",
+            return True
+        if objective.immersion != previous.immersion:
+            title = "Immersion change"
+            message = (
+                f"Changing from {previous.name} ({previous.immersion}) to {objective.name} "
+                f"({objective.immersion}). Apply/remove immersion medium now. Z moves to a safe "
+                "clearance before the turret rotates. Continue?"
+            )
+        else:
+            title = "Change objective"
+            message = (
+                f"Change from {previous.name} to {objective.name}? Z moves to a safe clearance "
+                "before the turret rotates."
+            )
+        if (confirm_automatic or objective.immersion != previous.immersion) and not self.confirm(
+            title, message
         ):
             self._sync_objective_box()
-            return
+            return False
         self.stop_spiral_preview()
         self.objective_box.setEnabled(False)
         self.progress_label.setText(f"Changing objective to {objective.name}…")
@@ -1050,6 +1062,7 @@ class ScanWindow(QMainWindow):
             self._refresh()
 
         self.device.submit(self.backend.change_objective, objective, on_done=done, on_error=failed)
+        return True
 
     # --------------------------------------------------------------- recipes --
     def _recipe_to_custom(self, *_args) -> None:
@@ -1083,7 +1096,9 @@ class ScanWindow(QMainWindow):
             self.z_mode_box.setCurrentIndex(self.z_mode_box.findData(recipe.z_mode))
             self.objective_box.setCurrentIndex(self.objective_box.findData(recipe.objective_id))
             if recipe.objective_id != self.backend.current_objective_id:
-                self._objective_selected(self.objective_box.currentIndex())
+                self._objective_selected(
+                    self.objective_box.currentIndex(), confirm_automatic=True
+                )
         finally:
             self._applying_recipe = False
         self.recipe_box.setCurrentText(name)
@@ -1284,7 +1299,7 @@ class ScanWindow(QMainWindow):
         self._move_set_finished()
         self.overview_hint.setText("Move cancelled")
 
-    def with_fresh_position(self, callback) -> None:
+    def with_fresh_position(self, callback, on_error=None) -> None:
         """Run ``callback(position)`` after every queued stage move has finished.
 
         The cached position can lag behind a jog that is still queued; reading it
@@ -1293,10 +1308,16 @@ class ScanWindow(QMainWindow):
 
         if self.controller.busy:
             return
+        def failed(exc: Exception) -> None:
+            if on_error is not None:
+                on_error(exc)
+            else:
+                self.warn("Could not read the stage position", str(exc))
+
         self.device.submit(
             lambda: self.backend.position,
             on_done=callback,
-            on_error=lambda exc: self.warn("Could not read the stage position", str(exc)),
+            on_error=failed,
         )
 
     def _capture_focus_here(self) -> None:
@@ -1345,7 +1366,11 @@ class ScanWindow(QMainWindow):
                 else:
                     self.stop_refocus(f"All {len(items)} focus points refocused for this cycle")
 
-        self.with_fresh_position(accept)
+        def failed(exc: Exception) -> None:
+            self._accept_pending = False
+            self.warn("Could not read the stage position", str(exc))
+
+        self.with_fresh_position(accept, on_error=failed)
 
     # -------------------------------------------------------- spiral preview --
     def _toggle_spiral_preview(self, on: bool) -> None:
@@ -1509,6 +1534,7 @@ class ScanWindow(QMainWindow):
         self.overview_hint.setText(text)
 
     def stop_refocus(self, message: str | None = None) -> None:
+        self._accept_pending = False
         if self.refocus_index is None:
             return
         self.refocus_index = None
@@ -1637,6 +1663,7 @@ class ScanWindow(QMainWindow):
             return
         self.stop_refocus()
         self.controller.new_experiment()
+        self._reset_z_stack_capture()
         self._refresh()
 
     def _open_experiment(self) -> None:
@@ -1660,6 +1687,7 @@ class ScanWindow(QMainWindow):
 
     def _load_experiment_into_view(self, experiment: Experiment) -> None:
         self.stop_refocus()
+        self._reset_z_stack_capture()
         self._loading = True
         try:
             last = experiment.cycles[-1] if experiment.cycles else None
@@ -1687,7 +1715,9 @@ class ScanWindow(QMainWindow):
         finally:
             self._loading = False
         if self.backend.current_objective_id != experiment.objective_id:
-            self._objective_selected(self.objective_box.currentIndex())
+            self._objective_selected(
+                self.objective_box.currentIndex(), confirm_automatic=True
+            )
         self.progress_label.setText(f"Experiment opened • {experiment.root}")
         self._z_mode_changed()
 
@@ -1697,7 +1727,9 @@ class ScanWindow(QMainWindow):
         self.live_button.setChecked(False)
         try:
             plan = self.build_plan()
-            problems = self.controller.preflight(plan)
+            problems = self.controller.preflight(
+                plan, current_z_um=self.device.last_position.z_um
+            )
         except (ValueError, KeyError) as exc:
             problems = [str(exc)]
         if problems:
@@ -1807,6 +1839,8 @@ class ScanWindow(QMainWindow):
         experiment = self.controller.experiment
         cycle = self.controller.active_cycle
         folder = experiment.cycle_folder(cycle) if experiment is not None and cycle else None
+        self._reset_z_stack_capture()
+        self._update_z_stack_view()
         self._refresh()
         if status.state == "complete":
             self.progress_label.setText(f"{status.message} • {folder}")

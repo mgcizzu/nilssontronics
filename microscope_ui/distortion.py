@@ -41,6 +41,7 @@ starts and every later cycle uses that copy, so all cycles share one geometry.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 import hashlib
@@ -58,6 +59,11 @@ MIN_PITCH_PX = 6.0
 MIN_POINTS_PER_CHANNEL = 30
 WARN_RMS_PX = 0.35
 WARN_COVERAGE = 0.7
+_CORRECTION_WORKERS = 4
+_PARALLEL_CORRECTION_MIN_PIXELS = 1024 * 1024
+_CORRECTION_POOL = ThreadPoolExecutor(
+    max_workers=_CORRECTION_WORKERS, thread_name_prefix="distortion-correction"
+)
 
 
 class CalibrationError(ValueError):
@@ -315,20 +321,52 @@ class FrameCorrector:
         height, width = frame.shape
         padded = np.pad(frame.astype(np.float32, copy=False), 2, mode="edge").ravel()
         stride = width + 4
-        wx = _keys_weights(fx)
-        wy = _keys_weights(fy)
-        out = np.zeros(frame.shape, dtype=np.float32)
-        for j in range(4):
-            row = wx[0] * padded[base + j * stride]
-            for i in range(1, 4):
-                row += wx[i] * padded[base + (j * stride + i)]
-            out += wy[j] * row
+        if frame.size >= _PARALLEL_CORRECTION_MIN_PIXELS:
+            # NumPy releases the GIL for these array operations. Row chunks
+            # therefore use multiple cores without copying the source frame or
+            # keeping another frame-sized weight cache per channel.
+            edges = np.linspace(0, height, _CORRECTION_WORKERS + 1, dtype=int)
+            futures = [
+                _CORRECTION_POOL.submit(
+                    _correct_rows,
+                    padded,
+                    stride,
+                    base[start:end],
+                    fx[start:end],
+                    fy[start:end],
+                )
+                for start, end in zip(edges[:-1], edges[1:])
+                if start < end
+            ]
+            out = np.concatenate([future.result() for future in futures], axis=0)
+        else:
+            out = _correct_rows(padded, stride, base, fx, fy)
         out[~valid] = 0.0
         if np.issubdtype(frame.dtype, np.integer):
             info = np.iinfo(frame.dtype)
             np.rint(out, out=out)
             np.clip(out, info.min, info.max, out=out)
         return out.astype(frame.dtype, copy=False)
+
+
+def _correct_rows(
+    padded: np.ndarray,
+    stride: int,
+    base: np.ndarray,
+    fx: np.ndarray,
+    fy: np.ndarray,
+) -> np.ndarray:
+    """Bicubic interpolation for a contiguous band of output rows."""
+
+    wx = _keys_weights(fx)
+    wy = _keys_weights(fy)
+    out = np.zeros(base.shape, dtype=np.float32)
+    for j in range(4):
+        row = wx[0] * padded[base + j * stride]
+        for i in range(1, 4):
+            row += wx[i] * padded[base + (j * stride + i)]
+        out += wy[j] * row
+    return out
 
 
 def _keys_weights(t: np.ndarray) -> list[np.ndarray]:
