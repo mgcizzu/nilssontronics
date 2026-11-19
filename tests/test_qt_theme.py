@@ -11,7 +11,7 @@ pytest.importorskip("qtpy")
 pytest.importorskip("pytestqt")
 
 from qtpy.QtCore import QSettings  # noqa: E402
-from qtpy.QtWidgets import QApplication, QCheckBox  # noqa: E402
+from qtpy.QtWidgets import QApplication, QCheckBox, QGroupBox, QWidget  # noqa: E402
 
 from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
@@ -41,6 +41,27 @@ def test_theme_switch_applies_and_is_remembered(window, tmp_path):
     assert window.theme_mode() == "light"
 
 
+def test_dark_theme_is_the_fresh_install_default(window):
+    assert window.theme_mode() == "dark"
+    assert current_palette().dark
+    assert window.dark_mode_toggle.isChecked()
+    assert window.theme_actions["dark"].isChecked()
+
+
+def test_header_dark_switch_and_theme_menu_stay_synchronized(window):
+    window.apply_theme_mode("light", remember=True)
+    assert not window.dark_mode_toggle.isChecked()
+
+    window.dark_mode_toggle.click()
+    assert current_palette().dark
+    assert window.theme_mode() == "dark"
+    assert window.theme_actions["dark"].isChecked()
+
+    window.theme_actions["light"].trigger()
+    assert not current_palette().dark
+    assert not window.dark_mode_toggle.isChecked()
+
+
 def test_unknown_stored_theme_falls_back_to_system(window):
     window.settings.setValue("theme", "neon")
     assert window.theme_mode() == "system"
@@ -50,6 +71,23 @@ def test_theme_menu_preserves_the_tabbed_resizable_layout(window):
     assert window.main_splitter.count() == 3
     assert window.setup_tabs.count() == 3
     assert set(window.theme_actions) == {"system", "light", "dark"}
+
+
+def test_fluent_refinement_keeps_dense_controls_legible(window):
+    assert window.channel_table.columnCount() == 3
+    assert [window.channel_table.horizontalHeaderItem(i).text() for i in range(3)] == [
+        "Channel",
+        "Exposure",
+        "Power",
+    ]
+    toolbars = window.findChildren(QWidget, "viewerToolbar")
+    assert len(toolbars) == 2
+    acquisition = next(
+        group for group in window.findChildren(QGroupBox) if group.title() == "Acquisition"
+    )
+    assert acquisition.isAncestorOf(window.start_button)
+    assert window.start_button.property("accent") is True
+    assert window.abort_button.property("critical") is True
 
 
 def test_options_are_toggle_switches_that_still_behave_as_checkboxes(window, qtbot):

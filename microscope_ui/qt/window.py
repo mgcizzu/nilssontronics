@@ -25,7 +25,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
-from qtpy.QtCore import QSettings, Qt, QTimer
+from qtpy.QtCore import QSettings, QSignalBlocker, Qt, QTimer
 from qtpy.QtGui import QActionGroup
 from qtpy.QtWidgets import (
     QApplication,
@@ -206,7 +206,7 @@ class ScanWindow(QMainWindow):
 
     # ---------------------------------------------------------------- theme --
     def theme_mode(self) -> str:
-        mode = str(self.settings.value("theme", "system"))
+        mode = str(self.settings.value("theme", "dark"))
         return mode if mode in THEME_MODES else "system"
 
     def _system_scheme_changed(self, *_args) -> None:
@@ -221,8 +221,15 @@ class ScanWindow(QMainWindow):
             self.settings.sync()
         if hasattr(self, "theme_actions"):
             self.theme_actions[mode].setChecked(True)
+        if hasattr(self, "dark_mode_toggle"):
+            blocker = QSignalBlocker(self.dark_mode_toggle)
+            self.dark_mode_toggle.setChecked(palette.dark)
+            del blocker
         self.channel_table.refresh_swatches()
         set_dark_title_bar(self, palette.dark)
+
+    def _toggle_dark_mode(self, checked: bool) -> None:
+        self.apply_theme_mode("dark" if checked else "light", remember=True)
 
     def fit_window_to_screen(self) -> None:
         """Fit the window inside the current screen's usable desktop area."""
@@ -249,19 +256,35 @@ class ScanWindow(QMainWindow):
 
     def _build_header(self) -> QWidget:
         header = QWidget()
+        header.setObjectName("appHeader")
         row = QHBoxLayout(header)
-        row.setContentsMargins(4, 0, 4, 0)
+        row.setContentsMargins(6, 2, 6, 4)
+        row.setSpacing(10)
         title = QLabel(f"<b>{self.config_data.microscope_name}</b>")
         mode = "SIMULATOR CONNECTED" if self.backend.simulated else f"{self.backend.name.upper()} CONNECTED"
         self.mode_label = QLabel(mode)
-        self.mode_label.setStyleSheet(
-            "padding: 2px 8px; border-radius: 4px; color: white; background: "
-            + ("#2f6f9f;" if self.backend.simulated else "#b5442c;")
-        )
+        self.mode_label.setObjectName("statusPill")
+        self.mode_label.setProperty("tone", "sim" if self.backend.simulated else "hw")
         self.position_label = QLabel()
+        self.position_label.setProperty("secondary", True)
         self.experiment_label = QLabel()
+        self.experiment_label.setProperty("secondary", True)
+        self.experiment_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        self.experiment_label.setMinimumWidth(20)
+        self.experiment_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.dark_mode_toggle = ToggleSwitch("Dark")
+        self.dark_mode_toggle.setToolTip(
+            "Switch between light and dark mode; use View → Theme to follow the system"
+        )
+        self.dark_mode_toggle.toggled.connect(self._toggle_dark_mode)
         row.addWidget(title)
         row.addWidget(self.mode_label)
+        row.addSpacing(4)
+        row.addWidget(self.dark_mode_toggle)
         row.addStretch(1)
         row.addWidget(self.experiment_label)
         row.addSpacing(16)
@@ -508,8 +531,13 @@ class ScanWindow(QMainWindow):
 
         overview_tab = QWidget()
         overview_layout = QVBoxLayout(overview_tab)
-        overview_layout.setContentsMargins(0, 4, 0, 0)
-        toolbar = QHBoxLayout()
+        overview_layout.setContentsMargins(0, 6, 0, 0)
+        overview_layout.setSpacing(6)
+        toolbar_widget = QWidget()
+        toolbar_widget.setObjectName("viewerToolbar")
+        toolbar = QHBoxLayout(toolbar_widget)
+        toolbar.setContentsMargins(8, 6, 8, 6)
+        toolbar.setSpacing(6)
         self.mode_group = QButtonGroup(self)
         self.mode_buttons: dict[str, QToolButton] = {}
         for mode, label, tip in OVERVIEW_MODES:
@@ -535,7 +563,7 @@ class ScanWindow(QMainWindow):
         self.overview = OverviewCanvas(self.config_data.stage_limits)
         self.overview_hint = QLabel(OVERVIEW_HINTS["navigate"])
         self.overview_hint.setStyleSheet("color: #888;")
-        overview_layout.addLayout(toolbar)
+        overview_layout.addWidget(toolbar_widget)
         overview_layout.addWidget(self.overview, 1)
         # Accept button under the canvas, so a refocus walk never needs the setup panel.
         self.overview_accept_button = QPushButton("Accept Z ▶")
@@ -563,7 +591,14 @@ class ScanWindow(QMainWindow):
         self.tabs.addTab(self.frame_view, "Camera")
         layout.addWidget(self.tabs, 1)
 
-        capture_controls = QHBoxLayout()
+        capture_bar = QWidget()
+        capture_bar.setObjectName("viewerToolbar")
+        capture_controls = QHBoxLayout(capture_bar)
+        capture_controls.setContentsMargins(8, 6, 8, 6)
+        capture_controls.setSpacing(6)
+        capture_title = QLabel("Capture")
+        capture_title.setProperty("toolbarTitle", True)
+        capture_controls.addWidget(capture_title)
         self.live_button = QPushButton("Live")
         self.live_button.setCheckable(True)
         self.live_button.toggled.connect(self._toggle_live)
@@ -587,13 +622,15 @@ class ScanWindow(QMainWindow):
         capture_controls.addWidget(self.live_channel_box, 1)
         capture_controls.addWidget(self.preview_button)
         capture_controls.addWidget(self.clear_preview_button)
-        layout.addLayout(capture_controls)
+        layout.addWidget(capture_bar)
         wrapper.setMinimumWidth(360)
         return wrapper
 
     def _build_review_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 0, 8, 8)
+        layout.setSpacing(8)
         summary = QGroupBox("Cycle summary")
         s_layout = QVBoxLayout(summary)
         self.summary_label = QLabel()
@@ -604,13 +641,17 @@ class ScanWindow(QMainWindow):
         s_layout.addWidget(self.safety_label)
         layout.addWidget(summary)
 
+        acquisition = QGroupBox("Acquisition")
+        acquisition_layout = QVBoxLayout(acquisition)
+        acquisition_layout.setSpacing(8)
         self.start_button = QPushButton("Start cycle")
         self.start_button.setMinimumHeight(40)
-        self.start_button.setStyleSheet("font-weight: 600;")
+        self.start_button.setProperty("accent", True)
         self.start_button.clicked.connect(self._start_cycle)
         self.pause_button = QPushButton("Pause")
         self.pause_button.clicked.connect(self._toggle_pause)
         self.abort_button = QPushButton("Abort")
+        self.abort_button.setProperty("critical", True)
         self.abort_button.clicked.connect(self._abort)
         run_row = QHBoxLayout()
         run_row.addWidget(self.pause_button)
@@ -619,10 +660,11 @@ class ScanWindow(QMainWindow):
         self.progress.setRange(0, 1000)
         self.progress_label = QLabel()
         self.progress_label.setWordWrap(True)
-        layout.addWidget(self.start_button)
-        layout.addLayout(run_row)
-        layout.addWidget(self.progress)
-        layout.addWidget(self.progress_label)
+        acquisition_layout.addWidget(self.start_button)
+        acquisition_layout.addLayout(run_row)
+        acquisition_layout.addWidget(self.progress)
+        acquisition_layout.addWidget(self.progress_label)
+        layout.addWidget(acquisition)
 
         stage = QGroupBox("Stage controls")
         stage_layout = QVBoxLayout(stage)

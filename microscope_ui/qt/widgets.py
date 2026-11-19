@@ -100,7 +100,7 @@ class ChannelTable(QTableWidget):
             exposure_slider = QSlider(Qt.Orientation.Horizontal)
             exposure_slider.setRange(0, EXPOSURE_SLIDER_STEPS)
             exposure_slider.setPageStep(25)
-            exposure_slider.setMinimumWidth(72)
+            exposure_slider.setMinimumWidth(30)
             exposure_slider.setValue(
                 _slider_from_exposure(channel.default_exposure_ms, channel.max_exposure_ms)
             )
@@ -109,13 +109,16 @@ class ChannelTable(QTableWidget):
                 f"{channel.name} exposure, logarithmic {EXPOSURE_MIN_MS:g}–"
                 f"{channel.max_exposure_ms:g} ms"
             )
+            exposure.setFixedWidth(82)
+            power = spin(channel.default_power_percent, 0, channel.max_power_percent, 0, "%")
+            power.setFixedWidth(60)
             exposure_cell = QWidget()
+            exposure_cell.setMaximumWidth(120)
             exposure_layout = QHBoxLayout(exposure_cell)
             exposure_layout.setContentsMargins(0, 0, 0, 0)
             exposure_layout.setSpacing(4)
             exposure_layout.addWidget(exposure_slider, 1)
             exposure_layout.addWidget(exposure)
-            power = spin(channel.default_power_percent, 0, channel.max_power_percent, 0, "%")
             exposure_slider.valueChanged.connect(
                 lambda position, box=exposure, maximum=channel.max_exposure_ms: box.setValue(
                     _exposure_from_slider(position, maximum)
@@ -266,8 +269,21 @@ class StageJog(QWidget):
         super().__init__(parent)
         self.xy_step = spin(100, 0.1, 20000, 1, "µm")
         self.z_step = spin(1, 0.01, 500, 2, "µm")
-        grid = QGridLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        pads = QHBoxLayout()
+        pads.setContentsMargins(0, 0, 0, 0)
+        pads.setSpacing(14)
+        pads.addStretch(1)
+
+        xy_pad = QWidget()
+        xy_pad.setObjectName("jogPad")
+        grid = QGridLayout(xy_pad)
         grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(4)
         for text, row, col, d in (
             ("▲", 0, 1, (0, -1, 0)),
             ("◀", 1, 0, (-1, 0, 0)),
@@ -275,19 +291,35 @@ class StageJog(QWidget):
             ("▼", 2, 1, (0, 1, 0)),
         ):
             button = QPushButton(text)
-            button.setFixedWidth(36)
+            button.setProperty("jog", True)
+            button.setFixedSize(38, 34)
             button.clicked.connect(lambda _=False, d=d: self._emit_xy(*d))
             grid.addWidget(button, row, col)
+
+        pads.addWidget(xy_pad)
+        z_pad = QVBoxLayout()
+        z_pad.setSpacing(4)
         z_up = QPushButton("Z +")
         z_down = QPushButton("Z −")
+        for button in (z_up, z_down):
+            button.setProperty("jog", True)
+            button.setFixedSize(64, 34)
         z_up.clicked.connect(lambda: self.move_requested.emit(0, 0, self.z_step.value()))
         z_down.clicked.connect(lambda: self.move_requested.emit(0, 0, -self.z_step.value()))
-        grid.addWidget(z_up, 0, 3)
-        grid.addWidget(z_down, 2, 3)
-        grid.addWidget(QLabel("XY step"), 3, 0, 1, 2)
-        grid.addWidget(self.xy_step, 3, 2, 1, 2)
-        grid.addWidget(QLabel("Z step"), 4, 0, 1, 2)
-        grid.addWidget(self.z_step, 4, 2, 1, 2)
+        z_pad.addWidget(z_up)
+        z_pad.addStretch(1)
+        z_pad.addWidget(z_down)
+        pads.addLayout(z_pad)
+        pads.addStretch(1)
+        root.addLayout(pads)
+
+        steps = QFormLayout()
+        steps.setContentsMargins(0, 0, 0, 0)
+        steps.setHorizontalSpacing(10)
+        steps.setVerticalSpacing(6)
+        steps.addRow("XY step", self.xy_step)
+        steps.addRow("Z step", self.z_step)
+        root.addLayout(steps)
 
     def _emit_xy(self, sx: int, sy: int, _sz: int) -> None:
         step = self.xy_step.value()

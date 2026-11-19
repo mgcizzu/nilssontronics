@@ -221,12 +221,14 @@ QLabel[tone="bad"] {{ color: {p.critical}; }}
 QLabel[tone="attention"] {{ color: {p.critical}; font-weight: 600; }}
 
 /* cards: settings groups */
-QGroupBox {{ background: {p.card}; border: 1px solid {p.card_border}; border-radius: 8px;
-            margin-top: 26px; padding: 14px 12px 10px 12px; }}
+QGroupBox {{ background: {p.card}; border: 1px solid {p.card_border}; border-radius: 10px;
+            margin-top: 24px; padding: 16px 14px 12px 14px; }}
 QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left; left: 2px; top: 2px;
                    padding: 0 2px; font-weight: 600; color: {p.text}; }}
 QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}
 QSplitter::handle {{ background: transparent; width: 6px; }}
+#viewerToolbar {{ background: {p.card}; border: 1px solid {p.card_border}; border-radius: 8px; }}
+#viewerToolbar QLabel[toolbarTitle="true"] {{ color: {p.text_secondary}; font-weight: 600; }}
 
 /* buttons */
 QPushButton {{ background: {p.control}; border: 1px solid {p.control_border};
@@ -243,6 +245,9 @@ QPushButton[accent="true"]:hover {{ background: {p.accent_hover}; border-color: 
 QPushButton[accent="true"]:pressed {{ background: {p.accent_pressed}; }}
 QPushButton[accent="true"]:disabled {{ background: {p.control_pressed}; color: {p.text_disabled};
                                       border: 1px solid {p.control_border}; }}
+QPushButton[critical="true"] {{ color: {p.critical}; }}
+QPushButton[critical="true"]:disabled {{ color: {p.text_disabled}; }}
+QPushButton[jog="true"] {{ padding: 3px; font-weight: 600; }}
 QToolButton {{ background: {p.control}; border: 1px solid {p.control_border}; border-radius: 4px;
               padding: 4px 10px; }}
 QToolButton:hover {{ background: {p.control_hover}; }}
