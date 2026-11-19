@@ -168,6 +168,17 @@ def test_gui_stays_responsive_during_slow_live(qtbot, window):
     assert window.device.stop_and_drain(5)
 
 
+def test_live_stays_in_overview_and_refreshes_current_fov(qtbot, window):
+    window.tabs.setCurrentIndex(0)
+    window.live_button.setChecked(True)
+    qtbot.waitUntil(lambda: window.overview.live_frame_visible, timeout=5000)
+    assert window.tabs.currentIndex() == 0
+
+    window.live_button.setChecked(False)
+    assert not window.overview.live_frame_visible
+    assert window.device.stop_and_drain(5)
+
+
 def test_live_stops_before_cycle_starts(qtbot, window):
     window.backend.delay = 0.05
     window.region_list.append(ScanRegion(-300, -200, 600, 400))

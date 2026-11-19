@@ -131,7 +131,7 @@ class ScanWindow(QMainWindow):
         microscope_menu.addAction("Configuration…", self.show_configuration)
         self._build_device_docks()
 
-        self.device.frame_ready.connect(self.frame_view.show_frame)
+        self.device.frame_ready.connect(self._show_live_frame)
         self.device.position_changed.connect(self._position_changed)
         self.device.live_failed.connect(self._live_failed)
         self.channel_table.changed.connect(self._push_live_settings)
@@ -851,7 +851,6 @@ class ScanWindow(QMainWindow):
             self._sync_objective_box()
             return
         self.stop_spiral_preview()
-        self.overview.clear_preview()  # preview tiles were taken with the old objective
         self.objective_box.setEnabled(False)
         self.progress_label.setText(f"Changing objective to {objective.name}…")
 
@@ -1390,8 +1389,27 @@ class ScanWindow(QMainWindow):
         if on:
             self.stop_spiral_preview()
             self._push_live_settings()
-            self.tabs.setCurrentWidget(self.frame_view)
+        else:
+            self.overview.clear_live_frame()
         self.device.set_live(on)
+
+    def _show_live_frame(self, frame: np.ndarray) -> None:
+        """Route a frame to Camera and, when selected, the current Overview FOV."""
+
+        self.frame_view.show_frame(frame)
+        if not self.live_button.isChecked() or self.tabs.currentIndex() != 0:
+            return
+        step = max(1, int(np.ceil(max(frame.shape) / PREVIEW_TILE_PX)))
+        preview = np.ascontiguousarray(frame[::step, ::step])
+        position = self.stage_position
+        objective_id = self.backend.current_objective_id
+        channel = self.config_data.channel(self.live_channel_box.currentData())
+        self.overview.set_live_frame(
+            preview,
+            (position.x_um, position.y_um),
+            self.config_data.fov_um(objective_id),
+            channel.color,
+        )
 
     def _live_failed(self, message: str) -> None:
         self.live_button.setChecked(False)

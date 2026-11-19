@@ -122,6 +122,11 @@ class OverviewCanvas(QGraphicsView):
         self._mosaic_item.setZValue(-10)
         self._mosaic_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self._scene.addItem(self._mosaic_item)
+        self._live_item = QGraphicsPixmapItem()
+        self._live_item.setZValue(-4)  # above saved previews, below regions and tile outlines
+        self._live_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        self._live_item.hide()
+        self._scene.addItem(self._live_item)
         self._dynamic: list = []
         self._preview_items: list[QGraphicsPixmapItem] = []
         self._focus_points: list[FocusPoint] = []
@@ -224,6 +229,44 @@ class OverviewCanvas(QGraphicsView):
         item.setZValue(-5)  # above the cycle mosaic, below regions and tiles
         self._scene.addItem(item)
         self._preview_items.append(item)
+
+    def set_live_frame(
+        self,
+        frame: np.ndarray,
+        center: tuple[float, float],
+        fov_um: tuple[float, float],
+        color: str,
+    ) -> None:
+        """Show the latest live frame at the current physical stage position."""
+
+        low, high = np.percentile(frame, (1.0, 99.7)) if frame.size else (0.0, 1.0)
+        high = max(float(high), float(low) + 1.0)
+        scaled = np.clip((frame.astype(np.float32) - low) / (high - low), 0.0, 1.0)
+        tint = QColor(color)
+        rgb = scaled[:, :, None] * np.array(
+            [tint.red(), tint.green(), tint.blue()], dtype=np.float32
+        )
+        rgb = np.ascontiguousarray(rgb.astype(np.uint8))
+        image = QImage(
+            rgb.data,
+            rgb.shape[1],
+            rgb.shape[0],
+            rgb.shape[1] * 3,
+            QImage.Format.Format_RGB888,
+        )
+        fw, fh = fov_um
+        self._live_item.setPixmap(QPixmap.fromImage(image.copy()))
+        self._live_item.setPos(center[0] - fw / 2, center[1] - fh / 2)
+        self._live_item.setTransform(QTransform.fromScale(fw / rgb.shape[1], fh / rgb.shape[0]))
+        self._live_item.show()
+
+    def clear_live_frame(self) -> None:
+        self._live_item.hide()
+        self._live_item.setPixmap(QPixmap())
+
+    @property
+    def live_frame_visible(self) -> bool:
+        return self._live_item.isVisible() and not self._live_item.pixmap().isNull()
 
     def clear_preview(self) -> None:
         for item in self._preview_items:

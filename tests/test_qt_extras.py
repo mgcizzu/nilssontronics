@@ -179,6 +179,24 @@ def test_new_spiral_retains_existing_preview_tiles(qtbot, window):
     assert window.overview.preview_tile_count >= first_count + 3
 
 
+def test_objective_change_retains_existing_preview_tiles(qtbot, window):
+    overview_index = window.objective_box.findData("4x_air")
+    window.objective_box.setCurrentIndex(overview_index)
+    window._objective_selected(overview_index)
+    qtbot.waitUntil(lambda: window.backend.current_objective_id == "4x_air", timeout=5000)
+
+    window.preview_button.click()
+    qtbot.waitUntil(lambda: window.overview.preview_tile_count >= 3, timeout=5000)
+    window.preview_button.click()
+    preview_count = window.overview.preview_tile_count
+
+    imaging_index = window.objective_box.findData("20x_air")
+    window.objective_box.setCurrentIndex(imaging_index)
+    window._objective_selected(imaging_index)
+    qtbot.waitUntil(lambda: window.backend.current_objective_id == "20x_air", timeout=5000)
+    assert window.overview.preview_tile_count == preview_count
+
+
 def test_spiral_preview_follows_regions(qtbot, window):
     window.region_list.append(ScanRegion(-400, -300, 800, 600))
     expected = len(window.controller.tiles_for(window.build_plan()))
