@@ -239,7 +239,7 @@ QSplitter::handle {{ background: transparent; width: 6px; }}
 /* buttons */
 QPushButton {{ background: {p.control}; border: 1px solid {p.control_border};
               border-bottom: 1px solid {p.control_bottom}; border-radius: 4px;
-              padding: 5px 12px; min-height: 20px; }}
+              padding: 5px 8px; min-height: 20px; }}
 QPushButton:hover {{ background: {p.control_hover}; }}
 QPushButton:pressed {{ background: {p.control_pressed}; color: {p.text_secondary};
                       border-bottom: 1px solid {p.control_border}; }}
@@ -255,7 +255,7 @@ QPushButton[critical="true"] {{ color: {p.critical}; }}
 QPushButton[critical="true"]:disabled {{ color: {p.text_disabled}; }}
 QPushButton[jog="true"] {{ padding: 3px; font-weight: 600; }}
 QToolButton {{ background: {p.control}; border: 1px solid {p.control_border}; border-radius: 4px;
-              padding: 4px 10px; }}
+              padding: 4px 7px; }}
 QToolButton:hover {{ background: {p.control_hover}; }}
 QToolButton:checked {{ background: {p.accent}; color: {p.on_accent}; border-color: {p.accent}; }}
 QToolButton:disabled {{ color: {p.text_disabled}; }}

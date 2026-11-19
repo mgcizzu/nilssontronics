@@ -15,7 +15,7 @@ pytest.importorskip("pytestqt")
 from qtpy.QtCore import QPoint, Qt, QTimer  # noqa: E402
 from qtpy.QtWidgets import QScrollArea, QTabWidget  # noqa: E402
 
-from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
+from microscope_ui.backend import SimulatedMicroscope, StagePosition  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
 from microscope_ui.models import FocusPoint, ScanRegion  # noqa: E402
 from microscope_ui.mosaic import read_tile  # noqa: E402
@@ -233,9 +233,69 @@ def test_surface_stack_builds_offsets_around_focus_map(window):
     assert plan.z.mode == "surface_stack"
     assert (plan.z.bottom_um, plan.z.top_um, plan.z.plane_count) == (-2.0, 3.0, 6)
     assert not window.z_below.isHidden() and not window.z_above.isHidden()
-    assert window.z_begin_button.isHidden()
+    assert not window.z_begin_button.isHidden()
+    assert window.z_begin_button.text() == "Set start"
+    assert window.z_end_button.text() == "Set end"
     assert window.focus_method_box.isEnabled()
     assert window.z_wheel.plane_count == 6
+
+
+def test_surface_stack_capture_keeps_span_and_centres_it(window):
+    window.region_list.set_items([ScanRegion(-1000, -1000, 2000, 2000)])
+    window.focus_list.set_items(
+        [
+            FocusPoint(-1000, -1000, -1),
+            FocusPoint(1000, -1000, 1),
+            FocusPoint(0, 1000, 2),
+        ]
+    )
+    window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("surface_stack"))
+    positions = iter((StagePosition(0, 0, 8), StagePosition(0, 0, 14)))
+    window.with_fresh_position = lambda callback, on_error=None: callback(next(positions))
+    window._capture_z_begin()
+    window._capture_z_end()
+    assert window.z_below.value() == pytest.approx(3)
+    assert window.z_above.value() == pytest.approx(3)
+    assert "Captured span 6" in window.surface_span_label.text()
+    plan = window.build_plan()
+    assert (plan.z.bottom_um, plan.z.top_um, plan.z.plane_count) == (-3, 3, 7)
+    z_by_tile = window.controller.z_positions(
+        plan.z,
+        plan.focus_points,
+        plan.options.focus_method,
+        tuple(window.controller.tiles_for(plan)),
+        None,
+    )
+    for values in z_by_tile.values():
+        assert values[0] == pytest.approx(values[3] - 3)
+        assert values[-1] == pytest.approx(values[3] + 3)
+    window._reset_z_stack_capture()
+    assert (window.z_below.value(), window.z_above.value()) == pytest.approx((3, 3))
+    assert "Span 6" in window.surface_span_label.text()
+    assert "Captured" not in window.surface_span_label.text()
+
+
+def test_compact_button_labels_fit_at_small_window_size(qtbot, window):
+    window.resize(1024, 720)
+    window.show()
+    window.setup_tabs.setCurrentIndex(1)
+    qtbot.wait(20)
+    buttons = (
+        window.add_region_button,
+        window.save_set_button,
+        window.load_set_button,
+        window.shift_button,
+        window.focus_list.remove_button,
+        window.set_z_button,
+        window.refocus_button,
+        window.align_button,
+        *window.mode_buttons.values(),
+        window.preview_button,
+        window.clear_preview_button,
+    )
+    for button in buttons:
+        text_width = button.fontMetrics().horizontalAdvance(button.text())
+        assert button.width() >= text_width, button.text()
 
 
 def test_finished_cycle_invalidates_captured_stack_bounds(qtbot, window):

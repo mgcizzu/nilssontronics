@@ -70,7 +70,9 @@ A new cycle cannot start while an earlier one is unfinished.
   plane is always included, and spacing never exceeds the selected step. This
   follows tilted or warped sections without making every tile span the full
   specimen-wide Z range. The complete per-tile stack is checked against the
-  objective's safe Z range before acquisition.
+  objective's safe Z range before acquisition. **Set start** and **Set end**
+  can capture a desired span from live Z; its size is retained and symmetrically
+  recentered on the surface Z at every tile.
 
 ## Options (all optional)
 

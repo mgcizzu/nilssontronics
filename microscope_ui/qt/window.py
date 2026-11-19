@@ -98,21 +98,21 @@ Z_MODES = (
 LAUNCH_ERRORS = (ControllerError, HardwareError, OSError, ValueError)
 MOSAIC_UNDERLAY_PX = 1024
 PREVIEW_TILE_PX = 256
-DEFAULT_PANEL_SIZES = (380, 720, 280)
+DEFAULT_PANEL_SIZES = (340, 780, 260)
 DEFAULT_WINDOW_SIZE = (1400, 860)
 OVERVIEW_MODES = (
-    ("navigate", "Navigate", "Drag to pan, wheel to zoom, double-click to move the stage"),
-    ("rectangle", "Rectangle", "Drag to draw a rectangular scan region"),
-    ("polygon", "Polygon", "Click corners, double-click or Enter to close"),
-    ("move_set", "Move ROI set", "Drag to translate all regions and focus points (XY only)"),
-    ("focus", "Focus points", "Click a point to go to it, elsewhere to move there"),
+    ("navigate", "Pan", "Drag to pan, wheel to zoom, double-click to move the stage"),
+    ("rectangle", "Rect", "Drag to draw a rectangular scan region"),
+    ("polygon", "Poly", "Click corners, double-click or Enter to close"),
+    ("move_set", "Move", "Drag to translate all regions and focus points (XY only)"),
+    ("focus", "Focus", "Click a point to go to it, elsewhere to move there"),
 )
 OVERVIEW_HINTS = {
     "navigate": "Drag to pan • wheel to zoom • double-click moves the stage",
     "rectangle": "Drag to draw a region • Esc cancels",
     "polygon": "Click corners • double-click or Enter closes • Esc cancels",
     "move_set": "Drag to move regions and focus points together • Esc restores",
-    "focus": "Click F-point to go there, elsewhere to move XY • focus in Live, then Capture here / Set Z here",
+    "focus": "Click F-point to go there, elsewhere to move XY • focus in Live, then Capture / Set Z",
 }
 
 
@@ -136,6 +136,9 @@ class ScanWindow(QMainWindow):
         self.device = DeviceWorker(self.backend, self)
         self.z_begin_captured = False
         self.z_end_captured = False
+        self._surface_stack_start_um: float | None = None
+        self._surface_stack_end_um: float | None = None
+        self._setting_surface_span = False
         self._last_mosaic_render = 0.0
         self._loading = False
 
@@ -388,13 +391,13 @@ class ScanWindow(QMainWindow):
         regions_layout = QVBoxLayout(regions)
         self.region_list = ItemList(describe_region)
         self.add_region_button = self.region_list.add_button("Add…", self._add_region)
-        self.save_set_button = QPushButton("Save set…")
+        self.save_set_button = QPushButton("Save…")
         self.save_set_button.setToolTip("Save regions and focus points to a JSON file")
         self.save_set_button.clicked.connect(self._save_roi_set)
-        self.load_set_button = QPushButton("Load set…")
+        self.load_set_button = QPushButton("Load…")
         self.load_set_button.setToolTip("Replace regions and focus points from a saved set")
         self.load_set_button.clicked.connect(self._load_roi_set)
-        self.shift_button = QPushButton("Shift ROI set…")
+        self.shift_button = QPushButton("Shift set…")
         self.shift_button.setToolTip("Re-register for this cycle: XY translation of the whole set")
         self.shift_button.clicked.connect(self._shift_roi_set)
         set_row = QHBoxLayout()
@@ -408,16 +411,18 @@ class ScanWindow(QMainWindow):
         focus = QGroupBox("Focus points")
         focus_layout = QVBoxLayout(focus)
         self.focus_list = ItemList(describe_focus)
-        self.focus_list.add_button("Capture here", self._capture_focus_here)
+        capture_focus_button = self.focus_list.add_button("Capture", self._capture_focus_here)
+        capture_focus_button.setToolTip("Capture a focus point at the current XYZ position")
         self.focus_list.add_button("Go to", self._goto_focus)
-        self.set_z_button = self.focus_list.add_button("Set Z here", self._set_focus_z_here)
+        self.set_z_button = self.focus_list.add_button("Set Z", self._set_focus_z_here)
+        self.set_z_button.setToolTip("Set the selected focus point to the current Z")
         self.focus_list.remove_button.clicked.connect(lambda: self.stop_refocus("Refocus stopped"))
         self.refocus_button = QPushButton("Refocus all")
         self.refocus_button.setToolTip(
             "Visit every focus point in order: focus in Live, then Accept Z to store it and move on"
         )
         self.refocus_button.clicked.connect(self._toggle_refocus)
-        self.align_button = QPushButton("Align selected F → stage")
+        self.align_button = QPushButton("Align F → stage")
         self.align_button.setToolTip(
             "Centre the selected point's landmark in Live, then press: the whole ROI set "
             "moves so that point sits at the current stage XY (Z is kept)"
@@ -452,8 +457,8 @@ class ScanWindow(QMainWindow):
         self.z_below.setToolTip("Distance below the interpolated focus surface at every tile")
         self.z_above.setToolTip("Distance above the interpolated focus surface at every tile")
         self.z_step = spin(1, 0.01, 1000, 2, "µm")
-        self.z_begin_button = QPushButton("Capture Begin")
-        self.z_end_button = QPushButton("Capture End")
+        self.z_begin_button = QPushButton("Set begin")
+        self.z_end_button = QPushButton("Set end")
         self.z_begin_button.clicked.connect(self._capture_z_begin)
         self.z_end_button.clicked.connect(self._capture_z_end)
         stack_buttons = QHBoxLayout()
@@ -468,15 +473,18 @@ class ScanWindow(QMainWindow):
         z_form.addRow("End", self.z_top)
         z_form.addRow("Below surface", self.z_below)
         z_form.addRow("Above surface", self.z_above)
+        self.surface_span_label = QLabel()
+        self.surface_span_label.setWordWrap(True)
+        self.surface_span_label.setProperty("secondary", True)
+        z_form.addRow(self.surface_span_label)
         self.z_step_label = QLabel("Step")
         z_form.addRow(self.z_step_label, self.z_step)
-        self.z_stack_widgets = (
-            self.z_begin_button,
-            self.z_end_button,
-            self.z_bottom,
-            self.z_top,
-        )
+        self.z_stack_widgets = (self.z_bottom, self.z_top)
+        self.z_capture_buttons = (self.z_begin_button, self.z_end_button)
         self.z_surface_stack_widgets = (self.z_below, self.z_above)
+        self.z_below.valueChanged.connect(self._surface_offsets_changed)
+        self.z_above.valueChanged.connect(self._surface_offsets_changed)
+        self._update_surface_span_label()
         acquisition_layout.addWidget(z_group)
 
         # Tiling & options
@@ -489,8 +497,11 @@ class ScanWindow(QMainWindow):
         self.consistent_approach = ToggleSwitch("Consistent stage approach")
         self.shutter_per_frame = ToggleSwitch("Shutter closed during moves")
         self.shutter_per_frame.setChecked(True)
-        self.flat_field = ToggleSwitch("Estimate flat-field profiles")
-        self.distortion = ToggleSwitch("Correct lens distortion and channel registration")
+        self.flat_field = ToggleSwitch("Estimate flat-field")
+        self.flat_field.setToolTip(
+            "Estimate a flat-field profile for every channel after the cycle"
+        )
+        self.distortion = ToggleSwitch("Correct distortion / registration")
         self.distortion.setToolTip(
             "Resample every plane with the objective's grid-slide calibration before saving, "
             "so ISS_preprocessing gets geometrically corrected, channel-registered tiles. "
@@ -548,7 +559,7 @@ class ScanWindow(QMainWindow):
             signal.connect(self._refresh)
 
         self.setup_tabs = QTabWidget()
-        self.setup_tabs.setMinimumWidth(360)
+        self.setup_tabs.setMinimumWidth(320)
         self.setup_tabs.setUsesScrollButtons(False)
         self.setup_tabs.tabBar().setExpanding(True)
         self.setup_pages: list[QScrollArea] = []
@@ -581,31 +592,41 @@ class ScanWindow(QMainWindow):
         overview_layout.setSpacing(6)
         toolbar_widget = QWidget()
         toolbar_widget.setObjectName("viewerToolbar")
-        toolbar = QHBoxLayout(toolbar_widget)
+        toolbar = QVBoxLayout(toolbar_widget)
         toolbar.setContentsMargins(8, 6, 8, 6)
-        toolbar.setSpacing(6)
+        toolbar.setSpacing(4)
+        mode_toolbar = QHBoxLayout()
+        mode_toolbar.setSpacing(6)
         self.mode_group = QButtonGroup(self)
         self.mode_buttons: dict[str, QToolButton] = {}
         for mode, label, tip in OVERVIEW_MODES:
             button = QToolButton()
             button.setText(label)
             button.setToolTip(tip)
+            button.setMinimumWidth(button.sizeHint().width())
             button.setCheckable(True)
             button.clicked.connect(lambda _=False, m=mode: self.set_overview_mode(m))
             self.mode_group.addButton(button)
             self.mode_buttons[mode] = button
-            toolbar.addWidget(button)
+            mode_toolbar.addWidget(button)
+        mode_toolbar.addStretch(1)
+        toolbar.addLayout(mode_toolbar)
         self.mode_buttons["navigate"].setChecked(True)
+        view_toolbar = QHBoxLayout()
+        view_toolbar.setSpacing(6)
+        view_toolbar.addWidget(QLabel("View"))
         fit = QToolButton()
         fit.setText("Fit")
+        fit.setMinimumWidth(fit.sizeHint().width())
         fit.clicked.connect(self._fit_overview)
         self.mosaic_mode_box = QComboBox()
         self.mosaic_mode_box.addItem(DiskBackedMosaic.COMPOSITE)
         self.mosaic_mode_box.setToolTip("Cycle mosaic display")
         self.mosaic_mode_box.currentIndexChanged.connect(lambda: self._render_mosaic(force=True))
-        toolbar.addWidget(fit)
-        toolbar.addStretch(1)
-        toolbar.addWidget(self.mosaic_mode_box)
+        view_toolbar.addWidget(fit)
+        view_toolbar.addStretch(1)
+        view_toolbar.addWidget(self.mosaic_mode_box)
+        toolbar.addLayout(view_toolbar)
         self.overview = OverviewCanvas(self.config_data.stage_limits)
         self.overview_hint = QLabel(OVERVIEW_HINTS["navigate"])
         self.overview_hint.setStyleSheet("color: #888;")
@@ -653,7 +674,7 @@ class ScanWindow(QMainWindow):
         self.live_channel_box = QComboBox()
         for channel in self.config_data.channels:
             self.live_channel_box.addItem(channel.name, channel.id)
-        self.preview_button = QPushButton("Spiral preview")
+        self.preview_button = QPushButton("Spiral")
         self.preview_button.setCheckable(True)
         self.preview_button.setToolTip(
             "Snap the Live channel at each tile position, spiralling out from the stage "
@@ -661,7 +682,8 @@ class ScanWindow(QMainWindow):
             "exist). Existing preview images are retained. Current Z only, no Z moves."
         )
         self.preview_button.toggled.connect(self._toggle_spiral_preview)
-        self.clear_preview_button = QPushButton("Clear previews")
+        self.clear_preview_button = QPushButton("Clear")
+        self.clear_preview_button.setToolTip("Clear all retained spiral preview images")
         self.clear_preview_button.clicked.connect(self.clear_spiral_previews)
         capture_controls.addWidget(self.live_button)
         capture_controls.addWidget(self.snap_button)
@@ -669,7 +691,7 @@ class ScanWindow(QMainWindow):
         capture_controls.addWidget(self.preview_button)
         capture_controls.addWidget(self.clear_preview_button)
         layout.addWidget(capture_bar)
-        wrapper.setMinimumWidth(360)
+        wrapper.setMinimumWidth(400)
         return wrapper
 
     def _build_review_panel(self) -> QWidget:
@@ -1139,15 +1161,28 @@ class ScanWindow(QMainWindow):
         mode = self.z_mode_box.currentData()
         stack = mode == "stack"
         surface_stack = mode == "surface_stack"
+        uses_stack_step = stack or surface_stack
         for widget in self.z_stack_widgets:
             widget.setVisible(stack)
+        for button in self.z_capture_buttons:
+            button.setVisible(uses_stack_step)
         for widget in self.z_surface_stack_widgets:
             widget.setVisible(surface_stack)
         for widget in self.z_stack_widgets + self.z_surface_stack_widgets:
             field_label = self.z_form.labelForField(widget)
             if field_label is not None:
                 field_label.setVisible(widget.isVisible())
-        uses_stack_step = stack or surface_stack
+        self.z_begin_button.setText("Set start" if surface_stack else "Set begin")
+        self.z_end_button.setText("Set end")
+        if surface_stack:
+            self.z_begin_button.setToolTip("Capture one edge of the desired stack span")
+            self.z_end_button.setToolTip(
+                "Capture the other edge; the span is centred on every tile's surface Z"
+            )
+        else:
+            self.z_begin_button.setToolTip("Capture the absolute stack begin at the current Z")
+            self.z_end_button.setToolTip("Capture the absolute stack end at the current Z")
+        self.surface_span_label.setVisible(surface_stack)
         self.z_step.setVisible(uses_stack_step)
         self.z_step_label.setVisible(uses_stack_step)
         self.focus_method_box.setEnabled(mode in ("focus_map", "surface_stack"))
@@ -1188,7 +1223,11 @@ class ScanWindow(QMainWindow):
 
     def _capture_z_begin(self) -> None:
         def capture(p) -> None:
-            self.z_bottom.setValue(p.z_um)
+            if self.z_mode_box.currentData() == "surface_stack":
+                self._surface_stack_start_um = p.z_um
+                self._apply_surface_stack_capture()
+            else:
+                self.z_bottom.setValue(p.z_um)
             self.z_begin_captured = True
             self._refresh()
 
@@ -1196,14 +1235,56 @@ class ScanWindow(QMainWindow):
 
     def _capture_z_end(self) -> None:
         def capture(p) -> None:
-            self.z_top.setValue(p.z_um)
+            if self.z_mode_box.currentData() == "surface_stack":
+                self._surface_stack_end_um = p.z_um
+                self._apply_surface_stack_capture()
+            else:
+                self.z_top.setValue(p.z_um)
             self.z_end_captured = True
             self._refresh()
 
         self.with_fresh_position(capture)
 
+    def _apply_surface_stack_capture(self) -> None:
+        """Keep the captured span and centre it on each tile's focus-surface Z."""
+
+        if self._surface_stack_start_um is None or self._surface_stack_end_um is None:
+            self._update_surface_span_label()
+            return
+        half_span = abs(self._surface_stack_end_um - self._surface_stack_start_um) / 2
+        self._setting_surface_span = True
+        try:
+            self.z_below.setValue(half_span)
+            self.z_above.setValue(half_span)
+        finally:
+            self._setting_surface_span = False
+        self._update_surface_span_label()
+        self._update_z_stack_view()
+
+    def _surface_offsets_changed(self, *_args) -> None:
+        if not self._setting_surface_span:
+            self._surface_stack_start_um = None
+            self._surface_stack_end_um = None
+            self.z_begin_captured = self.z_end_captured = False
+        self._update_surface_span_label()
+
+    def _update_surface_span_label(self) -> None:
+        if not hasattr(self, "surface_span_label"):
+            return
+        span = self.z_below.value() + self.z_above.value()
+        if self._surface_stack_start_um is not None and self._surface_stack_end_um is not None:
+            self.surface_span_label.setText(
+                f"Captured span {span:g} µm → centred ±{span / 2:g} µm on the surface"
+            )
+        else:
+            self.surface_span_label.setText(
+                f"Span {span:g} µm → centred on each tile's surface Z"
+            )
+
     def _reset_z_stack_capture(self) -> None:
         self.z_begin_captured = self.z_end_captured = False
+        self._surface_stack_start_um = self._surface_stack_end_um = None
+        self._update_surface_span_label()
 
     def _add_region(self) -> None:
         p = self.stage_position
@@ -1319,11 +1400,11 @@ class ScanWindow(QMainWindow):
         if index >= 0:
             self.focus_list.list.setCurrentRow(index)
             self._goto_focus()
-            self.overview_hint.setText(f"Going to F{index + 1} — refocus in Live, then Set Z here")
+            self.overview_hint.setText(f"Going to F{index + 1} — refocus in Live, then Set Z")
         else:
             self.focus_list.list.setCurrentRow(-1)
             self.device_move(self.backend.move_xy, x_um, y_um)
-            self.overview_hint.setText("Moving — focus in Live, then Capture here")
+            self.overview_hint.setText("Moving — focus in Live, then Capture")
         if not self.live_button.isChecked():
             self.live_button.setChecked(True)
         self.tabs.setCurrentIndex(0)  # stay on the overview while live runs
@@ -1598,7 +1679,7 @@ class ScanWindow(QMainWindow):
             return
         self.refocus_index = None
         self.refocus_button.setText("Refocus all")
-        self.set_z_button.setText("Set Z here")
+        self.set_z_button.setText("Set Z")
         self.refocus_label.hide()
         self.overview_accept_button.hide()
         if message:
