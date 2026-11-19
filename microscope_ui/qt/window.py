@@ -77,6 +77,7 @@ from .widgets import (
     ItemList,
     RectangleDialog,
     StageJog,
+    ZWheelControl,
     describe_focus,
     describe_region,
     spin,
@@ -135,6 +136,13 @@ class ScanWindow(QMainWindow):
         self.setWindowTitle(f"Microscope Scan Console — {self.backend.name}")
         self.fit_window_to_screen()
         self._build_ui(use_ndv)
+        for signal in (
+            self.z_mode_box.currentIndexChanged,
+            self.z_bottom.valueChanged,
+            self.z_top.valueChanged,
+            self.z_step.valueChanged,
+        ):
+            signal.connect(self._update_z_stack_view)
         microscope_menu = self.menuBar().addMenu("Microscope")
         microscope_menu.addAction("Configuration…", self.show_configuration)
         self._build_device_docks()
@@ -671,6 +679,9 @@ class ScanWindow(QMainWindow):
         self.jog = StageJog()
         self.jog.move_requested.connect(self._jog)
         stage_layout.addWidget(self.jog)
+        self.z_wheel = ZWheelControl()
+        self.z_wheel.jog_requested.connect(self._z_wheel_jog)
+        stage_layout.addWidget(self.z_wheel)
         layout.addWidget(stage)
         layout.addStretch(1)
         scroll = QScrollArea()
@@ -873,7 +884,7 @@ class ScanWindow(QMainWindow):
                        self.output_edit, self.channel_table, self.focus_method_box,
                        self.z_mode_box, self.consistent_approach, self.shutter_per_frame,
                        self.flat_field, self.snap_button, self.live_button, self.jog,
-                       self.preview_button):
+                       self.preview_button, self.z_wheel):
             widget.setEnabled(not busy)
         for widget in (self.objective_box, self.overlap_x, self.overlap_y, self.tile_order_box,
                        self.distortion):
@@ -947,6 +958,7 @@ class ScanWindow(QMainWindow):
             return
         p = self.device.last_position
         self.position_label.setText(f"X {p.x_um:.1f}  Y {p.y_um:.1f}  Z {p.z_um:.2f} µm")
+        self._update_z_stack_view()
 
     def _position_changed(self, _position) -> None:
         self._update_position()
@@ -1058,7 +1070,23 @@ class ScanWindow(QMainWindow):
         for widget in self.z_stack_widgets:
             widget.setVisible(stack)
         self.focus_method_box.setEnabled(self.z_mode_box.currentData() == "focus_map")
+        self._update_z_stack_view()
         self._refresh()
+
+    def _update_z_stack_view(self, *_args) -> None:
+        if not hasattr(self, "z_wheel"):
+            return
+        positions: tuple[float, ...] = ()
+        if self.z_mode_box.currentData() == "stack":
+            positions = ZSettings(
+                mode="stack",
+                bottom_um=self.z_bottom.value(),
+                top_um=self.z_top.value(),
+                step_um=self.z_step.value(),
+                begin_captured=True,
+                end_captured=True,
+            ).stack_positions()
+        self.z_wheel.set_stack(positions, self.device.last_position.z_um)
 
     def _capture_z_begin(self) -> None:
         def capture(p) -> None:
@@ -1513,6 +1541,11 @@ class ScanWindow(QMainWindow):
                 backend.move_xy(p.x_um + dx, p.y_um + dy)
 
         self.device_move(jog)
+
+    def _z_wheel_jog(self, notches: int) -> None:
+        """Move Z from the dedicated viewer-edge wheel target."""
+
+        self._jog(0.0, 0.0, notches * self.jog.z_step.value())
 
     def _push_live_settings(self, *_args) -> None:
         channel = self.config_data.channel(self.live_channel_box.currentData())

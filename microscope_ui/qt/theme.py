@@ -229,6 +229,12 @@ QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border:
 QSplitter::handle {{ background: transparent; width: 6px; }}
 #viewerToolbar {{ background: {p.card}; border: 1px solid {p.card_border}; border-radius: 8px; }}
 #viewerToolbar QLabel[toolbarTitle="true"] {{ color: {p.text_secondary}; font-weight: 600; }}
+#zWheelZone {{ background: {p.card}; border: 1px solid {p.card_border}; border-radius: 8px; }}
+#zWheelZone:hover {{ border-color: {p.accent}; background: {p.control_hover}; }}
+#zWheelZone QLabel {{ color: {p.text_secondary}; }}
+#zWheelZone QLabel[wheelTitle="true"] {{ color: {p.text}; font-weight: 700; }}
+#zWheelZone QLabel[wheelValue="true"] {{ color: {p.text_secondary}; font-size: 9pt; }}
+#zWheelZone:disabled {{ background: {p.control_pressed}; border-color: {p.card_border}; }}
 
 /* buttons */
 QPushButton {{ background: {p.control}; border: 1px solid {p.control_border};

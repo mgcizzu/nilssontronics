@@ -326,6 +326,139 @@ class StageJog(QWidget):
         self.move_requested.emit(sx * step, sy * step, 0.0)
 
 
+class ZWheelControl(QWidget):
+    """A deliberate mouse-wheel target plus a live Z-stack plane navigator."""
+
+    jog_requested = Signal(int)  # signed number of wheel notches
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._wheel_delta = 0
+        self.setObjectName("zWheelZone")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(128)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName("Z mouse wheel control and stack viewer")
+        self.setToolTip(
+            "Scroll here to move focus Z. Wheel up: +Z; wheel down: −Z. "
+            "Distance per notch comes from Stage controls → Z step."
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setSpacing(4)
+        title = QLabel("Z")
+        title.setProperty("wheelTitle", True)
+        self.position_label = QLabel("0.00 µm")
+        self.position_label.setProperty("wheelValue", True)
+        self.ruler = _ZStackRuler()
+        self.ruler.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.plane_label = QLabel("single")
+        self.plane_label.setProperty("wheelValue", True)
+        wheel_label = QLabel("↕ wheel")
+        for label in (title, self.position_label, self.plane_label, wheel_label):
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        header = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self.position_label)
+        layout.addLayout(header)
+        layout.addWidget(self.ruler, 1)
+        footer = QHBoxLayout()
+        footer.addWidget(self.plane_label)
+        footer.addStretch(1)
+        footer.addWidget(wheel_label)
+        layout.addLayout(footer)
+
+    @property
+    def plane_count(self) -> int:
+        return len(self.ruler.positions)
+
+    @property
+    def active_plane_index(self) -> int | None:
+        return self.ruler.active_index
+
+    def set_stack(self, positions: tuple[float, ...], active_z_um: float) -> None:
+        self.position_label.setText(f"{active_z_um:.2f} µm")
+        self.ruler.set_stack(positions, active_z_um)
+        index = self.ruler.active_index
+        self.plane_label.setText(
+            f"{index + 1} / {len(positions)}" if index is not None else "single"
+        )
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt API
+        delta = event.angleDelta().y()
+        if not delta:
+            event.ignore()
+            return
+        self._wheel_delta += delta
+        notches = int(self._wheel_delta / 120)
+        if notches:
+            self._wheel_delta -= notches * 120
+            self.jog_requested.emit(notches)
+        event.accept()
+
+
+class _ZStackRuler(QWidget):
+    """Paint planned planes as a ladder and highlight the nearest active one."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.positions: tuple[float, ...] = ()
+        self.active_z_um = 0.0
+        self.active_index: int | None = None
+        self.setMinimumHeight(46)
+
+    def set_stack(self, positions: tuple[float, ...], active_z_um: float) -> None:
+        self.positions = tuple(positions)
+        self.active_z_um = active_z_um
+        self.active_index = (
+            min(range(len(self.positions)), key=lambda i: abs(self.positions[i] - active_z_um))
+            if self.positions else None
+        )
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt API
+        from .theme import current_palette
+
+        palette = current_palette()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        x = self.width() // 2
+        top, bottom = 6, max(7, self.height() - 7)
+        painter.setPen(QColor(palette.control_border))
+        painter.drawLine(x, top, x, bottom)
+
+        count = len(self.positions)
+        if count:
+            visible = set(range(count))
+            if count > 48:
+                stride = math.ceil(count / 48)
+                visible = set(range(0, count, stride)) | {count - 1}
+            for index in visible:
+                y = top if count == 1 else round(top + index * (bottom - top) / (count - 1))
+                width = 9 if index in (0, count - 1) else 6
+                painter.setPen(QColor(palette.text_secondary))
+                painter.drawLine(x - width, y, x + width, y)
+
+            if self.active_index is not None:
+                y = (
+                    top
+                    if count == 1
+                    else round(top + self.active_index * (bottom - top) / (count - 1))
+                )
+                painter.setPen(QColor(palette.accent))
+                painter.setBrush(QColor(palette.accent))
+                painter.drawRoundedRect(x - 14, y - 3, 28, 7, 3, 3)
+        else:
+            painter.setPen(QColor(palette.text_disabled))
+            painter.drawEllipse(x - 3, (top + bottom) // 2 - 3, 6, 6)
+        painter.end()
+
+
 class FrameView(QWidget):
     """Camera frame display. Uses ndv when it can start, else a plain image label.
 

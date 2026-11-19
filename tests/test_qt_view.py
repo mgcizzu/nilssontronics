@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("qtpy")
 pytest.importorskip("pytestqt")
 
-from qtpy.QtCore import Qt, QTimer  # noqa: E402
+from qtpy.QtCore import QPoint, Qt, QTimer  # noqa: E402
 from qtpy.QtWidgets import QScrollArea, QTabWidget  # noqa: E402
 
 from microscope_ui.backend import SimulatedMicroscope  # noqa: E402
@@ -28,6 +28,21 @@ class SlowSimulator(SimulatedMicroscope):
     def snap(self):
         time.sleep(self.delay)
         return super().snap()
+
+
+class FakeWheelEvent:
+    def __init__(self, delta: int) -> None:
+        self.delta = delta
+        self.accepted = False
+
+    def angleDelta(self):  # noqa: N802 - mirrors the Qt API
+        return QPoint(0, self.delta)
+
+    def accept(self) -> None:
+        self.accepted = True
+
+    def ignore(self) -> None:
+        self.accepted = False
 
 
 @pytest.fixture
@@ -150,6 +165,46 @@ def test_jog_is_limit_checked_and_reports_position(qtbot, window):
     assert window.messages[-1][1] == "Stage move refused"
     assert window.device.stop_and_drain(5)
     assert window.backend.position.x_um == pytest.approx(limits.x_max_um - 10)
+
+
+def test_dedicated_wheel_zone_jogs_z_without_stealing_viewer_zoom(qtbot, window):
+    window.show()
+    window.jog.z_step.setValue(2.5)
+    start_z = window.stage_position.z_um
+
+    first_half = FakeWheelEvent(60)
+    window.z_wheel.wheelEvent(first_half)
+    assert first_half.accepted
+    assert window.backend.position.z_um == pytest.approx(start_z)
+
+    second_half = FakeWheelEvent(60)
+    window.z_wheel.wheelEvent(second_half)
+    qtbot.waitUntil(lambda: window.stage_position.z_um == pytest.approx(start_z + 2.5))
+    assert second_half.accepted
+
+    two_notches_down = FakeWheelEvent(-240)
+    window.z_wheel.wheelEvent(two_notches_down)
+    qtbot.waitUntil(lambda: window.stage_position.z_um == pytest.approx(start_z - 2.5))
+    assert window.z_wheel.isVisibleTo(window)
+    window.tabs.setCurrentIndex(1)
+    assert window.z_wheel.isVisibleTo(window)  # available beside both Overview and Camera
+    assert window.review_scroll.widget().isAncestorOf(window.z_wheel)
+
+
+def test_z_stack_view_highlights_the_nearest_active_plane(qtbot, window):
+    window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("stack"))
+    window.z_bottom.setValue(-2.0)
+    window.z_top.setValue(2.0)
+    window.z_step.setValue(1.0)
+    assert window.z_wheel.plane_count == 5
+    assert window.z_wheel.active_plane_index == 2
+    assert window.z_wheel.plane_label.text() == "3 / 5"
+
+    window.jog.z_step.setValue(1.0)
+    window.z_wheel.wheelEvent(FakeWheelEvent(120))
+    qtbot.waitUntil(lambda: window.z_wheel.active_plane_index == 3)
+    assert window.z_wheel.plane_label.text() == "4 / 5"
+    assert "1.00 µm" in window.z_wheel.position_label.text()
 
 
 def test_gui_stays_responsive_during_slow_live(qtbot, window):
