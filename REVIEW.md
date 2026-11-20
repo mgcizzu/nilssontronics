@@ -136,7 +136,7 @@ Windows, so the macOS `F_FULLFSYNC`-per-plane cost is deliberately not listed.
   Micro-Manager (stage may home, turret/filters may move) and ask for confirmation.
   *Test:* wizard refuses with a hardware backend; inspection runs off the GUI thread.
 
-- [ ] **E2. Wizard pre-fills plausible safety values.**
+- [x] **E2. Wizard pre-fills plausible safety values.**
   Every objective row starts as 10×, NA 0.3, 1.0 µm/px, safe Z −4000/3500
   (`qt/profile_wizard.py:234`). These pass validation, so ticking the single
   confirmation box saves wrong pixel sizes and safe-Z ranges.

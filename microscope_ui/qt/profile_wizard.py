@@ -28,6 +28,22 @@ from qtpy.QtWidgets import (
 
 from ..mm_profile import MMConfigDiscovery, build_profile, inspect_mm_config, safe_id, save_profile
 
+# Refractive index used when the "Immersion n" cell is left empty.
+IMMERSION_INDEX = {"air": 1.0, "oil": 1.515, "water": 1.333, "silicone": 1.406}
+
+OBJECTIVE_COLUMNS = (  # (header, key)
+    ("Name", "name"),
+    ("Mag.", "magnification"),
+    ("NA", "na"),
+    ("Immersion", "immersion"),
+    ("Immersion n", "index"),
+    ("Turret state", "turret"),
+    ("µm/px", "pixel"),
+    ("Safe Z min", "safe_min"),
+    ("Safe Z max", "safe_max"),
+)
+COLUMN_TITLES = {key: title for title, key in OBJECTIVE_COLUMNS}
+
 CHANNEL_COLORS = ("#e7e5d8", "#6c8cff", "#58d68d", "#ffb347", "#ff5b78", "#c67cff")
 
 
@@ -301,11 +317,15 @@ class SafetyPage(QWizardPage):
         limits.addWidget(QLabel("Objective-change clearance"), 3, 0)
         limits.addWidget(self.clearance, 3, 1, 1, 2)
         root.addLayout(limits)
-        root.addWidget(QLabel("Objectives (edit every optical and safe-Z value):"))
-        self.objectives = QTableWidget(0, 8)
-        self.objectives.setHorizontalHeaderLabels(
-            ["Name", "Mag.", "NA", "Immersion", "Turret state", "µm/px", "Safe Z min", "Safe Z max"]
+        hint = QLabel(
+            "Objectives: enter magnification, NA, pixel size and safe Z range for every "
+            "row (nothing is pre-filled). Immersion n may stay empty for air, oil, water "
+            "and silicone; it is required for 'other'."
         )
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+        self.objectives = QTableWidget(0, len(OBJECTIVE_COLUMNS))
+        self.objectives.setHorizontalHeaderLabels([title for title, _key in OBJECTIVE_COLUMNS])
         self.objectives.horizontalHeader().setStretchLastSection(True)
         root.addWidget(self.objectives)
         self.confirmed = QCheckBox("I verified the travel limits, clearance position, turret mapping, and safe Z ranges")
@@ -323,9 +343,10 @@ class SafetyPage(QWizardPage):
             labels = ("Objective 1",)
         self.objectives.setRowCount(len(labels))
         for row, label in enumerate(labels):
-            values = (label, "10", "0.3", "air", str(row), "1.0", "-4000", "3500")
-            for column, value in enumerate(values):
-                self.objectives.setItem(row, column, QTableWidgetItem(value))
+            # Only facts Micro-Manager knows are pre-filled; optics and safe Z must be typed.
+            prefilled = {"name": label, "immersion": "air", "turret": str(row)}
+            for column, (_title, key) in enumerate(OBJECTIVE_COLUMNS):
+                self.objectives.setItem(row, column, QTableWidgetItem(prefilled.get(key, "")))
         self.objectives.resizeColumnsToContents()
 
     def validatePage(self) -> bool:
@@ -337,13 +358,13 @@ class SafetyPage(QWizardPage):
         if not limits["z_min_um"] <= self.clearance.value() <= limits["z_max_um"]:
             QMessageBox.warning(self, "Invalid clearance", "Objective-change clearance must lie inside the Z travel limits.")
             return False
-        if not self.confirmed.isChecked():
-            QMessageBox.warning(self, "Safety confirmation required", "Verify and confirm every motion-safety value before continuing.")
-            return False
         try:
             self.selected_objectives()
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid objective", str(exc))
+            return False
+        if not self.confirmed.isChecked():
+            QMessageBox.warning(self, "Safety confirmation required", "Verify and confirm every motion-safety value before continuing.")
             return False
         return True
 
@@ -354,27 +375,48 @@ class SafetyPage(QWizardPage):
         result = []
         used: set[str] = set()
         for row in range(self.objectives.rowCount()):
-            values = [self.objectives.item(row, column).text().strip() for column in range(8)]
-            name, magnification, na, immersion, turret, pixel, safe_min, safe_max = values
+            cells = {}
+            for column, (_title, key) in enumerate(OBJECTIVE_COLUMNS):
+                item = self.objectives.item(row, column)
+                cells[key] = item.text().strip() if item is not None else ""
+            name = cells["name"]
+            if not name:
+                raise ValueError(f"Row {row + 1}: enter the objective name")
             objective_id = safe_id(name, f"objective_{row + 1}")
             if objective_id in used:
                 raise ValueError(f"Objective name '{name}' is duplicated")
             used.add(objective_id)
-            immersion = immersion.lower()
-            if immersion not in {"air", "oil", "water", "silicone", "other"}:
+            immersion = cells["immersion"].lower()
+            if immersion not in IMMERSION_INDEX and immersion != "other":
                 raise ValueError(f"{name}: immersion must be air, oil, water, silicone, or other")
+
+            def number(key: str, kind=float):
+                title = COLUMN_TITLES[key]
+                if not cells[key]:
+                    raise ValueError(f"{name}: enter {title}")
+                try:
+                    return kind(cells[key])
+                except ValueError:
+                    raise ValueError(f"{name}: {title} must be a number, not '{cells[key]}'") from None
+
+            if cells["index"]:
+                index = number("index")
+            elif immersion in IMMERSION_INDEX:
+                index = IMMERSION_INDEX[immersion]
+            else:
+                raise ValueError(f"{name}: enter the immersion refractive index for 'other'")
             result.append(
                 {
                     "id": objective_id,
                     "name": name,
-                    "magnification": float(magnification),
-                    "numerical_aperture": float(na),
+                    "magnification": number("magnification"),
+                    "numerical_aperture": number("na"),
                     "immersion": immersion,
-                    "immersion_refractive_index": 1.0 if immersion == "air" else 1.515,
-                    "turret_position": int(turret),
-                    "pixel_size_um": float(pixel),
-                    "safe_z_min_um": float(safe_min),
-                    "safe_z_max_um": float(safe_max),
+                    "immersion_refractive_index": index,
+                    "turret_position": number("turret", int),
+                    "pixel_size_um": number("pixel"),
+                    "safe_z_min_um": number("safe_min"),
+                    "safe_z_max_um": number("safe_max"),
                 }
             )
         return result
