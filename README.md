@@ -242,7 +242,9 @@ reported by Micro-Manager; the wizard deliberately requires an operator to
 enter and confirm stage travel, objective clearance and per-objective safe-Z
 limits. The resulting `nilssontronics_profile.json` remains separate from the
 `.cfg` and can be selected for the next launch. If that saved profile cannot
-connect, the app reports the error and falls back to the bundled simulator.
+connect, the app names the failed profile and offers **Retry**, **Use simulator
+this time** (the profile stays selected for the next launch) or **Use simulator
+from now on**.
 
 Set `"backend": "mmcore"` (or pass `--backend mmcore`) and fill the
 `hardware` section of the configuration:

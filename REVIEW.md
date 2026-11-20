@@ -161,7 +161,7 @@ Windows, so the macOS `F_FULLFSYNC`-per-plane cost is deliberately not listed.
   Optionally restore the NA-based automatic step in the Qt view (see E5).
   *Test:* uniform spacing for surface stacks; XML Z length = (n−1)·actual spacing.
 
-- [ ] **E4. One failed launch forgets the microscope profile.**
+- [x] **E4. One failed launch forgets the microscope profile.**
   When the saved profile fails at startup (e.g. microscope switched off),
   `qt/window.py:2134` removes `startup_profile`, so every later launch silently
   opens the simulator.

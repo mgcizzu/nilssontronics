@@ -2129,6 +2129,72 @@ class ScanWindow(QMainWindow):
         event.ignore()
 
 
+STARTUP_RETRY = "retry"
+STARTUP_SIMULATOR_ONCE = "simulator_once"
+STARTUP_SIMULATOR_ALWAYS = "simulator_always"
+
+
+def ask_startup_fallback(config_path: str, error: Exception) -> str:
+    """Ask what to do when the saved microscope profile cannot start."""
+
+    box = QMessageBox(
+        QMessageBox.Icon.Warning,
+        "Microscope profile could not start",
+        f"Profile: {config_path}\n\n{error}\n\n"
+        "Check that the microscope is switched on and connected, then retry. "
+        "Otherwise the application opens with the simulator; the microscope "
+        "profile stays selected for the next launch unless you choose otherwise.",
+    )
+    retry = box.addButton("Retry", QMessageBox.ButtonRole.AcceptRole)
+    once = box.addButton("Use simulator this time", QMessageBox.ButtonRole.RejectRole)
+    always = box.addButton("Use simulator from now on", QMessageBox.ButtonRole.DestructiveRole)
+    box.setDefaultButton(retry)
+    box.setEscapeButton(once)
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is retry:
+        return STARTUP_RETRY
+    if clicked is always:
+        return STARTUP_SIMULATOR_ALWAYS
+    return STARTUP_SIMULATOR_ONCE
+
+
+def open_startup_backend(
+    config_arg: str | None,
+    backend_arg: str | None,
+    settings: QSettings,
+    choose=ask_startup_fallback,
+):
+    """Load the startup profile and its backend; return ``(config, backend, path)``.
+
+    A saved profile that fails (e.g. microscope switched off) falls back to the
+    simulator *for this launch only* unless the operator chooses otherwise; it
+    is never silently forgotten. An explicit ``--config`` or the bundled
+    profile failing is fatal (raised to the caller).
+    """
+
+    config_path = config_arg or settings.value("startup_profile", str(DEFAULT_CONFIG_PATH))
+    using_saved_profile = not config_arg and Path(config_path) != DEFAULT_CONFIG_PATH
+    while True:
+        try:
+            config = load_config(config_path)
+            if backend_arg:
+                config = replace(config, hardware={**config.hardware, "backend": backend_arg})
+            return config, create_backend(config), config_path
+        except (OSError, ValueError, json.JSONDecodeError, HardwareError) as exc:
+            if not using_saved_profile:
+                raise
+            choice = choose(str(config_path), exc)
+            if choice == STARTUP_RETRY:
+                continue
+            if choice == STARTUP_SIMULATOR_ALWAYS:
+                settings.remove("startup_profile")
+                settings.sync()
+            config_path = str(DEFAULT_CONFIG_PATH)
+            config = load_config(config_path)
+            return config, create_backend(config), config_path
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Microscope Scan Console (Qt)")
     parser.add_argument("--config", help="configuration JSON")
@@ -2137,27 +2203,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     app = QApplication.instance() or QApplication([])
     settings = QSettings("nilssontronics", "scan-console")
-    config_path = args.config or settings.value("startup_profile", str(DEFAULT_CONFIG_PATH))
     try:
-        config = load_config(config_path)
-        if args.backend:
-            config = replace(config, hardware={**config.hardware, "backend": args.backend})
-        backend = create_backend(config)
+        config, backend, config_path = open_startup_backend(args.config, args.backend, settings)
     except (OSError, ValueError, json.JSONDecodeError, HardwareError) as exc:
-        using_saved_profile = not args.config and Path(config_path) != DEFAULT_CONFIG_PATH
-        if not using_saved_profile:
-            QMessageBox.critical(None, "Startup error", str(exc))
-            raise SystemExit(1) from exc
-        QMessageBox.warning(
-            None,
-            "Microscope profile could not start",
-            f"{exc}\n\nThe application will open with the simulator instead.",
-        )
-        settings.remove("startup_profile")
-        settings.sync()
-        config_path = str(DEFAULT_CONFIG_PATH)
-        config = load_config(config_path)
-        backend = create_backend(config)
+        QMessageBox.critical(None, "Startup error", str(exc))
+        raise SystemExit(1) from exc
     window = ScanWindow(
         config,
         backend,

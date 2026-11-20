@@ -438,3 +438,84 @@ def test_surface_span_label_shows_when_the_grid_extends_the_span(window):
     window.z_below.setValue(4)
     window.z_above.setValue(4)
     assert "planes" not in window.surface_span_label.text()
+
+
+def _startup_settings(tmp_path, profile):
+    from qtpy.QtCore import QSettings
+
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("startup_profile", str(profile))
+    return settings
+
+
+def _hardware_profile(tmp_path):
+    import json
+
+    from microscope_ui.config import DEFAULT_CONFIG_PATH
+
+    data = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    data["hardware"] = {**data.get("hardware", {}), "backend": "mmcore"}
+    profile = tmp_path / "scope.json"
+    profile.write_text(json.dumps(data), encoding="utf-8")
+    return profile
+
+
+def test_failed_startup_keeps_the_saved_profile(tmp_path):
+    from microscope_ui.backend import HardwareError
+    from microscope_ui.config import DEFAULT_CONFIG_PATH
+    from microscope_ui.qt import window as window_module
+
+    profile = _hardware_profile(tmp_path)
+    settings = _startup_settings(tmp_path, profile)
+    real_create = window_module.create_backend
+    asked = []
+
+    def create(config):
+        if config.hardware.get("backend") == "mmcore":
+            raise HardwareError("microscope switched off")
+        return real_create(config)
+
+    def choose(path, error):
+        asked.append((path, str(error)))
+        return window_module.STARTUP_SIMULATOR_ONCE
+
+    with mock.patch.object(window_module, "create_backend", side_effect=create):
+        _config, backend, path = window_module.open_startup_backend(None, None, settings, choose)
+    assert backend.simulated and path == str(DEFAULT_CONFIG_PATH)
+    assert asked == [(str(profile), "microscope switched off")]  # names the failed profile
+    assert settings.value("startup_profile") == str(profile)
+
+
+def test_startup_retry_and_simulator_from_now_on(tmp_path):
+    from microscope_ui.backend import HardwareError
+    from microscope_ui.qt import window as window_module
+
+    profile = _hardware_profile(tmp_path)
+    settings = _startup_settings(tmp_path, profile)
+    hardware = mock.Mock(simulated=False)
+    attempts = []
+
+    def create(_config):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise HardwareError("not yet")
+        return hardware
+
+    with mock.patch.object(window_module, "create_backend", side_effect=create):
+        _c, backend, path = window_module.open_startup_backend(
+            None, None, settings, lambda *_a: window_module.STARTUP_RETRY
+        )
+    assert backend is hardware and path == str(profile) and len(attempts) == 2
+
+    real_create = window_module.create_backend
+
+    def broken(config):
+        if config.hardware.get("backend") == "mmcore":
+            raise HardwareError("off")
+        return real_create(config)
+
+    with mock.patch.object(window_module, "create_backend", side_effect=broken):
+        window_module.open_startup_backend(
+            None, None, settings, lambda *_a: window_module.STARTUP_SIMULATOR_ALWAYS
+        )
+    assert settings.value("startup_profile") is None
