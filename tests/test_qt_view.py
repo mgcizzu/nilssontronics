@@ -427,3 +427,14 @@ def test_import_wizard_refuses_while_the_app_drives_hardware(window, monkeypatch
     wizard.assert_not_called()
     assert window.messages and window.messages[-1][0] == "warn"
     assert "simulator" in window.messages[-1][2]
+
+
+def test_surface_span_label_shows_when_the_grid_extends_the_span(window):
+    window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("surface_stack"))
+    window.z_below.setValue(5)
+    window.z_above.setValue(3)
+    window.z_step.setValue(2)
+    assert "-6 … +4 µm (6 planes)" in window.surface_span_label.text()
+    window.z_below.setValue(4)
+    window.z_above.setValue(4)
+    assert "planes" not in window.surface_span_label.text()

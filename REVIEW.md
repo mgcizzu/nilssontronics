@@ -147,7 +147,7 @@ Windows, so the macOS `F_FULLFSYNC`-per-plane cost is deliberately not listed.
   (or add an editable column).
   *Test:* `selected_objectives()` rejects empty cells; water → 1.333.
 
-- [ ] **E3. Z spacing in the XML can be wrong; surface stacks are unevenly spaced.**
+- [x] **E3. Z spacing in the XML can be wrong; surface stacks are unevenly spaced.**
   Both stack modes shrink the spacing to fit the range, but the region XML records
   the step typed by the user (`controller.py:567`, `z_step_um=record.z.step_um`).
   Example: absolute stack 0→10 µm, step 3 → planes at 0, 2.5, 5, 7.5, 10, but the

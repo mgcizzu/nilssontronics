@@ -122,6 +122,20 @@ class CycleTests(unittest.TestCase):
         _header, planes = read_tile(self.controller.experiment.cycle_folder(1), 0)
         self.assertEqual(len(planes), 2 * 5)
 
+    def test_region_xml_records_the_actual_z_spacing(self) -> None:
+        import xml.etree.ElementTree as ET
+
+        # 0→10 µm with a typed step of 3 µm is acquired at 2.5 µm spacing.
+        z = ZSettings("stack", 0, 10, 3, begin_captured=True, end_captured=True)
+        record, status = self.run_cycle(self.plan(z=z, focus_points=()))
+        self.assertEqual(status.state, "complete")
+        xml = self.controller.experiment.cycle_folder(record.number) / "Metadata" / "R01.xml"
+        node = ET.parse(xml).getroot().find(
+            ".//ImageDescription/Dimensions/DimensionDescription[@DimID='3']"
+        )
+        self.assertEqual(node.attrib["NumberOfElements"], "5")
+        self.assertAlmostEqual(float(node.attrib["Length"]), 4 * 2.5)
+
     def test_surface_stack_is_centred_on_each_tiles_focus_surface(self) -> None:
         z = ZSettings("surface_stack", -1, 1, 1)
         record, status = self.run_cycle(self.plan(z=z))

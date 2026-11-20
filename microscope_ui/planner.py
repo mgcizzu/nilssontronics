@@ -281,8 +281,9 @@ def validate_plan(
                 surface = None
             low, high = surface.z_range(tile.xy for tile in tiles) if surface and tiles else (0.0, 0.0)
             if plan.z.mode == "surface_stack":
-                low += plan.z.bottom_um
-                high += plan.z.top_um
+                offsets = plan.z.stack_positions() or (plan.z.bottom_um, plan.z.top_um)
+                low += offsets[0]  # the uniform grid may reach past bottom/top
+                high += offsets[-1]
             if surface is not None and tiles and (low < safe_min or high > safe_max):
                 subject = (
                     "The surface-relative stack"

@@ -490,6 +490,7 @@ class ScanWindow(QMainWindow):
         self.z_surface_stack_widgets = (self.z_below, self.z_above)
         self.z_below.valueChanged.connect(self._surface_offsets_changed)
         self.z_above.valueChanged.connect(self._surface_offsets_changed)
+        self.z_step.valueChanged.connect(self._update_surface_span_label)
         self._update_surface_span_label()
         acquisition_layout.addWidget(z_group)
 
@@ -1339,13 +1340,23 @@ class ScanWindow(QMainWindow):
             return
         span = self.z_below.value() + self.z_above.value()
         if self._surface_stack_start_um is not None and self._surface_stack_end_um is not None:
-            self.surface_span_label.setText(
-                f"Captured span {span:g} µm → centred ±{span / 2:g} µm on the surface"
-            )
+            text = f"Captured span {span:g} µm → centred ±{span / 2:g} µm on the surface"
         else:
-            self.surface_span_label.setText(
-                f"Span {span:g} µm → centred on each tile's surface Z"
+            text = f"Span {span:g} µm → centred on each tile's surface Z"
+        offsets = ZSettings(
+            mode="surface_stack",
+            bottom_um=-self.z_below.value(),
+            top_um=self.z_above.value(),
+            step_um=self.z_step.value(),
+        ).stack_positions()
+        if offsets and (
+            offsets[0] < -self.z_below.value() - 1e-9 or offsets[-1] > self.z_above.value() + 1e-9
+        ):
+            text += (
+                f"\nPlanes every {self.z_step.value():g} µm through the surface: "
+                f"{offsets[0]:+g} … {offsets[-1]:+g} µm ({len(offsets)} planes)"
             )
+        self.surface_span_label.setText(text)
 
     def _reset_z_stack_capture(self) -> None:
         self.z_begin_captured = self.z_end_captured = False

@@ -297,10 +297,22 @@ class ZSettings:
         if self.mode == "surface_stack":
             if self.bottom_um > 0 or self.top_um < 0:
                 return 0
-            below = endpoint_inclusive_plane_count(abs(self.bottom_um), self.step_um)
-            above = endpoint_inclusive_plane_count(abs(self.top_um), self.step_um)
-            return below + above - 1  # the surface plane belongs to both halves
+            first, last = self._surface_step_range()
+            return last - first + 1
         return endpoint_inclusive_plane_count(self.top_um - self.bottom_um, self.step_um)
+
+    def _surface_step_range(self) -> tuple[int, int]:
+        """Multiples ``k`` of the step (``k·step`` offsets) covering bottom…top.
+
+        The grid is uniform and always contains the surface (k = 0); it may reach
+        slightly past the requested span when that is not a multiple of the step.
+        """
+
+        below = self.bottom_um / self.step_um
+        above = self.top_um / self.step_um
+        first = round(below) if abs(below - round(below)) < 1e-9 else math.floor(below)
+        last = round(above) if abs(above - round(above)) < 1e-9 else math.ceil(above)
+        return int(first), int(last)
 
     def stack_positions(self) -> tuple[float, ...]:
         """Absolute positions, or surface-relative offsets, from bottom to top."""
@@ -309,17 +321,25 @@ class ZSettings:
         if self.mode not in ("stack", "surface_stack") or count == 0:
             return ()
         if self.mode == "surface_stack":
-            below_count = endpoint_inclusive_plane_count(abs(self.bottom_um), self.step_um)
-            above_count = endpoint_inclusive_plane_count(abs(self.top_um), self.step_um)
-            below_spacing = abs(self.bottom_um) / (below_count - 1) if below_count > 1 else 0.0
-            above_spacing = abs(self.top_um) / (above_count - 1) if above_count > 1 else 0.0
-            below = tuple(self.bottom_um + index * below_spacing for index in range(below_count))
-            above = tuple(index * above_spacing for index in range(1, above_count))
-            return below + above
+            first, last = self._surface_step_range()
+            return tuple(k * self.step_um for k in range(first, last + 1))
         if count == 1:
             return (self.bottom_um,)
         spacing = (self.top_um - self.bottom_um) / (count - 1)
         return tuple(self.bottom_um + index * spacing for index in range(count))
+
+    @property
+    def actual_step_um(self) -> float | None:
+        """Spacing between the planes really acquired (None for a single plane).
+
+        An absolute stack shrinks the typed step so that Begin and End are both
+        hit; metadata must record this value, not ``step_um``.
+        """
+
+        positions = self.stack_positions()
+        if len(positions) < 2:
+            return None
+        return (positions[-1] - positions[0]) / (len(positions) - 1)
 
 
 @dataclass(frozen=True)

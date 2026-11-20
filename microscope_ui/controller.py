@@ -564,11 +564,7 @@ class ScanController:
                 camera_width_px=self.config.oriented_camera_size_px[0],
                 camera_height_px=self.config.oriented_camera_size_px[1],
                 z_planes=z_planes,
-                z_step_um=(
-                    record.z.step_um
-                    if record.z.mode in ("stack", "surface_stack")
-                    else None
-                ),
+                z_step_um=record.z.actual_step_um,
                 project=experiment.project,
                 sample=experiment.sample,
                 distortion_correction=corrector.correction.fingerprint if corrector else None,

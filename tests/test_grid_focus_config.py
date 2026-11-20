@@ -180,9 +180,28 @@ class ZPlaneTests(unittest.TestCase):
         )
         offsets = asymmetric.stack_positions()
         self.assertIn(0.0, offsets)
-        self.assertAlmostEqual(offsets[0], -2.1)
-        self.assertAlmostEqual(offsets[-1], 3.2)
-        self.assertLessEqual(max(b - a for a, b in zip(offsets, offsets[1:])), 1.0)
+        # Uniform k·step grid through the surface, reaching just past the request.
+        self.assertEqual(offsets, (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0))
+
+    def test_surface_stack_spacing_is_uniform_on_both_sides(self) -> None:
+        z = ZSettings(mode="surface_stack", bottom_um=-5.0, top_um=3.0, step_um=2.0)
+        self.assertEqual(z.stack_positions(), (-6.0, -4.0, -2.0, 0.0, 2.0, 4.0))
+        self.assertEqual(z.plane_count, 6)
+        self.assertEqual(z.actual_step_um, 2.0)
+        # Exact multiples are not extended by floating-point noise (1.1 / 0.1 > 11).
+        fine = ZSettings(mode="surface_stack", bottom_um=-0.3, top_um=1.1, step_um=0.1)
+        offsets = fine.stack_positions()
+        self.assertEqual(len(offsets), 15)
+        self.assertAlmostEqual(offsets[0], -0.3)
+        self.assertAlmostEqual(offsets[-1], 1.1)
+        gaps = [b - a for a, b in zip(offsets, offsets[1:])]
+        self.assertAlmostEqual(max(gaps), min(gaps))
+
+    def test_actual_step_reports_the_shrunk_absolute_spacing(self) -> None:
+        z = ZSettings("stack", 0.0, 10.0, 3.0, begin_captured=True, end_captured=True)
+        self.assertEqual(z.stack_positions(), (0.0, 2.5, 5.0, 7.5, 10.0))
+        self.assertEqual(z.actual_step_um, 2.5)
+        self.assertIsNone(ZSettings("focus_map").actual_step_um)
 
 
 class FocusSurfaceTests(unittest.TestCase):
@@ -252,6 +271,24 @@ class FocusSurfaceTests(unittest.TestCase):
             z=replace(plan.z, top_um=config.objective("20x_air").safe_z_max_um + 1),
         )
         problems = validate_plan(config, unsafe, check_disk=False)
+        self.assertTrue(any("surface-relative stack" in problem for problem in problems))
+
+    def test_surface_stack_safety_check_covers_the_extended_grid(self) -> None:
+        config = load_config()
+        safe_max = config.objective("20x_air").safe_z_max_um
+        plan = AcquisitionPlan(
+            "P", "S", Path("."), "20x_air", (ChannelSetting("dapi", 40, 20),),
+            (ScanRegion(-1000, -1000, 2000, 2000),),
+            # top is inside the safe range, but the 7 µm grid reaches past it.
+            z=ZSettings("surface_stack", 0, safe_max - 0.5, 7),
+            focus_points=(
+                FocusPoint(-900, -900, 0),
+                FocusPoint(900, -900, 0),
+                FocusPoint(0, 900, 0),
+            ),
+        )
+        self.assertGreater(plan.z.stack_positions()[-1], safe_max)
+        problems = validate_plan(config, plan, check_disk=False)
         self.assertTrue(any("surface-relative stack" in problem for problem in problems))
 
 
