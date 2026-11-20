@@ -519,3 +519,20 @@ def test_startup_retry_and_simulator_from_now_on(tmp_path):
             None, None, settings, lambda *_a: window_module.STARTUP_SIMULATOR_ALWAYS
         )
     assert settings.value("startup_profile") is None
+
+
+def test_nyquist_button_sets_the_na_based_z_step(window):
+    from microscope_ui.optics import recommended_z_step_um
+
+    window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("stack"))
+    assert not window.z_step_row.isHidden()  # Z group may sit on a hidden tab
+    objective = window.config_data.objective(window.objective_box.currentData())
+    selected = {item.channel_id for item in window.channel_table.settings()}
+    channels = tuple(c for c in window.config_data.channels if c.id in selected)
+    expected, wavelength = recommended_z_step_um(objective, channels)
+    window.z_step.setValue(7)
+    window.z_nyquist_button.click()
+    assert window.z_step.value() == pytest.approx(expected, abs=0.006)
+    assert f"{wavelength:g} nm" in window.z_nyquist_button.toolTip()
+    window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("single"))
+    assert window.z_step_row.isHidden()

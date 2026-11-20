@@ -68,6 +68,7 @@ from ..models import (
     ZSettings,
 )
 from ..mosaic import DiskBackedMosaic
+from ..optics import recommended_z_step_um
 from ..planner import continuous_spiral_preview_positions, spiral_preview_positions
 from ..roi_io import load_roi_set, save_roi_set
 from .device_worker import DeviceWorker
@@ -484,7 +485,18 @@ class ScanWindow(QMainWindow):
         self.surface_span_label.setProperty("secondary", True)
         z_form.addRow(self.surface_span_label)
         self.z_step_label = QLabel("Step")
-        z_form.addRow(self.z_step_label, self.z_step)
+        self.z_nyquist_button = QPushButton("Nyquist")
+        self.z_nyquist_button.setToolTip(
+            "Set the step to the widefield axial Nyquist interval n·λ/NA² for the "
+            "selected objective and the shortest selected emission wavelength"
+        )
+        self.z_nyquist_button.clicked.connect(self.apply_nyquist_z_step)
+        self.z_step_row = QWidget()
+        step_row = QHBoxLayout(self.z_step_row)
+        step_row.setContentsMargins(0, 0, 0, 0)
+        step_row.addWidget(self.z_step, 1)
+        step_row.addWidget(self.z_nyquist_button)
+        z_form.addRow(self.z_step_label, self.z_step_row)
         self.z_stack_widgets = (self.z_bottom, self.z_top)
         self.z_capture_buttons = (self.z_begin_button, self.z_end_button)
         self.z_surface_stack_widgets = (self.z_below, self.z_above)
@@ -1250,11 +1262,29 @@ class ScanWindow(QMainWindow):
             self.z_begin_button.setToolTip("Capture the absolute stack begin at the current Z")
             self.z_end_button.setToolTip("Capture the absolute stack end at the current Z")
         self.surface_span_label.setVisible(surface_stack)
-        self.z_step.setVisible(uses_stack_step)
+        self.z_step_row.setVisible(uses_stack_step)
         self.z_step_label.setVisible(uses_stack_step)
         self.focus_method_box.setEnabled(mode in ("focus_map", "surface_stack"))
         self._update_z_stack_view()
         self._refresh()
+
+    def apply_nyquist_z_step(self) -> None:
+        """Fill the Z step with the NA-based axial Nyquist interval (``n·λ/NA²``)."""
+
+        objective = self.config_data.objective(self.objective_box.currentData())
+        selected = {item.channel_id for item in self.channel_table.settings()}
+        channels = tuple(c for c in self.config_data.channels if c.id in selected)
+        try:
+            step_um, wavelength_nm = recommended_z_step_um(objective, channels)
+        except ValueError as exc:
+            self.warn("Nyquist step", str(exc))
+            return
+        self.z_step.setValue(step_um)
+        self.z_nyquist_button.setToolTip(
+            f"Last set to {step_um:.2f} µm = n·λ/NA² for {objective.name} "
+            f"(NA {objective.numerical_aperture:g}, n {objective.immersion_refractive_index:g}, "
+            f"λ {wavelength_nm:g} nm)"
+        )
 
     def _update_z_stack_view(self, *_args) -> None:
         if not hasattr(self, "z_wheel"):

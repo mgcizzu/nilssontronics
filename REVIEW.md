@@ -169,7 +169,7 @@ Windows, so the macOS `F_FULLFSYNC`-per-plane cost is deliberately not listed.
   show which profile failed plus a "Retry" / "Use simulator from now on" choice.
   *Test:* failed startup keeps `startup_profile`.
 
-- [ ] **E5. README describes the NA-based Z step, but the Qt view doesn't use it.**
+- [x] **E5. README describes the NA-based Z step, but the Qt view doesn't use it.**
   `README.md:60` says the plane count comes from the axial Nyquist interval
   `n·λ/NA²`; only the Tk view computes it — Qt uses the typed step.
   *Fix:* either add a "Nyquist" button/default for the Qt step box

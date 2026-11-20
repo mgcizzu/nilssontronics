@@ -56,8 +56,11 @@ A new cycle cannot start while an earlier one is unfinished.
 
 - **Single** – the Z at the moment the cycle starts (checked against the
   objective's safe range).
-- **Z-stack** – absolute Begin/End captured from live Z; plane count from the
-  widefield axial Nyquist interval `n·λ/NA²` (shortest enabled emission).
+- **Z-stack** – absolute Begin/End captured from live Z. Planes are spaced at
+  most the chosen step, shrunk so Begin and End are both acquired (the XML
+  records the actual spacing). In the Qt view **Nyquist** fills the step with
+  the widefield axial Nyquist interval `n·λ/NA²` (selected objective, shortest
+  selected emission); the Tk view always uses that interval.
 - **Surface map** – one plane per tile at the Z of a focus surface:
   - *Triangulated* (default): piecewise-linear over a Delaunay triangulation,
     so local warping of large sections is followed; outside the points' hull
