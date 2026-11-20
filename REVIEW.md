@@ -111,3 +111,83 @@ existing ones (`tests/test_cycles.py`, `tests/test_qt_*.py`) and tick the box.
   **Implemented:** approved by Marco. The `surface_stack` mode captures a stack
   below/above each tile's interpolated surface Z, always includes the surface
   plane, and preflights the complete per-tile range against safe Z limits.
+
+## E. Second review — 2026-11-20 (`7d3c52d`..`75a193b`)
+
+Reviewed the fixes for A–D (all confirmed, each with a regression test) and the
+new commits: surface-relative Z-stacks, compact UI, Micro-Manager profile wizard.
+185 of 186 tests pass in the review environment (see E7). Acquisition runs on
+Windows, so the macOS `F_FULLFSYNC`-per-plane cost is deliberately not listed.
+
+- [ ] **E1. The profile wizard is not read-only and can fight the running app.**
+  `inspect_mm_config` (`microscope_ui/mm_profile.py:33`) calls
+  `core.loadSystemConfiguration` (line 60), which initializes every device and
+  applies the `.cfg` System/Startup presets — depending on the adapters this can
+  home the XY stage, move the turret/filter wheels or open shutters. If the app is
+  already running on the MMCore backend, the wizard creates a *second* core on the
+  same serial/USB ports: loading fails or conflicts, and `unloadAllDevices()` in
+  `finally` can send shutdown commands to devices the app still uses. It also runs
+  on the GUI thread (`SourcePage.validatePage`, `qt/profile_wizard.py:78`), so the
+  window freezes while drivers load.
+  *Fix:* refuse to start the wizard while `backend.simulated` is False (tell the
+  user to switch to the simulator profile and relaunch); run inspection on a
+  worker thread with a progress indicator; replace "The wizard only reads the
+  configuration" with an explicit warning that devices are initialized as in
+  Micro-Manager (stage may home, turret/filters may move) and ask for confirmation.
+  *Test:* wizard refuses with a hardware backend; inspection runs off the GUI thread.
+
+- [ ] **E2. Wizard pre-fills plausible safety values.**
+  Every objective row starts as 10×, NA 0.3, 1.0 µm/px, safe Z −4000/3500
+  (`qt/profile_wizard.py:234`). These pass validation, so ticking the single
+  confirmation box saves wrong pixel sizes and safe-Z ranges.
+  *Fix:* leave magnification, NA, pixel size and safe-Z cells empty and refuse to
+  continue until each row is filled (turret index and name can stay pre-filled).
+  Also `immersion_refractive_index` is 1.515 for every non-air medium (line 281):
+  use oil 1.515, water 1.333, silicone 1.406, and require a value for "other"
+  (or add an editable column).
+  *Test:* `selected_objectives()` rejects empty cells; water → 1.333.
+
+- [ ] **E3. Z spacing in the XML can be wrong; surface stacks are unevenly spaced.**
+  Both stack modes shrink the spacing to fit the range, but the region XML records
+  the step typed by the user (`controller.py:567`, `z_step_um=record.z.step_um`).
+  Example: absolute stack 0→10 µm, step 3 → planes at 0, 2.5, 5, 7.5, 10, but the
+  XML says step 3 and length 12 µm. Surface stacks compute the halves separately
+  (`ZSettings.stack_positions`, `models.py:305`): −5/+3 µm with step 2 gives
+  1.67 µm spacing below the surface and 1.5 µm above.
+  *Fix:* for `surface_stack`, use offsets `k·step` for
+  `k = floor(bottom/step) … ceil(top/step)` (uniform, always includes 0; may extend
+  slightly past the requested span — show that in the summary). For both modes,
+  pass the *actual* spacing (from the computed positions) to `CycleMetadata`.
+  Optionally restore the NA-based automatic step in the Qt view (see E5).
+  *Test:* uniform spacing for surface stacks; XML Z length = (n−1)·actual spacing.
+
+- [ ] **E4. One failed launch forgets the microscope profile.**
+  When the saved profile fails at startup (e.g. microscope switched off),
+  `qt/window.py:2134` removes `startup_profile`, so every later launch silently
+  opens the simulator.
+  *Fix:* fall back to the simulator for this launch only, keep the setting, and
+  show which profile failed plus a "Retry" / "Use simulator from now on" choice.
+  *Test:* failed startup keeps `startup_profile`.
+
+- [ ] **E5. README describes the NA-based Z step, but the Qt view doesn't use it.**
+  `README.md:60` says the plane count comes from the axial Nyquist interval
+  `n·λ/NA²`; only the Tk view computes it — Qt uses the typed step.
+  *Fix:* either add a "Nyquist" button/default for the Qt step box
+  (`optics.recommended_z_step_um`) or update the README.
+
+- [ ] **E6. Surface stack capture always centres the span on the surface.**
+  `_apply_surface_stack_capture` (`qt/window.py:1309`) keeps only the captured
+  span and centres it (±span/2). If focus points were taken at the top or bottom
+  of the tissue, half the stack is wasted.
+  *Fix:* keep the captured asymmetry: when Begin/End are captured at a position,
+  compute below/above relative to the surface Z *at that XY*. Keep the symmetric
+  option as a choice if wanted (decision for Marco).
+
+- [ ] **E7. Clipped button label at small window sizes.**
+  `test_compact_button_labels_fit_at_small_window_size` (`tests/test_qt_view.py:278`)
+  fails on Linux fonts: "Align selected F → stage" is 186 px wide but needs 199 px
+  at 1024×720. Passes alone/on macOS, but Windows with 125–150 % display scaling
+  is likely to clip too.
+  *Fix:* shorter label ("Align F → stage", full text as tooltip) or let the row
+  wrap; make the test independent of the platform font (check `sizeHint()`
+  against the laid-out width rather than a fixed font).
