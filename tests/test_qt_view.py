@@ -17,6 +17,7 @@ from qtpy.QtWidgets import QScrollArea, QTabWidget  # noqa: E402
 
 from microscope_ui.backend import SimulatedMicroscope, StagePosition  # noqa: E402
 from microscope_ui.config import load_config  # noqa: E402
+from microscope_ui.focus import FocusSurface  # noqa: E402
 from microscope_ui.models import FocusPoint, ScanRegion  # noqa: E402
 from microscope_ui.mosaic import read_tile  # noqa: E402
 from microscope_ui.qt.widgets import ChannelTable  # noqa: E402
@@ -240,7 +241,7 @@ def test_surface_stack_builds_offsets_around_focus_map(window):
     assert window.z_wheel.plane_count == 6
 
 
-def test_surface_stack_capture_keeps_span_and_centres_it(window):
+def test_surface_stack_capture_keeps_asymmetry_relative_to_the_surface(window):
     window.region_list.set_items([ScanRegion(-1000, -1000, 2000, 2000)])
     window.focus_list.set_items(
         [
@@ -250,15 +251,19 @@ def test_surface_stack_capture_keeps_span_and_centres_it(window):
         ]
     )
     window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("surface_stack"))
-    positions = iter((StagePosition(0, 0, 8), StagePosition(0, 0, 14)))
+    surface = FocusSurface(window.focus_list.items, window.focus_method_box.currentText())
+    # Start captured 1 µm below the surface at one XY, end 5 µm above it elsewhere.
+    start = StagePosition(-500, -500, surface.z_at(-500, -500) - 1)
+    end = StagePosition(500, 500, surface.z_at(500, 500) + 5)
+    positions = iter((start, end))
     window.with_fresh_position = lambda callback, on_error=None: callback(next(positions))
     window._capture_z_begin()
     window._capture_z_end()
-    assert window.z_below.value() == pytest.approx(3)
-    assert window.z_above.value() == pytest.approx(3)
-    assert "Captured span 6" in window.surface_span_label.text()
+    assert window.z_below.value() == pytest.approx(1)
+    assert window.z_above.value() == pytest.approx(5)
+    assert "Captured −1 / +5" in window.surface_span_label.text()
     plan = window.build_plan()
-    assert (plan.z.bottom_um, plan.z.top_um, plan.z.plane_count) == (-3, 3, 7)
+    assert (plan.z.bottom_um, plan.z.top_um, plan.z.plane_count) == (-1, 5, 7)
     z_by_tile = window.controller.z_positions(
         plan.z,
         plan.focus_points,
@@ -267,13 +272,34 @@ def test_surface_stack_capture_keeps_span_and_centres_it(window):
         None,
     )
     for values in z_by_tile.values():
-        assert values[0] == pytest.approx(values[3] - 3)
-        assert values[-1] == pytest.approx(values[3] + 3)
+        assert values[0] == pytest.approx(values[1] - 1)
+        assert values[-1] == pytest.approx(values[1] + 5)
     window._reset_z_stack_capture()
-    assert (window.z_below.value(), window.z_above.value()) == pytest.approx((3, 3))
-    assert "Span 6" in window.surface_span_label.text()
+    assert (window.z_below.value(), window.z_above.value()) == pytest.approx((1, 5))
     assert "Captured" not in window.surface_span_label.text()
 
+
+def test_surface_stack_capture_on_one_side_still_includes_the_surface(window):
+    window.focus_list.set_items(
+        [FocusPoint(-1000, -1000, 10), FocusPoint(1000, -1000, 10), FocusPoint(0, 1000, 10)]
+    )
+    window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("surface_stack"))
+    positions = iter((StagePosition(0, 0, 12), StagePosition(0, 0, 16)))
+    window.with_fresh_position = lambda callback, on_error=None: callback(next(positions))
+    window._capture_z_begin()
+    window._capture_z_end()
+    assert (window.z_below.value(), window.z_above.value()) == pytest.approx((0, 6))
+
+
+def test_surface_stack_capture_without_focus_surface_is_centred(window):
+    window.focus_list.set_items([])
+    window.z_mode_box.setCurrentIndex(window.z_mode_box.findData("surface_stack"))
+    positions = iter((StagePosition(0, 0, 8), StagePosition(0, 0, 14)))
+    window.with_fresh_position = lambda callback, on_error=None: callback(next(positions))
+    window._capture_z_begin()
+    window._capture_z_end()
+    assert (window.z_below.value(), window.z_above.value()) == pytest.approx((3, 3))
+    assert "no focus surface" in window.surface_span_label.text()
 
 def test_compact_button_labels_fit_at_small_window_size(qtbot, window):
     window.resize(1024, 720)

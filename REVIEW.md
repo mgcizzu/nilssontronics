@@ -175,7 +175,7 @@ Windows, so the macOS `F_FULLFSYNC`-per-plane cost is deliberately not listed.
   *Fix:* either add a "Nyquist" button/default for the Qt step box
   (`optics.recommended_z_step_um`) or update the README.
 
-- [ ] **E6. Surface stack capture always centres the span on the surface.**
+- [x] **E6. Surface stack capture always centres the span on the surface.**
   `_apply_surface_stack_capture` (`qt/window.py:1309`) keeps only the captured
   span and centres it (±span/2). If focus points were taken at the top or bottom
   of the tissue, half the stack is wasted.

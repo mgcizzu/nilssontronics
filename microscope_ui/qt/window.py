@@ -53,7 +53,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from ..backend import HardwareError
+from ..backend import HardwareError, StagePosition
 from ..backend_mmcore import create_backend
 from ..config import DEFAULT_CONFIG_PATH, load_config
 from ..controller import ControllerError, ScanController
@@ -138,8 +138,10 @@ class ScanWindow(QMainWindow):
         self.device = DeviceWorker(self.backend, self)
         self.z_begin_captured = False
         self.z_end_captured = False
-        self._surface_stack_start_um: float | None = None
-        self._surface_stack_end_um: float | None = None
+        # Live positions captured with Set start / Set end (surface-stack mode).
+        self._surface_stack_start: StagePosition | None = None
+        self._surface_stack_end: StagePosition | None = None
+        self._surface_capture_note = ""
         self._setting_surface_span = False
         self._last_mosaic_render = 0.0
         self._loading = False
@@ -1256,7 +1258,8 @@ class ScanWindow(QMainWindow):
         if surface_stack:
             self.z_begin_button.setToolTip("Capture one edge of the desired stack span")
             self.z_end_button.setToolTip(
-                "Capture the other edge; the span is centred on every tile's surface Z"
+                "Capture the other edge; both are measured from the focus surface at "
+                "the captured XY and applied to every tile's surface Z"
             )
         else:
             self.z_begin_button.setToolTip("Capture the absolute stack begin at the current Z")
@@ -1321,7 +1324,7 @@ class ScanWindow(QMainWindow):
     def _capture_z_begin(self) -> None:
         def capture(p) -> None:
             if self.z_mode_box.currentData() == "surface_stack":
-                self._surface_stack_start_um = p.z_um
+                self._surface_stack_start = p
                 self._apply_surface_stack_capture()
             else:
                 self.z_bottom.setValue(p.z_um)
@@ -1333,7 +1336,7 @@ class ScanWindow(QMainWindow):
     def _capture_z_end(self) -> None:
         def capture(p) -> None:
             if self.z_mode_box.currentData() == "surface_stack":
-                self._surface_stack_end_um = p.z_um
+                self._surface_stack_end = p
                 self._apply_surface_stack_capture()
             else:
                 self.z_top.setValue(p.z_um)
@@ -1343,16 +1346,32 @@ class ScanWindow(QMainWindow):
         self.with_fresh_position(capture)
 
     def _apply_surface_stack_capture(self) -> None:
-        """Keep the captured span and centre it on each tile's focus-surface Z."""
+        """Turn the captured start/end into below/above offsets from the surface.
 
-        if self._surface_stack_start_um is None or self._surface_stack_end_um is None:
+        Each capture is measured against the focus-surface Z *at the XY where it
+        was taken*, so a stack captured at the top or bottom of the tissue keeps
+        its asymmetry. Without a usable focus surface the span is centred.
+        """
+
+        start, end = self._surface_stack_start, self._surface_stack_end
+        if start is None or end is None:
             self._update_surface_span_label()
             return
-        half_span = abs(self._surface_stack_end_um - self._surface_stack_start_um) / 2
+        try:
+            surface = FocusSurface(self.focus_list.items, self.focus_method_box.currentText())
+            offsets = (
+                start.z_um - surface.z_at(start.x_um, start.y_um),
+                end.z_um - surface.z_at(end.x_um, end.y_um),
+            )
+            below, above = max(0.0, -min(offsets)), max(0.0, max(offsets))
+            self._surface_capture_note = "relative to the focus surface where captured"
+        except ValueError:  # fewer than three focus points, or degenerate ones
+            below = above = abs(end.z_um - start.z_um) / 2
+            self._surface_capture_note = "centred (no focus surface yet)"
         self._setting_surface_span = True
         try:
-            self.z_below.setValue(half_span)
-            self.z_above.setValue(half_span)
+            self.z_below.setValue(below)
+            self.z_above.setValue(above)
         finally:
             self._setting_surface_span = False
         self._update_surface_span_label()
@@ -1360,28 +1379,26 @@ class ScanWindow(QMainWindow):
 
     def _surface_offsets_changed(self, *_args) -> None:
         if not self._setting_surface_span:
-            self._surface_stack_start_um = None
-            self._surface_stack_end_um = None
+            self._surface_stack_start = None
+            self._surface_stack_end = None
             self.z_begin_captured = self.z_end_captured = False
         self._update_surface_span_label()
 
     def _update_surface_span_label(self) -> None:
         if not hasattr(self, "surface_span_label"):
             return
-        span = self.z_below.value() + self.z_above.value()
-        if self._surface_stack_start_um is not None and self._surface_stack_end_um is not None:
-            text = f"Captured span {span:g} µm → centred ±{span / 2:g} µm on the surface"
+        below, above = self.z_below.value(), self.z_above.value()
+        if self._surface_stack_start is not None and self._surface_stack_end is not None:
+            text = f"Captured −{below:g} / +{above:g} µm, {self._surface_capture_note}"
         else:
-            text = f"Span {span:g} µm → centred on each tile's surface Z"
+            text = f"−{below:g} / +{above:g} µm around each tile's surface Z"
         offsets = ZSettings(
             mode="surface_stack",
-            bottom_um=-self.z_below.value(),
-            top_um=self.z_above.value(),
+            bottom_um=-below,
+            top_um=above,
             step_um=self.z_step.value(),
         ).stack_positions()
-        if offsets and (
-            offsets[0] < -self.z_below.value() - 1e-9 or offsets[-1] > self.z_above.value() + 1e-9
-        ):
+        if offsets and (offsets[0] < -below - 1e-9 or offsets[-1] > above + 1e-9):
             text += (
                 f"\nPlanes every {self.z_step.value():g} µm through the surface: "
                 f"{offsets[0]:+g} … {offsets[-1]:+g} µm ({len(offsets)} planes)"
@@ -1390,7 +1407,7 @@ class ScanWindow(QMainWindow):
 
     def _reset_z_stack_capture(self) -> None:
         self.z_begin_captured = self.z_end_captured = False
-        self._surface_stack_start_um = self._surface_stack_end_um = None
+        self._surface_stack_start = self._surface_stack_end = None
         self._update_surface_span_label()
 
     def _add_region(self) -> None:

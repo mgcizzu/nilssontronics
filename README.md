@@ -69,13 +69,15 @@ A new cycle cannot start while an earlier one is unfinished.
 
   Every tile's surface Z is checked against the safe range before scanning.
 - **Z-stack around surface** – a stack from the chosen distance below to the
-  chosen distance above each tile's interpolated focus-surface Z. The surface
-  plane is always included, and spacing never exceeds the selected step. This
-  follows tilted or warped sections without making every tile span the full
-  specimen-wide Z range. The complete per-tile stack is checked against the
-  objective's safe Z range before acquisition. **Set start** and **Set end**
-  can capture a desired span from live Z; its size is retained and symmetrically
-  recentered on the surface Z at every tile.
+  chosen distance above each tile's interpolated focus-surface Z. Planes lie on
+  a uniform grid of the selected step through the surface plane, so the stack
+  may reach slightly past the requested distances (the view shows the actual
+  range). This follows tilted or warped sections without making every tile span
+  the full specimen-wide Z range. The complete per-tile stack is checked against
+  the objective's safe Z range before acquisition. **Set start** and **Set end**
+  capture the span from live Z: each edge is measured from the focus surface at
+  the XY where it was captured, so a stack set at the top or bottom of the
+  tissue keeps its asymmetry (without a focus surface yet, it is centred).
 
 ## Options (all optional)
 
