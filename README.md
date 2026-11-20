@@ -262,7 +262,7 @@ Set `"backend": "mmcore"` (or pass `--backend mmcore`) and fill the
 | `objective_device`, `turret_position_offset` | turret state device; MM state = `turret_position + offset` |
 | `objective_change_z_um` | clearance Z used before rotating the turret |
 | `power_properties` | per-channel adjustable power: `{"device", "property", "scale", "offset"}`; without one, power is fixed at the channel default by its MM preset |
-| `pixel_size_configs` | optional per objective: MM pixel-size preset to select |
+| `pixel_size_configs` | optional per objective: MM pixel-size preset to select; a preset that sets the turret to a different state than that objective's is refused at startup |
 | `settle_timeout_ms` | device wait timeout |
 
 `camera.orientation` (`flip_x`, `flip_y`, `transpose`) maps camera pixels to

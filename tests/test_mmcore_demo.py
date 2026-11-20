@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover
     CMMCorePlus = None
     find_micromanager = None
 
-from microscope_ui.backend import StageLimitError
+from microscope_ui.backend import HardwareError, StageLimitError
 from microscope_ui.backend_mmcore import MMCoreBackend
 from microscope_ui.config import load_config
 from microscope_ui.controller import ScanController
@@ -51,7 +51,9 @@ class MMCoreDemoTests(unittest.TestCase):
             backend="mmcore",
             mm_config_path=str(DEMO_CFG),
             mm_adapter_path=MM_PATH,
-            pixel_size_configs={"10x_air": "Res10x", "20x_air": "Res20x", "40x_air": "Res40x"},
+            # Only Res10x matches our turret mapping (10x_air → state 1); the demo's
+            # Res20x/Res40x would set the turret to states 3/0 (see the test below).
+            pixel_size_configs={"10x_air": "Res10x"},
             # The DemoCamera "Z" stage (DStage) only travels ±300 µm.
             objective_change_z_um=-250,
         )
@@ -106,6 +108,20 @@ class MMCoreDemoTests(unittest.TestCase):
         # A fresh backend reads the turret back to the same objective.
         self.assertEqual(MMCoreBackend(self.config, core=self.core).current_objective_id, "10x_air")
 
+    def test_pixel_size_preset_that_moves_the_turret_is_refused(self) -> None:
+        # In MMConfig_demo.cfg, Res20x sets Objective state 3 (40x_air in our mapping).
+        hardware = {**self.config.hardware, "pixel_size_configs": {"20x_air": "Res20x"}}
+        config = replace(self.config, hardware=hardware)
+        with self.assertRaisesRegex(HardwareError, "rotate the turret"):
+            MMCoreBackend(config, core=self.core)
+        backend = self.backend
+        backend._hw = hardware  # a profile edited after startup is still checked
+        backend.move_z(10.0)
+        before = (backend.position, int(self.core.getState("Objective")))
+        with self.assertRaisesRegex(HardwareError, "rotate the turret"):
+            backend.change_objective(config.objective("20x_air"))
+        self.assertEqual((backend.position, int(self.core.getState("Objective"))), before)
+
     def test_channels_shutter_and_snap(self) -> None:
         channel = self.config.channel("af488")
         self.backend.set_channel(channel, 25.0, channel.default_power_percent)
@@ -143,7 +159,8 @@ class MMCoreDemoTests(unittest.TestCase):
                         ChannelSetting("dapi", 10, self.config.channel("dapi").default_power_percent),
                         ChannelSetting("af488", 10, self.config.channel("af488").default_power_percent),
                     ),
-                    regions=(ScanRegion(0, 0, 1200, 800),),
+                    # 64 px frames → 20.8 µm field at 20x: a few tiles, not thousands.
+                    regions=(ScanRegion(0, 0, 50, 35),),
                     focus_points=(),
                     z=ZSettings(mode="single"),
                 )

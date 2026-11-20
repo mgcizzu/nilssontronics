@@ -58,6 +58,11 @@ class MMCoreBackend:
         self._presets: dict[str, str] = dict(preset_config)
         self._power: dict[str, dict] = dict(power_config)
         self._objective_id = self._read_objective_id()
+        pixel_configs = self._hw.get("pixel_size_configs", {})
+        if not isinstance(pixel_configs, dict):
+            raise HardwareError("hardware.pixel_size_configs must be an object")
+        for objective in config.objectives:
+            self._check_pixel_config(objective)
         missing = [channel.id for channel in config.channels if channel.id not in self._presets]
         if missing:
             raise HardwareError(
@@ -162,7 +167,49 @@ class MMCoreBackend:
         self._call("move focus", self._core.setPosition, z_um)
         self._wait(focus)
 
+    def _check_pixel_config(self, objective: Objective) -> None:
+        """Refuse a pixel-size preset that would move the turret to another objective.
+
+        ``setPixelSizeConfig`` *applies* the preset's device settings. A preset
+        that sets the objective device to a different state than the one
+        mapped to ``objective`` would silently rotate the turret after the
+        objective change was verified (and with Z about to leave clearance).
+        """
+
+        name = self._hw.get("pixel_size_configs", {}).get(objective.id)
+        if not name or not self._objective_device:
+            return
+        try:
+            settings = list(self._core.getPixelSizeConfigData(name))
+        except Exception as exc:
+            raise HardwareError(f"Pixel-size preset '{name}' for {objective.id}: {exc}") from exc
+        target = objective.turret_position + self._turret_offset
+        for device, prop, value in settings:
+            if str(device) != self._objective_device:
+                continue
+            try:
+                if str(prop) == "State":
+                    state = int(value)
+                elif str(prop) == "Label":
+                    state = int(self._core.getStateFromLabel(self._objective_device, str(value)))
+                else:
+                    continue
+            except Exception as exc:
+                raise HardwareError(
+                    f"Pixel-size preset '{name}' for {objective.id}: cannot resolve "
+                    f"{device}-{prop} '{value}': {exc}"
+                ) from exc
+            if state != target:
+                raise HardwareError(
+                    f"Pixel-size preset '{name}' sets {device} to state {state}, but "
+                    f"{objective.id} is at turret state {target} (turret_position "
+                    f"{objective.turret_position} + offset {self._turret_offset}). Selecting it "
+                    "would rotate the turret to another objective; fix "
+                    "hardware.pixel_size_configs or the turret mapping."
+                )
+
     def change_objective(self, objective: Objective) -> None:
+        self._check_pixel_config(objective)  # before any motion
         clearance = float(self._hw.get("objective_change_z_um", self._config.stage_limits.z_min_um))
         if not self._config.stage_limits.contains_z(clearance):
             raise HardwareError("hardware.objective_change_z_um is outside the stage Z limits")
