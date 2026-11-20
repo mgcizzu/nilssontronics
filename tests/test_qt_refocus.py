@@ -72,7 +72,7 @@ def test_refocus_all_walks_every_point(qtbot, window):
     assert [p.z_um for p in window.focus_list.items] == pytest.approx(new_z)
     assert [(p.x_um, p.y_um) for p in window.focus_list.items] == [(p.x_um, p.y_um) for p in POINTS]
     assert window.refocus_button.text() == "Refocus all"
-    assert window.set_z_button.text() == "Set Z"
+    assert window.set_z_button.text() == "Set Z here"
     assert window.refocus_label.isHidden() and window.overview_accept_button.isHidden()
     assert "All 3 focus points refocused" in window.overview_hint.text()
 

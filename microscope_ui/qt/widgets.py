@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import math
 from typing import Callable
 
 import numpy as np
-from qtpy.QtCore import QSignalBlocker, Qt, Signal
+from qtpy.QtCore import Qt, Signal
 from qtpy.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from qtpy.QtWidgets import (
     QAbstractItemView,
@@ -22,7 +21,6 @@ from qtpy.QtWidgets import (
     QListWidget,
     QPushButton,
     QSizePolicy,
-    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -32,31 +30,6 @@ from qtpy.QtWidgets import (
 from ..models import Channel, ChannelSetting, FocusPoint, ScanRegion
 
 EXPOSURE_MIN_MS = 0.1
-EXPOSURE_SLIDER_STEPS = 1000
-
-
-def _exposure_from_slider(position: int, maximum_ms: float) -> float:
-    """Map a slider position logarithmically onto the channel exposure range."""
-
-    fraction = max(0.0, min(1.0, position / EXPOSURE_SLIDER_STEPS))
-    return math.exp(
-        math.log(EXPOSURE_MIN_MS)
-        + fraction * (math.log(maximum_ms) - math.log(EXPOSURE_MIN_MS))
-    )
-
-
-def _slider_from_exposure(exposure_ms: float, maximum_ms: float) -> int:
-    exposure_ms = max(EXPOSURE_MIN_MS, min(maximum_ms, exposure_ms))
-    fraction = (math.log(exposure_ms) - math.log(EXPOSURE_MIN_MS)) / (
-        math.log(maximum_ms) - math.log(EXPOSURE_MIN_MS)
-    )
-    return round(fraction * EXPOSURE_SLIDER_STEPS)
-
-
-def _set_slider_without_feedback(slider: QSlider, position: int) -> None:
-    blocker = QSignalBlocker(slider)
-    slider.setValue(position)
-    del blocker
 
 
 def spin(value: float, low: float, high: float, decimals: int = 1, suffix: str = "") -> QDoubleSpinBox:
@@ -89,7 +62,6 @@ class ChannelTable(QTableWidget):
         self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self._checks: dict[str, QCheckBox] = {}
         self._exposure: dict[str, QDoubleSpinBox] = {}
-        self._exposure_sliders: dict[str, QSlider] = {}
         self._power: dict[str, QDoubleSpinBox] = {}
         for row, channel in enumerate(channels):
             check = QCheckBox(channel.name)
@@ -102,19 +74,12 @@ class ChannelTable(QTableWidget):
                 1,
                 "ms",
             )
-            exposure_slider = QSlider(Qt.Orientation.Horizontal)
-            exposure_slider.setRange(0, EXPOSURE_SLIDER_STEPS)
-            exposure_slider.setPageStep(25)
-            exposure_slider.setMinimumWidth(30)
-            exposure_slider.setValue(
-                _slider_from_exposure(channel.default_exposure_ms, channel.max_exposure_ms)
-            )
-            exposure_slider.setAccessibleName(f"{channel.name} exposure")
-            exposure_slider.setToolTip(
-                f"{channel.name} exposure, logarithmic {EXPOSURE_MIN_MS:g}–"
-                f"{channel.max_exposure_ms:g} ms"
-            )
             exposure.setFixedWidth(82)
+            exposure.setAccessibleName(f"{channel.name} exposure")
+            exposure.setToolTip(
+                f"{channel.name} exposure ({EXPOSURE_MIN_MS:g}–"
+                f"{channel.max_exposure_ms:g} ms)"
+            )
             power = spin(channel.default_power_percent, 0, channel.max_power_percent, 0, "%")
             power.setFixedWidth(60)
             if adjustable_power_ids is not None and channel.id not in adjustable_power_ids:
@@ -123,33 +88,13 @@ class ChannelTable(QTableWidget):
                     f"Fixed at {channel.default_power_percent:g}% by the Micro-Manager preset. "
                     f"Add hardware.power_properties.{channel.id} to make it adjustable."
                 )
-            exposure_cell = QWidget()
-            exposure_cell.setMaximumWidth(120)
-            exposure_layout = QHBoxLayout(exposure_cell)
-            exposure_layout.setContentsMargins(0, 0, 0, 0)
-            exposure_layout.setSpacing(4)
-            exposure_layout.addWidget(exposure_slider, 1)
-            exposure_layout.addWidget(exposure)
-            exposure_slider.valueChanged.connect(
-                lambda position, box=exposure, maximum=channel.max_exposure_ms: box.setValue(
-                    _exposure_from_slider(position, maximum)
-                )
-            )
-            exposure.valueChanged.connect(
-                lambda value, slider=exposure_slider, maximum=channel.max_exposure_ms: (
-                    _set_slider_without_feedback(
-                        slider, _slider_from_exposure(value, maximum)
-                    )
-                )
-            )
             exposure.valueChanged.connect(self.changed)
             power.valueChanged.connect(self.changed)
             self.setCellWidget(row, 0, check)
-            self.setCellWidget(row, 1, exposure_cell)
+            self.setCellWidget(row, 1, exposure)
             self.setCellWidget(row, 2, power)
             self._checks[channel.id] = check
             self._exposure[channel.id] = exposure
-            self._exposure_sliders[channel.id] = exposure_slider
             self._power[channel.id] = power
         self.resizeColumnsToContents()
         for column in (1, 2):
@@ -217,21 +162,35 @@ class ItemList(QWidget):
         self.items: list = []
         self.list = QListWidget()
         self.list.setMaximumHeight(110)
-        self.buttons = QHBoxLayout()
+        self.buttons = QGridLayout()
+        self.buttons.setHorizontalSpacing(6)
+        self.buttons.setVerticalSpacing(6)
+        self._action_buttons: list[QPushButton] = []
         self.remove_button = QPushButton("Remove")
         self.remove_button.clicked.connect(self.remove_selected)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.list)
         layout.addLayout(self.buttons)
-        self.buttons.addStretch(1)
-        self.buttons.addWidget(self.remove_button)
+        self._relayout_buttons()
 
     def add_button(self, text: str, callback: Callable[[], None]) -> QPushButton:
         button = QPushButton(text)
         button.clicked.connect(callback)
-        self.buttons.insertWidget(self.buttons.count() - 2, button)
+        self._action_buttons.append(button)
+        self._relayout_buttons()
         return button
+
+    def _relayout_buttons(self) -> None:
+        """Lay actions out in pairs so descriptive labels survive a narrow panel."""
+
+        while self.buttons.count():
+            self.buttons.takeAt(0)
+        all_buttons = [*self._action_buttons, self.remove_button]
+        for index, button in enumerate(all_buttons):
+            self.buttons.addWidget(button, index // 2, index % 2)
+        self.buttons.setColumnStretch(0, 1)
+        self.buttons.setColumnStretch(1, 1)
 
     def set_items(self, items) -> None:
         self.items = list(items)

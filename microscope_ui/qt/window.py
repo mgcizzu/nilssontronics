@@ -35,6 +35,7 @@ from qtpy.QtWidgets import (
     QDockWidget,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -98,21 +99,21 @@ Z_MODES = (
 LAUNCH_ERRORS = (ControllerError, HardwareError, OSError, ValueError)
 MOSAIC_UNDERLAY_PX = 1024
 PREVIEW_TILE_PX = 256
-DEFAULT_PANEL_SIZES = (340, 780, 260)
+DEFAULT_PANEL_SIZES = (380, 740, 280)
 DEFAULT_WINDOW_SIZE = (1400, 860)
 OVERVIEW_MODES = (
-    ("navigate", "Pan", "Drag to pan, wheel to zoom, double-click to move the stage"),
-    ("rectangle", "Rect", "Drag to draw a rectangular scan region"),
-    ("polygon", "Poly", "Click corners, double-click or Enter to close"),
-    ("move_set", "Move", "Drag to translate all regions and focus points (XY only)"),
-    ("focus", "Focus", "Click a point to go to it, elsewhere to move there"),
+    ("navigate", "Navigate", "Drag to pan, wheel to zoom, double-click to move the stage"),
+    ("rectangle", "Rectangle", "Drag to draw a rectangular scan region"),
+    ("polygon", "Polygon", "Click corners, double-click or Enter to close"),
+    ("move_set", "Move ROI set", "Drag to translate all regions and focus points (XY only)"),
+    ("focus", "Focus points", "Click a point to go to it, elsewhere to move there"),
 )
 OVERVIEW_HINTS = {
     "navigate": "Drag to pan • wheel to zoom • double-click moves the stage",
     "rectangle": "Drag to draw a region • Esc cancels",
     "polygon": "Click corners • double-click or Enter closes • Esc cancels",
     "move_set": "Drag to move regions and focus points together • Esc restores",
-    "focus": "Click F-point to go there, elsewhere to move XY • focus in Live, then Capture / Set Z",
+    "focus": "Click F-point to go there, elsewhere to move XY • focus in Live, then Capture here / Set Z here",
 }
 
 
@@ -391,19 +392,19 @@ class ScanWindow(QMainWindow):
         regions_layout = QVBoxLayout(regions)
         self.region_list = ItemList(describe_region)
         self.add_region_button = self.region_list.add_button("Add…", self._add_region)
-        self.save_set_button = QPushButton("Save…")
+        self.save_set_button = QPushButton("Save set…")
         self.save_set_button.setToolTip("Save regions and focus points to a JSON file")
         self.save_set_button.clicked.connect(self._save_roi_set)
-        self.load_set_button = QPushButton("Load…")
+        self.load_set_button = QPushButton("Load set…")
         self.load_set_button.setToolTip("Replace regions and focus points from a saved set")
         self.load_set_button.clicked.connect(self._load_roi_set)
-        self.shift_button = QPushButton("Shift set…")
+        self.shift_button = QPushButton("Shift ROI set…")
         self.shift_button.setToolTip("Re-register for this cycle: XY translation of the whole set")
         self.shift_button.clicked.connect(self._shift_roi_set)
-        set_row = QHBoxLayout()
-        set_row.addWidget(self.save_set_button)
-        set_row.addWidget(self.load_set_button)
-        set_row.addWidget(self.shift_button)
+        set_row = QGridLayout()
+        set_row.addWidget(self.save_set_button, 0, 0)
+        set_row.addWidget(self.load_set_button, 0, 1)
+        set_row.addWidget(self.shift_button, 1, 0, 1, 2)
         regions_layout.addWidget(self.region_list)
         regions_layout.addLayout(set_row)
         regions_page_layout.addWidget(regions)
@@ -411,10 +412,10 @@ class ScanWindow(QMainWindow):
         focus = QGroupBox("Focus points")
         focus_layout = QVBoxLayout(focus)
         self.focus_list = ItemList(describe_focus)
-        capture_focus_button = self.focus_list.add_button("Capture", self._capture_focus_here)
+        capture_focus_button = self.focus_list.add_button("Capture here", self._capture_focus_here)
         capture_focus_button.setToolTip("Capture a focus point at the current XYZ position")
         self.focus_list.add_button("Go to", self._goto_focus)
-        self.set_z_button = self.focus_list.add_button("Set Z", self._set_focus_z_here)
+        self.set_z_button = self.focus_list.add_button("Set Z here", self._set_focus_z_here)
         self.set_z_button.setToolTip("Set the selected focus point to the current Z")
         self.focus_list.remove_button.clicked.connect(lambda: self.stop_refocus("Refocus stopped"))
         self.refocus_button = QPushButton("Refocus all")
@@ -422,7 +423,7 @@ class ScanWindow(QMainWindow):
             "Visit every focus point in order: focus in Live, then Accept Z to store it and move on"
         )
         self.refocus_button.clicked.connect(self._toggle_refocus)
-        self.align_button = QPushButton("Align F → stage")
+        self.align_button = QPushButton("Align selected F → stage")
         self.align_button.setToolTip(
             "Centre the selected point's landmark in Live, then press: the whole ROI set "
             "moves so that point sits at the current stage XY (Z is kept)"
@@ -497,11 +498,11 @@ class ScanWindow(QMainWindow):
         self.consistent_approach = ToggleSwitch("Consistent stage approach")
         self.shutter_per_frame = ToggleSwitch("Shutter closed during moves")
         self.shutter_per_frame.setChecked(True)
-        self.flat_field = ToggleSwitch("Estimate flat-field")
+        self.flat_field = ToggleSwitch("Estimate flat-field profiles")
         self.flat_field.setToolTip(
             "Estimate a flat-field profile for every channel after the cycle"
         )
-        self.distortion = ToggleSwitch("Correct distortion / registration")
+        self.distortion = ToggleSwitch("Correct lens distortion and channel registration")
         self.distortion.setToolTip(
             "Resample every plane with the objective's grid-slide calibration before saving, "
             "so ISS_preprocessing gets geometrically corrected, channel-registered tiles. "
@@ -559,7 +560,7 @@ class ScanWindow(QMainWindow):
             signal.connect(self._refresh)
 
         self.setup_tabs = QTabWidget()
-        self.setup_tabs.setMinimumWidth(320)
+        self.setup_tabs.setMinimumWidth(360)
         self.setup_tabs.setUsesScrollButtons(False)
         self.setup_tabs.tabBar().setExpanding(True)
         self.setup_pages: list[QScrollArea] = []
@@ -595,7 +596,7 @@ class ScanWindow(QMainWindow):
         toolbar = QVBoxLayout(toolbar_widget)
         toolbar.setContentsMargins(8, 6, 8, 6)
         toolbar.setSpacing(4)
-        mode_toolbar = QHBoxLayout()
+        mode_toolbar = QGridLayout()
         mode_toolbar.setSpacing(6)
         self.mode_group = QButtonGroup(self)
         self.mode_buttons: dict[str, QToolButton] = {}
@@ -608,8 +609,9 @@ class ScanWindow(QMainWindow):
             button.clicked.connect(lambda _=False, m=mode: self.set_overview_mode(m))
             self.mode_group.addButton(button)
             self.mode_buttons[mode] = button
-            mode_toolbar.addWidget(button)
-        mode_toolbar.addStretch(1)
+            index = len(self.mode_buttons) - 1
+            mode_toolbar.addWidget(button, index // 3, index % 3)
+        mode_toolbar.setColumnStretch(3, 1)
         toolbar.addLayout(mode_toolbar)
         self.mode_buttons["navigate"].setChecked(True)
         view_toolbar = QHBoxLayout()
@@ -660,12 +662,12 @@ class ScanWindow(QMainWindow):
 
         capture_bar = QWidget()
         capture_bar.setObjectName("viewerToolbar")
-        capture_controls = QHBoxLayout(capture_bar)
+        capture_controls = QGridLayout(capture_bar)
         capture_controls.setContentsMargins(8, 6, 8, 6)
         capture_controls.setSpacing(6)
         capture_title = QLabel("Capture")
         capture_title.setProperty("toolbarTitle", True)
-        capture_controls.addWidget(capture_title)
+        capture_controls.addWidget(capture_title, 0, 0)
         self.live_button = QPushButton("Live")
         self.live_button.setCheckable(True)
         self.live_button.toggled.connect(self._toggle_live)
@@ -674,7 +676,7 @@ class ScanWindow(QMainWindow):
         self.live_channel_box = QComboBox()
         for channel in self.config_data.channels:
             self.live_channel_box.addItem(channel.name, channel.id)
-        self.preview_button = QPushButton("Spiral")
+        self.preview_button = QPushButton("Spiral preview")
         self.preview_button.setCheckable(True)
         self.preview_button.setToolTip(
             "Snap the Live channel at each tile position, spiralling out from the stage "
@@ -682,16 +684,22 @@ class ScanWindow(QMainWindow):
             "exist). Existing preview images are retained. Current Z only, no Z moves."
         )
         self.preview_button.toggled.connect(self._toggle_spiral_preview)
-        self.clear_preview_button = QPushButton("Clear")
+        self.clear_preview_button = QPushButton("Clear previews")
         self.clear_preview_button.setToolTip("Clear all retained spiral preview images")
         self.clear_preview_button.clicked.connect(self.clear_spiral_previews)
-        capture_controls.addWidget(self.live_button)
-        capture_controls.addWidget(self.snap_button)
-        capture_controls.addWidget(self.live_channel_box, 1)
-        capture_controls.addWidget(self.preview_button)
-        capture_controls.addWidget(self.clear_preview_button)
+        capture_controls.addWidget(self.live_button, 0, 1)
+        capture_controls.addWidget(self.snap_button, 0, 2)
+        capture_controls.addWidget(self.live_channel_box, 0, 3)
+        preview_row = QHBoxLayout()
+        preview_row.setContentsMargins(0, 0, 0, 0)
+        preview_row.setSpacing(6)
+        preview_row.addWidget(self.preview_button)
+        preview_row.addWidget(self.clear_preview_button)
+        preview_row.addStretch(1)
+        capture_controls.addLayout(preview_row, 1, 1, 1, 3)
+        capture_controls.setColumnStretch(3, 1)
         layout.addWidget(capture_bar)
-        wrapper.setMinimumWidth(400)
+        wrapper.setMinimumWidth(360)
         return wrapper
 
     def _build_review_panel(self) -> QWidget:
@@ -1679,7 +1687,7 @@ class ScanWindow(QMainWindow):
             return
         self.refocus_index = None
         self.refocus_button.setText("Refocus all")
-        self.set_z_button.setText("Set Z")
+        self.set_z_button.setText("Set Z here")
         self.refocus_label.hide()
         self.overview_accept_button.hide()
         if message:
