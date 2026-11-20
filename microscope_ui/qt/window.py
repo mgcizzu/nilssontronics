@@ -431,10 +431,12 @@ class ScanWindow(QMainWindow):
             "Visit every focus point in order: focus in Live, then Accept Z to store it and move on"
         )
         self.refocus_button.clicked.connect(self._toggle_refocus)
-        self.align_button = QPushButton("Align selected F → stage")
+        # Short label so it fits small/scaled windows; the tooltip carries the full name.
+        self.align_button = QPushButton("Align F → stage")
         self.align_button.setToolTip(
-            "Centre the selected point's landmark in Live, then press: the whole ROI set "
-            "moves so that point sits at the current stage XY (Z is kept)"
+            "Align selected F → stage: centre the selected point's landmark in Live, then "
+            "press: the whole ROI set moves so that point sits at the current stage XY "
+            "(Z is kept)"
         )
         self.align_button.clicked.connect(self._align_selected_focus_to_stage)
         cycle_row = QHBoxLayout()
@@ -2118,7 +2120,7 @@ class ScanWindow(QMainWindow):
             self.inform(
                 "Cycle complete",
                 f"Cycle {cycle} finished: {status.tiles_done:,} tiles.\n\nData:\n{folder}\n\n"
-                "Strip/restain, then Align selected F → stage (or Move ROI set) and Refocus all before the next cycle.",
+                "Strip/restain, then Align F → stage (or Move ROI set) and Refocus all before the next cycle.",
             )
         elif status.state == "aborted":
             self.progress_label.setText(f"Stopped • {status.tiles_done}/{status.tiles_total} tiles saved • resumable")

@@ -301,7 +301,11 @@ def test_surface_stack_capture_without_focus_surface_is_centred(window):
     assert (window.z_below.value(), window.z_above.value()) == pytest.approx((3, 3))
     assert "no focus surface" in window.surface_span_label.text()
 
-def test_compact_button_labels_fit_at_small_window_size(qtbot, window):
+@pytest.mark.parametrize("font_scale", [1.0, 1.5])  # 1.5 ≈ Windows at 150 % scaling
+def test_compact_button_labels_fit_at_small_window_size(qtbot, window, font_scale):
+    font = window.font()
+    font.setPointSizeF(font.pointSizeF() * font_scale)
+    window.setFont(font)
     window.resize(1024, 720)
     window.show()
     window.setup_tabs.setCurrentIndex(1)
@@ -320,8 +324,12 @@ def test_compact_button_labels_fit_at_small_window_size(qtbot, window):
         window.clear_preview_button,
     )
     for button in buttons:
-        text_width = button.fontMetrics().horizontalAdvance(button.text())
-        assert button.width() >= text_width, button.text()
+        # The style's own size hint (text + padding in the font actually in use)
+        # must fit the laid-out width; no assumption about a particular font.
+        assert button.width() >= button.minimumSizeHint().width(), (
+            button.text(), button.width(), button.minimumSizeHint().width()
+        )
+    assert "Align selected F → stage" in window.align_button.toolTip()
 
 
 def test_finished_cycle_invalidates_captured_stack_bounds(qtbot, window):

@@ -183,7 +183,7 @@ Windows, so the macOS `F_FULLFSYNC`-per-plane cost is deliberately not listed.
   compute below/above relative to the surface Z *at that XY*. Keep the symmetric
   option as a choice if wanted (decision for Marco).
 
-- [ ] **E7. Clipped button label at small window sizes.**
+- [x] **E7. Clipped button label at small window sizes.**
   `test_compact_button_labels_fit_at_small_window_size` (`tests/test_qt_view.py:278`)
   fails on Linux fonts: "Align selected F → stage" is 186 px wide but needs 199 px
   at 1024×720. Passes alone/on macOS, but Windows with 125–150 % display scaling

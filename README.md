@@ -37,7 +37,7 @@ so no marker mapping is stored).
 2. **Strip / restain and remount the slide.**
 3. **Re-align by translation.** Either drag the whole set in **Move ROI set**
    mode, or – more precisely – select a focus point, drive the stage until the
-   same landmark is centred in Live, and press **Align selected F → stage**.
+   same landmark is centred in Live, and press **Align F → stage** (Tk: *Align selected F → stage*).
    The offset relative to cycle 1 is shown under the viewer and stored with
    the cycle.
 4. **Refocus.** Press **Refocus all**: the stage visits F1, F2, … in turn; focus
