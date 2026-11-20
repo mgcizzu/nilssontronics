@@ -159,6 +159,11 @@ class ScanWindow(QMainWindow):
             signal.connect(self._update_z_stack_view)
         microscope_menu = self.menuBar().addMenu("Microscope")
         microscope_menu.addAction("Configuration…", self.show_configuration)
+        microscope_menu.addAction(
+            "Import Micro-Manager configuration…", self.import_mm_configuration
+        )
+        microscope_menu.addAction("Choose application profile…", self.choose_application_profile)
+        microscope_menu.addAction("Use simulator next launch", self.use_simulator_next_launch)
         self._build_device_docks()
         self.apply_theme_mode(self.theme_mode())
         hints = QApplication.instance().styleHints()
@@ -853,6 +858,48 @@ class ScanWindow(QMainWindow):
         layout.addWidget(text)
         layout.addWidget(buttons)
         dialog.exec()
+
+    def import_mm_configuration(self) -> None:
+        """Create a separate app profile from an existing Micro-Manager config."""
+
+        from .profile_wizard import MicroManagerImportWizard
+
+        wizard = MicroManagerImportWizard(self)
+        if wizard.exec() != wizard.DialogCode.Accepted or wizard.saved_path is None:
+            return
+        self.settings.setValue("last_imported_profile", str(wizard.saved_path))
+        if wizard.save_page.activate.isChecked():
+            self.settings.setValue("startup_profile", str(wizard.saved_path))
+        self.settings.sync()
+        next_launch = (
+            "It will be used automatically on the next launch."
+            if wizard.save_page.activate.isChecked()
+            else "Choose it from Microscope → Choose application profile when ready."
+        )
+        self.inform(
+            "Microscope profile created",
+            f"Saved {wizard.saved_path}\n\n{next_launch}",
+        )
+
+    def choose_application_profile(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose microscope application profile", "", "JSON (*.json)"
+        )
+        if not path:
+            return
+        try:
+            load_config(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            self.warn("Invalid microscope profile", str(exc))
+            return
+        self.settings.setValue("startup_profile", str(Path(path).resolve()))
+        self.settings.sync()
+        self.inform("Profile selected", "The selected microscope profile will be used next launch.")
+
+    def use_simulator_next_launch(self) -> None:
+        self.settings.remove("startup_profile")
+        self.settings.sync()
+        self.inform("Simulator selected", "The bundled simulator profile will be used next launch.")
 
     # ------------------------------------------------------- dialogs (seam) --
     def confirm(self, title: str, text: str) -> bool:
@@ -2062,20 +2109,40 @@ class ScanWindow(QMainWindow):
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Microscope Scan Console (Qt)")
-    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="configuration JSON")
+    parser.add_argument("--config", help="configuration JSON")
     parser.add_argument("--backend", choices=("simulator", "mmcore"), help="override hardware.backend")
     parser.add_argument("--no-ndv", action="store_true", help="plain image view instead of ndv")
     args = parser.parse_args(argv)
     app = QApplication.instance() or QApplication([])
+    settings = QSettings("nilssontronics", "scan-console")
+    config_path = args.config or settings.value("startup_profile", str(DEFAULT_CONFIG_PATH))
     try:
-        config = load_config(args.config)
+        config = load_config(config_path)
         if args.backend:
             config = replace(config, hardware={**config.hardware, "backend": args.backend})
         backend = create_backend(config)
     except (OSError, ValueError, json.JSONDecodeError, HardwareError) as exc:
-        QMessageBox.critical(None, "Startup error", str(exc))
-        raise SystemExit(1) from exc
-    window = ScanWindow(config, backend, use_ndv=not args.no_ndv, config_path=args.config)
+        using_saved_profile = not args.config and Path(config_path) != DEFAULT_CONFIG_PATH
+        if not using_saved_profile:
+            QMessageBox.critical(None, "Startup error", str(exc))
+            raise SystemExit(1) from exc
+        QMessageBox.warning(
+            None,
+            "Microscope profile could not start",
+            f"{exc}\n\nThe application will open with the simulator instead.",
+        )
+        settings.remove("startup_profile")
+        settings.sync()
+        config_path = str(DEFAULT_CONFIG_PATH)
+        config = load_config(config_path)
+        backend = create_backend(config)
+    window = ScanWindow(
+        config,
+        backend,
+        use_ndv=not args.no_ndv,
+        config_path=config_path,
+        settings=settings,
+    )
     window.show()
     app.exec()
 

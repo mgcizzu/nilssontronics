@@ -231,6 +231,16 @@ the controller, so the whole acquisition path is tested without a display.
 
 ## Hardware (pymmcore-plus)
 
+The Qt app can create a hardware profile from an independently prepared
+Micro-Manager configuration. Open **Microscope → Import Micro-Manager
+configuration…**, select the `.cfg` and (if needed) its device-adapter folder,
+then map the detected presets and objective turret. Discovery fills only facts
+reported by Micro-Manager; the wizard deliberately requires an operator to
+enter and confirm stage travel, objective clearance and per-objective safe-Z
+limits. The resulting `nilssontronics_profile.json` remains separate from the
+`.cfg` and can be selected for the next launch. If that saved profile cannot
+connect, the app reports the error and falls back to the bundled simulator.
+
 Set `"backend": "mmcore"` (or pass `--backend mmcore`) and fill the
 `hardware` section of the configuration:
 
