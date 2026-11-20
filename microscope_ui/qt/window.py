@@ -862,6 +862,17 @@ class ScanWindow(QMainWindow):
     def import_mm_configuration(self) -> None:
         """Create a separate app profile from an existing Micro-Manager config."""
 
+        if not self.backend.simulated:
+            # The wizard loads the .cfg in a second MMCore: it would fight this app's
+            # core for the same ports and could shut down devices still in use.
+            self.warn(
+                "Switch to the simulator first",
+                "The import wizard initializes the microscope through its own "
+                "Micro-Manager core and cannot run while this window controls the "
+                "hardware.\n\nChoose Microscope → Use simulator next launch, restart "
+                "the application, then import the configuration.",
+            )
+            return
         from .profile_wizard import MicroManagerImportWizard
 
         wizard = MicroManagerImportWizard(self)

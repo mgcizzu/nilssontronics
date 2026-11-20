@@ -1,6 +1,10 @@
 """Discover a Micro-Manager configuration and create an application profile.
 
-Discovery is deliberately read-only.  Values that Micro-Manager cannot know
+Discovery is *not* passive: ``loadSystemConfiguration`` initializes every
+device and applies the System/Startup presets, so the stage may home and
+turrets/filter wheels may move.  It must never run while the application
+itself drives the same hardware (a second core on the same ports), and the
+Qt wizard runs it on a worker thread.  Values that Micro-Manager cannot know
 reliably (travel limits, objective clearance and optical metadata) are supplied
 separately by the import wizard and validated by the normal config loader.
 """
@@ -36,7 +40,10 @@ def inspect_mm_config(
     *,
     core_factory: Callable[[Path | None], Any] | None = None,
 ) -> MMConfigDiscovery:
-    """Load a Micro-Manager config long enough to inventory its public devices."""
+    """Load a Micro-Manager config long enough to inventory its public devices.
+
+    This initializes the hardware exactly like Micro-Manager does (see module doc).
+    """
 
     config_path = Path(config_path).expanduser().resolve()
     if not config_path.is_file():

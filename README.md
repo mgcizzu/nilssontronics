@@ -234,7 +234,10 @@ the controller, so the whole acquisition path is tested without a display.
 The Qt app can create a hardware profile from an independently prepared
 Micro-Manager configuration. Open **Microscope → Import Micro-Manager
 configuration…**, select the `.cfg` and (if needed) its device-adapter folder,
-then map the detected presets and objective turret. Discovery fills only facts
+then map the detected presets and objective turret. Inspection initializes the
+devices exactly like Micro-Manager (the stage may home, turret and filter wheels
+may move), so the wizard asks for confirmation first and is only available
+while the app runs on the simulator. Discovery fills only facts
 reported by Micro-Manager; the wizard deliberately requires an operator to
 enter and confirm stage travel, objective clearance and per-objective safe-Z
 limits. The resulting `nilssontronics_profile.json` remains separate from the

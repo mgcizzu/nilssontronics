@@ -418,3 +418,12 @@ def test_abort_then_resume(qtbot, window):
     window.resume_button.click()
     qtbot.waitUntil(lambda: not window.poll_timer.isActive(), timeout=30000)
     assert window.controller.status().state == "complete"
+
+
+def test_import_wizard_refuses_while_the_app_drives_hardware(window, monkeypatch):
+    monkeypatch.setattr(window.backend, "simulated", False)
+    with mock.patch("microscope_ui.qt.profile_wizard.MicroManagerImportWizard") as wizard:
+        window.import_mm_configuration()
+    wizard.assert_not_called()
+    assert window.messages and window.messages[-1][0] == "warn"
+    assert "simulator" in window.messages[-1][2]

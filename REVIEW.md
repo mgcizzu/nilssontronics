@@ -119,7 +119,7 @@ new commits: surface-relative Z-stacks, compact UI, Micro-Manager profile wizard
 185 of 186 tests pass in the review environment (see E7). Acquisition runs on
 Windows, so the macOS `F_FULLFSYNC`-per-plane cost is deliberately not listed.
 
-- [ ] **E1. The profile wizard is not read-only and can fight the running app.**
+- [x] **E1. The profile wizard is not read-only and can fight the running app.**
   `inspect_mm_config` (`microscope_ui/mm_profile.py:33`) calls
   `core.loadSystemConfiguration` (line 60), which initializes every device and
   applies the `.cfg` System/Startup presets — depending on the adapters this can

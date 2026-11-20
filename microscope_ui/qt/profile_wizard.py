@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, Signal
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -16,6 +17,7 @@ from qtpy.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -37,7 +39,20 @@ def _number(value: float, low: float = -1e9, high: float = 1e9) -> QDoubleSpinBo
     return box
 
 
+INITIALIZATION_WARNING = (
+    "Inspecting loads the configuration exactly as Micro-Manager does: every device "
+    "is initialized and the System/Startup presets are applied. Depending on the "
+    "adapters the XY stage may home, the objective turret and filter wheels may "
+    "move, and shutters may open. Clear the stage and objectives first. Vendor "
+    "drivers and matching Micro-Manager device adapters must already be installed."
+)
+
+
 class SourcePage(QWizardPage):
+    """Pick the .cfg and inspect it on a background thread (driver loading can take long)."""
+
+    _inspected = Signal(object, object)  # discovery, error -> delivered on the GUI thread
+
     def __init__(self) -> None:
         super().__init__()
         self.setTitle("Micro-Manager configuration")
@@ -58,12 +73,35 @@ class SourcePage(QWizardPage):
         adapter_row.addWidget(adapter_browse)
         form.addRow("Micro-Manager .cfg", config_row)
         form.addRow("Device-adapter folder", adapter_row)
-        note = QLabel(
-            "The wizard only reads the configuration. Vendor drivers and matching "
-            "Micro-Manager device adapters must already be installed."
+        warning = QLabel(f"<b>Warning:</b> {INITIALIZATION_WARNING}")
+        warning.setWordWrap(True)
+        form.addRow(warning)
+        self.acknowledge = QCheckBox(
+            "I understand that the devices will be initialized and may move"
         )
-        note.setWordWrap(True)
-        form.addRow(note)
+        form.addRow(self.acknowledge)
+        self.inspect_button = QPushButton("Inspect configuration")
+        self.inspect_button.clicked.connect(self.start_inspection)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)  # busy indicator
+        self.progress.setVisible(False)
+        inspect_row = QHBoxLayout()
+        inspect_row.addWidget(self.inspect_button)
+        inspect_row.addWidget(self.progress, 1)
+        form.addRow(inspect_row)
+        self.status = QLabel("Not inspected yet.")
+        self.status.setWordWrap(True)
+        form.addRow(self.status)
+        self.thread: threading.Thread | None = None
+        self._inspected.connect(self._inspection_finished, Qt.ConnectionType.QueuedConnection)
+        self.config.textChanged.connect(self._source_changed)
+        self.adapters.textChanged.connect(self._source_changed)
+        self.acknowledge.toggled.connect(self._update_buttons)
+        self._update_buttons()
+
+    @property
+    def busy(self) -> bool:
+        return self.thread is not None
 
     def _browse_config(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select Micro-Manager configuration", "", "Micro-Manager (*.cfg);;All files (*)")
@@ -75,15 +113,69 @@ class SourcePage(QWizardPage):
         if path:
             self.adapters.setText(path)
 
-    def validatePage(self) -> bool:
-        try:
-            self.wizard().discovery = self.wizard().inspector(
-                self.config.text(), self.adapters.text() or None
-            )
-            return True
-        except Exception as exc:
-            QMessageBox.warning(self, "Could not inspect configuration", str(exc))
-            return False
+    def _source_changed(self) -> None:
+        if self.busy:
+            return
+        wizard = self.wizard()
+        if wizard is not None and wizard.discovery is not None:
+            wizard.discovery = None
+            self.status.setText("Not inspected yet.")
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.inspect_button.setEnabled(
+            not self.busy and self.acknowledge.isChecked() and bool(self.config.text().strip())
+        )
+        self.config.setEnabled(not self.busy)
+        self.adapters.setEnabled(not self.busy)
+        self.acknowledge.setEnabled(not self.busy)
+        wizard = self.wizard()
+        if wizard is not None:
+            cancel = wizard.button(QWizard.WizardButton.CancelButton)
+            if cancel is not None:
+                cancel.setEnabled(not self.busy)
+        self.completeChanged.emit()
+
+    def start_inspection(self) -> None:
+        """Load the configuration on a worker thread; the window stays responsive."""
+
+        if self.busy or not self.acknowledge.isChecked():
+            return
+        wizard = self.wizard()
+        wizard.discovery = None
+        inspector = wizard.inspector
+        config, adapters = self.config.text(), self.adapters.text() or None
+
+        def run() -> None:
+            try:
+                result, error = inspector(config, adapters), None
+            except Exception as exc:  # reported in the GUI, never raised on the worker
+                result, error = None, exc
+            self._inspected.emit(result, error)
+
+        self.thread = threading.Thread(target=run, name="mm-profile-inspect", daemon=True)
+        self.progress.setVisible(True)
+        self.status.setText("Initializing devices…")
+        self._update_buttons()
+        self.thread.start()
+
+    def _inspection_finished(self, discovery, error) -> None:
+        self.thread = None
+        self.progress.setVisible(False)
+        if error is not None:
+            self.status.setText("Inspection failed.")
+            QMessageBox.warning(self, "Could not inspect configuration", str(error))
+        else:
+            self.wizard().discovery = discovery
+            self.status.setText(f"Inspected {discovery.config_path.name}.")
+        self._update_buttons()
+
+    def isComplete(self) -> bool:  # noqa: N802 - Qt API
+        wizard = self.wizard()
+        return not self.busy and wizard is not None and wizard.discovery is not None
+
+    def validatePage(self) -> bool:  # noqa: N802 - Qt API
+        return self.isComplete()
 
 
 class MappingPage(QWizardPage):
@@ -354,3 +446,9 @@ class MicroManagerImportWizard(QWizard):
         self.save_page = SavePage()
         for page in (self.source_page, self.mapping_page, self.safety_page, self.save_page):
             self.addPage(page)
+
+    def reject(self) -> None:
+        # Devices are being initialized on a worker thread; let it finish and unload.
+        if self.source_page.busy:
+            return
+        super().reject()
